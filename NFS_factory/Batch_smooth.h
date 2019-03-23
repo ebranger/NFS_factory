@@ -1,0 +1,63 @@
+#pragma once
+#include "mpirxx.h"
+#include <fstream>
+#include <sstream>
+#include <string.h>
+#include "Polynomial.h"
+using namespace std;
+
+class Batch_smooth
+{
+public:
+	Batch_smooth(int lbp, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int smooth_factor_reduce);
+	~Batch_smooth(void);
+	void Do_batch_check();
+	void Add_number( long long a_val, long long b_val, char* relation_factor_list);
+	int Get_num_relations_found();
+
+private:
+	mpz_class* prime_product;
+	mpz_class** inputs;
+	long long * a_vals, * b_vals;
+	char** list_of_factors; // holds the already known smooth side factor list.
+	mpz_class* no_print_product; // divide out factors less than 1000; they will not be printed.
+	mpz_class* predivide_tiny_product;
+	mpz_class* temp_number;
+	mpz_class* relation_value;
+	mpz_class* small_factors;
+	int side;
+
+	int num_factors;
+	unsigned int* relation_factor_list; //for Pollard rho factoring of the found relations.
+	unsigned int* lp1;
+	unsigned int* lp2;
+
+	bool product_set_up;
+	bool precheck;
+	void Setup_prime_product(int smooth_bound);
+	void Setup_memory(int tree_levels, int max_bits_in_input);
+	
+	void Output_solutions();
+
+	string save_filename;
+	int tree_size;
+	int entries;
+	int start_entry;
+	int max_entries_before_check;
+	long num_relations_found;
+	int num_relations_per_batch;
+
+	Polynomial* poly;
+
+	bool using_snfs_deg4_binomial;
+	
+	long long one_lp_limit;
+	long long two_lp_limit;
+	double lp_lim_lower_factor;
+	bool check_two_lp_smooth(mpz_class number, unsigned int index);
+	int smooth_factor_reduce;
+	mpz_class *factor1, *factor2;
+
+
+};
+

@@ -1,0 +1,15 @@
+0.1 First release of the code. 
+
+0.07 General speedups. Implemented a 2lp routine, using a fast-qs grabbed from Msieve. The program can now read relations also in a binary format, which can save some space.
+
+0.06 Fixed a bug where some parts of the code expected that the (a,b) pairs were 32-bit signed integers, it now assumes 64-bit signed. 
+
+0.05 Reworked IO to be done at single times per batch being run. All reading is done to fill the tree with minimal other computations (before the polynomial norms were calculated here), and all printing of found factors is done as the last step before the batch is finished. Also implemented that the program can be used to both batch-check the algebraic or rational polynomial, and a parameter "side:" must now be included with the polynomial input file. 0 is rational, 1 is algebraic.
+
+0.04 Implemented a main() function that takes input parameters (filenames) to work with, and functions for reading a .poly file in gnfs-lasieve format to extract the factorization parameters.
+
+0.03 Reworked the batch testing to use fractions and multiplies rather than modulo operations, based on the CADO-nfs batch code. Optimized IO by using fgets rather than ifstream, and char array handling rather than stringstream. Include smaller factors more than once in the prime product and do fewer squarings at the bottom of the tree.
+
+0.02 Grabbed relation factoring code using Pollard Rho from gnfs-lasieve. Implemented that the rational factors were read from file and stored with the relation so that the complete relation may be printed.
+
+0.01 Implemented batch smoothness checking according to Crandall & Pomerance, Bernstein’s batch test. Implemented a simple reading routine to read (a,b) pairs from a gnfs-lasieve output file.

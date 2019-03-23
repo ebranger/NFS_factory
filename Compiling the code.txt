@@ -1,0 +1,3 @@
+I have used Visual studio 2017 community edition to compile the code, the project files are included.
+
+The code requires MPIR to buld, which should be interchangable with GMP. I have built MPIR 3.0.0 for my system and placed the resulting files/libraries with the code, but your installation may differ. Files that are needed from MPIR include mppir.h, mpirxx.h, and the compiled mpir libraries.

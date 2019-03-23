@@ -1,0 +1,16 @@
+This is a list of things that could be improved.
+
+Better adjustment of tree size.
+
+Check that the polynomials match the input number. At currently I assume that this check is done by the python driver.
+
+Faster factorization of found relations. For now, just use the Pollard rho implementation from gnfs-lasieve.
+If the relations factorization becomes really fast, consider storing only the (a,b) pair, and reconstruct the entire relation if it found to be smooth.
+
+Improvements can be done to further save space in the binary relation format. 
+
+Test rational side batch smoothness checking. I have used batch smoothness checking only on the algebraic side, mainly on degree-4 polynomials.
+
+For smoothness checking on the algebraic side, include only factor-base primes in the prime product.
+
+
