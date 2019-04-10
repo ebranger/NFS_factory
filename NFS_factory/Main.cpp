@@ -161,9 +161,13 @@ int read_batch_from_file(string filename, Batch_smooth* batch)
 	long long a, b;
 	bool a_negative;
 	char *tmp;
+	char* ratlist, *alglist;
 	string line;
 	unsigned int relation_list[20];
 	unsigned int copy_testing[20];
+
+	ratlist = new char[200]; //plenty of space
+	alglist = new char[200]; // plenty of space
 
 	char *line_end;
 
@@ -226,28 +230,36 @@ int read_batch_from_file(string filename, Batch_smooth* batch)
 		{
 			//empty rational list, but perhaps a complete algebraic one
 			*tmp++;
-		}
-		line_end = strstr(tmp, ":");
-
-		if (line_end != NULL)
-		{
-			//rational list, the line ends ends with ":\n\0". remove the newline.
-			*line_end = '\0';
+			*ratlist = '\0';
 		}
 		else
 		{
-			//Store the relation list in a char array tmp.
-			line_end = strstr(tmp, "\n");
+			strcpy(ratlist, tmp);
+			line_end = strstr(ratlist, ":");
+			*line_end = '\0';
+			tmp = line_end + 1;
+		}
 
-			if (line_end != NULL)
-			{
-				//algebraic list, the line ends ends with "\n\0". remove the newline.
-				*line_end = '\0';
-			}
-		}//else we hope that the null termination comes at the correct position
+		strcpy(alglist, tmp);
+		//Store the relation list in a char array tmp.
+		line_end = strstr(alglist, "\n");
+
+		if (line_end != NULL)
+		{
+			//algebraic list, the line ends ends with "\n\0". remove the newline.
+			*line_end = '\0';
+		}
 
 		//Add the relation to be bacth smoothnes checked.
-		batch->Add_number(a, b, tmp);
+		if (batch->side == 0)
+		{
+			batch->Add_number(a, b, alglist);
+		}
+		else
+		{
+			batch->Add_number(a, b, ratlist);
+		}
+
 		relation_num++;
 
 	next_relation:;

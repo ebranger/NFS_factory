@@ -604,6 +604,9 @@ void Batch_smooth::Output_solutions()
 
 			if (side == 0)
 			{
+				*text_ptr = ':';
+				text_ptr++;
+
 				//rational relations were just found and printed, now fill in the saved algebraic ones.
 				//TODO: test this program when batch checking rational values, and test the outputting done here
 				strcpy(text_ptr, list_of_factors[index]);

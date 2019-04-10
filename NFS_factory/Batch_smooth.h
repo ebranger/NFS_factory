@@ -15,6 +15,8 @@ public:
 	void Add_number( long long a_val, long long b_val, char* relation_factor_list);
 	int Get_num_relations_found();
 
+	int side;
+
 private:
 	mpz_class* prime_product;
 	mpz_class** inputs;
@@ -25,7 +27,6 @@ private:
 	mpz_class* temp_number;
 	mpz_class* relation_value;
 	mpz_class* small_factors;
-	int side;
 
 	int num_factors;
 	unsigned int* relation_factor_list; //for Pollard rho factoring of the found relations.
