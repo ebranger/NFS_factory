@@ -18,33 +18,31 @@ using namespace std;
 #define MAX_CHARS_IN_RELATION_LIST 150 //from the relations i have, this should be enought space to hold any relation. 
 
 //Initialize the batch smoothness class
-Batch_smooth::Batch_smooth(int lbp, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int smooth_factor_reduce)
+Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side)
 {
 	//init.
 	temp_number = new mpz_class;
 
-	if (lbp > 32)
+	long long max_prime_limit = pow(2.0, lbp);
+
+	//if fblim and 2^lbp match, then we batch-check all numbers against the full primorial and do no cofactorization of any remaining numbers.
+	// fblim > 2^lbp makes little sense? so assume equal, otherwise we will end up printing relations with some factors too large. Maybe check this in input filea nd war nuser?
+	if (max_prime_limit > fblim)
 	{
-		cout << "The large prime limits are too high, many places in the code expects maximum of 32 bit factors. Things will probably crash..." << endl;
+		do_cofactorization = true;
+	}
+	else
+	{ 
+		do_cofactorization = false;
 	}
 
-	//Setup for using 2lp remainder factorization.
-	lp_lim_lower_factor = smooth_factor_reduce; //note: 1 means do full smoothness check, and no remainder checking. lim > 1 means check for all primes less than smooth_bound / lim, and any remainder is handled as 2lp.
-	//tree_levels = tree_levels; 
-	long long smooth_bound = pow(2.0, lbp);
+	one_lp_limit = max_prime_limit;
 
-	if (lbp == 32)
-	{
-		smooth_bound = 2 * (pow(2.0, lbp - 1) - 1); // to fit in uint32, and two_lp_limit in uint64.
-	}
-
-	one_lp_limit = smooth_bound;
-	two_lp_limit = one_lp_limit * one_lp_limit;
-	smooth_bound = smooth_bound / lp_lim_lower_factor;
-
+	max_cofactor_bit_size = mfb;
+	
 	entries = 0;
 
-	tree_size = lbp - 5 - (int(log2(smooth_factor_reduce))); // rough guess, works for deg-4 SNFS quite well.
+	tree_size = (int(log2(fblim))) - 5; // rough guess, works for deg-4 SNFS quite well.
 	tree_size = min(20, tree_size); //max 22 requires ~3GB of RAM. Decent guess based on the size of the prime product and tree for deg-4 poly values. Update: Seem to get the same speed for lower size, which saves a lot of RAM. 20 is ~7% slower, but saved 2GB of RAM, so worth it.
 
 
@@ -56,7 +54,7 @@ Batch_smooth::Batch_smooth(int lbp, int max_bits_in_input, string filename, Poly
 	prime_product = new mpz_class();
 	*prime_product = 1;
 
-	Setup_prime_product(smooth_bound);
+	Setup_prime_product(fblim);
 	product_set_up = true;
 
 	Setup_memory(tree_size, max_bits_in_input);
@@ -204,7 +202,7 @@ void Batch_smooth::Add_number(long long a_val, long long b_val, char* relation_f
 //If it does, it is a valid relation!
 bool Batch_smooth::check_two_lp_smooth(mpz_class number, unsigned int index)
 {
-	if (number > two_lp_limit)
+	if (mpz_sizeinbase(number.get_mpz_t(), 2) > max_cofactor_bit_size)
 	{
 		//Too big to be split into two primes both less than lp_limit
 		return false;
@@ -255,6 +253,8 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class number, unsigned int index)
 	}
 	else
 	{
+		//I only see this happening if the remainder was small, and producd of two even smaller primes.
+		//If the small primes occur to high powers then the batch smoothness may have missed the higher powers.
 		num_factors = factor(relation_factor_list, number.get_mpz_t(), 0);
 		lp1[index] = relation_factor_list[num_factors - 1];
 		lp2[index] = relation_factor_list[num_factors - 2];
@@ -392,7 +392,7 @@ void Batch_smooth::Do_batch_check()
 			Q = (Q * Q) % *inputs[i];
 		}
 
-		if (lp_lim_lower_factor > 1)
+		if (do_cofactorization == true)
 		{
 			//divide out all factors from the tree from the relation and put the result in Q. 
 			mpz_gcd(temp_number->get_mpz_t(), inputs[i]->get_mpz_t(), Q.get_mpz_t());
@@ -437,7 +437,7 @@ void Batch_smooth::Do_batch_check()
 			Q = (Q * Q) % *inputs[i + 1];
 		}
 
-		if (lp_lim_lower_factor > 1)
+		if (do_cofactorization == true)
 		{
 			//divide out all factors from the tree from the relation and put the result in Q. 
 			mpz_gcd(temp_number->get_mpz_t(), inputs[i + 1]->get_mpz_t(), Q.get_mpz_t());

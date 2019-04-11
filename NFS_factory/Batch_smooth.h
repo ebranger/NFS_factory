@@ -9,7 +9,7 @@ using namespace std;
 class Batch_smooth
 {
 public:
-	Batch_smooth(int lbp, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int smooth_factor_reduce);
+	Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side);
 	~Batch_smooth(void);
 	void Do_batch_check();
 	void Add_number( long long a_val, long long b_val, char* relation_factor_list);
@@ -53,8 +53,8 @@ private:
 	bool using_snfs_deg4_binomial;
 	
 	long long one_lp_limit;
-	long long two_lp_limit;
-	double lp_lim_lower_factor;
+	int max_cofactor_bit_size;
+	bool do_cofactorization;
 	bool check_two_lp_smooth(mpz_class number, unsigned int index);
 	int smooth_factor_reduce;
 	mpz_class *factor1, *factor2;

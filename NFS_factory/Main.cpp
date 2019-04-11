@@ -12,8 +12,8 @@ benefit from your work.
 Some parts of the code (and also this header), included in this
 distribution have been reused from other sources. In particular I
 have benefitted greatly from the work of Jason Papadopoulos's msieve, 
-the batch code in CADO-NFS, and relation factoring code found in
-gnfs-lasieve by Franke and Kleinjung.
+the batch factorization code in CADO-NFS, and relation factoring code 
+found in gnfs-lasieve by Franke and Kleinjung.
 ----------------------------------------------------------------------*/
 
 
@@ -25,7 +25,6 @@ gnfs-lasieve by Franke and Kleinjung.
 #include "Polynomial.h"
 #include "Batch_smooth.h"
 #include <time.h>
-#include <string.h>
 #include <sstream>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,7 +38,10 @@ struct nfs_parameters {
 	int lbpr, lbpa;
 	int smoothness_checking_side; // 0 for rational, 1 for algebraic.
 	long long maxa, maxb;
-	int smooth_factor_reduce;
+	long long rlim, alim;
+	int mfbr, mfba;
+	int max_rational_coefficient_bits;
+	int max_algebraic_coefficient_bits;
 };
 
 //Function for reading a polynomial. Read only the parameters of interest to this program and store in an nfs_parameter struct.
@@ -59,15 +61,18 @@ void read_polynomial(string filename, nfs_parameters* params)
 	params->lbpr = 0;
 	params->smoothness_checking_side = 2;
 
+	params->max_algebraic_coefficient_bits = 0;
+	params->max_rational_coefficient_bits = 0;
+
 	string line;
 	int position;
 	string data;
 
 	mpz_class* number = new mpz_class;
 
-	while(getline(read,line))
+	while (getline(read, line))
 	{
-		if (line.length() > 0 && line.substr(0,1) != "#")
+		if (line.length() > 0 && line.substr(0, 1) != "#")
 		{
 			position = line.find_first_of(":");
 			data = line.substr(0, position);
@@ -77,11 +82,12 @@ void read_polynomial(string filename, nfs_parameters* params)
 			//Otherwise, both Y0 and Y1 needs to be set. 
 			if (data.length() == 1 && data[0] == 'm')
 			{
-				
+
 				*number = line;
 				*number = *number * -1;
 				params->rational_polynomial->set_coeff(0, number);
 				params->rational_polynomial->set_coeff(1, 1);
+				params->max_rational_coefficient_bits = mpz_sizeinbase(number->get_mpz_t(), 2);
 			}
 			//Polynomials in GGNFS format.
 			else if (data.length() == 2)
@@ -91,16 +97,34 @@ void read_polynomial(string filename, nfs_parameters* params)
 					*number = line;
 					data = data.erase(0, 1);
 					params->algebraic_polynomial->set_coeff(stoi(data), number);
+					if (mpz_sizeinbase(number->get_mpz_t(), 2) > params->max_algebraic_coefficient_bits)
+					{
+						params->max_algebraic_coefficient_bits = mpz_sizeinbase(number->get_mpz_t(), 2);
+					}
 				}
 				else if (data[0] == 'Y' && isdigit(data[1]))
 				{
 					*number = line;
 					data = data.erase(0, 1);
 					params->rational_polynomial->set_coeff(stoi(data), number);
+					if (mpz_sizeinbase(number->get_mpz_t(), 2) > params->max_rational_coefficient_bits)
+					{
+						params->max_rational_coefficient_bits = mpz_sizeinbase(number->get_mpz_t(), 2);
+					}
 				}
 			}
 			else if (data.length() == 4)
 			{
+				//Factorbase limits on the algebraic side
+				if (data == "alim")
+				{
+					params->alim = stoi(line);
+				}
+				//Factorbase limits on the rational side
+				else if (data == "rlim")
+				{
+					params->rlim = stoi(line);
+				}
 				//Maximum bits for large primes on the algebraic side
 				if (data == "lpba")
 				{
@@ -110,6 +134,16 @@ void read_polynomial(string filename, nfs_parameters* params)
 				else if (data == "lpbr")
 				{
 					params->lbpr = stoi(line);
+				}
+				//Maximum bits for the remainder on the algebraic side after batch smoothness checking, to be factored by QS/squfof
+				if (data == "mfba")
+				{
+					params->mfba = stoi(line);
+				}
+				//Maximum bits for the remainder on the rational side after batch smoothness checking, to be factored by QS/squfof
+				else if (data == "mfbr")
+				{
+					params->mfbr = stoi(line);
 				}
 				//The side to perform batch smoothnes checking on. 0 is rational, 1 is algebraic
 				else if (data == "side")
@@ -125,14 +159,6 @@ void read_polynomial(string filename, nfs_parameters* params)
 				else if (data == "maxb")
 				{
 					params->maxb = stoi(line);
-				}
-			}
-			//For controlling the 2lp cutoff.
-			else if (data.length() == 6)
-			{
-				if (data == "reduce")
-				{
-					params->smooth_factor_reduce = stoi(line);
 				}
 			}
 		}
@@ -270,6 +296,8 @@ int read_batch_from_file(string filename, Batch_smooth* batch)
 
 	delete value;
 	return batch->Get_num_relations_found();
+	delete alglist;
+	delete ratlist;
 }
 
 //Read a list of binary values and convert to a char array for printing.
@@ -365,27 +393,62 @@ int main(int argc, char* argv[])
 	param->algebraic_polynomial = new Polynomial();
 	param->rational_polynomial = new Polynomial();
 
-	param->smooth_factor_reduce = 4; //i.e. make prime product up to 2^lbp{a/r} / smooth_factor_reduce, and check the remaining part up to 2^lbp{a/r} using a 2lp approach. Defualt 4, lose ~ 3% relations but reduce memory by a factor of ~3.
-
 	read_polynomial(polyfile, param);
 
-	//currently, lbpr/a of 31 is the maximum that can be handled. Several optimizations are needed before 32 or larger will work well.
-	if (param->lbpr > 31 && param->smoothness_checking_side == 0)
+	//Check the polynomial to ensure input is reasonable.
+
+	//currently, maximum primes of 32 bits is the maximum that can be handled. Several changes are needed before 33 or larger will work.
+	if (param->rlim > 4294967296 && param->smoothness_checking_side == 0)
 	{
-		cout << "Rational primes larger than 31 bits currently not supported" << endl;
+		cout << "Batch smoothness checking can only be done for primes of 32 bits or less. Use a lower rlim" << endl;
 		return -1;
 	}
 
-	if (param->lbpa > 31 && param->smoothness_checking_side == 1)
+	if (param->alim > 4294967296 && param->smoothness_checking_side == 1)
 	{
-		cout << "Algebraic primes larger than 31 bits currently not supported" << endl;
+		cout << "Batch smoothness checking can only be done for primes of 32 bits or less. Use a lower alim" << endl;
 		return -1;
 	}
+
+	//currently, lbpr/a of 32 is the maximum that can be handled. Several changes are needed before 33 or larger will work.
+	if (param->lbpr > 32 && param->smoothness_checking_side == 0)
+	{
+		cout << "A large prime bound of >32 bits is not suported. Use a lower lbpr." << endl;
+		return -1;
+	}
+
+	if (param->lbpa > 32 && param->smoothness_checking_side == 1)
+	{
+		cout << "A large prime bound of >32 bits is not suported. Use a lower lbpa." << endl;
+		return -1;
+	}
+
+	//currently, lbpr/a of 32 is the maximum that can be handled. Several changes are needed before 33 or larger will work.
+	if (param->lbpr *2 > param->mfbr && param->smoothness_checking_side == 0)
+	{
+		cout << "Three large prime cofactorization not supported. Use a lower mfbr." << endl;
+		return -1;
+	}
+
+	if (param->lbpa * 2 > param->mfba && param->smoothness_checking_side == 1)
+	{
+		cout << "Three large prime cofactorization not supported. Use a lower mfba." << endl;
+		return -1;
+	}
+
+
 		
-
+	//Estimate size needed to hold the value of the algebraic/rational polynomial values. 
 	int tree_bits;
+	if (param->smoothness_checking_side == 0)
+	{
+		tree_bits = param->max_rational_coefficient_bits+30; //Assume max 30 bit a, b values in relation.
+	}
+	else
+	{
+		tree_bits = param->max_algebraic_coefficient_bits  + 30 * param->algebraic_polynomial->get_degree(); // Assume maxumum a, b is 30 bits (should be filtered to <29 bits in my SNFS-220 data....) and maximum coefficient is 30 bits (at bigger coefficients, batch factoring becomes too slow, and regular SNFS may be preferred? )
+	}
 
-	tree_bits = 30 * param->algebraic_polynomial->get_degree() + 30; // Assume maxumum a,b is 30 bits (should be filtered to <29 bits in my SNFS-220 data....) and maximum coefficient is 30 bits (at bigger coefficients, batch factoring becomes too slow, and regular SNFS may be preferred? )
 
 	//Check that we read the input polynomial correctly.
 	if (param->algebraic_polynomial->get_degree() > 0 && param->rational_polynomial->get_degree() > 0 && param->lbpa > 0 && param->lbpr > 0 && param->smoothness_checking_side != 2)
@@ -393,11 +456,11 @@ int main(int argc, char* argv[])
 		time = clock();
 		if (param->smoothness_checking_side == 0)
 		{
-			batch = new Batch_smooth(param->lbpr, tree_bits, outputfile, param->rational_polynomial,0, param->smooth_factor_reduce); 
+			batch = new Batch_smooth(param->rlim, param->lbpr, param->mfbr, tree_bits, outputfile, param->rational_polynomial,0); 
 		}
 		else if (param->smoothness_checking_side == 1)
 		{
-			batch = new Batch_smooth(param->lbpa, tree_bits, outputfile, param->algebraic_polynomial,1, param->smooth_factor_reduce); 
+			batch = new Batch_smooth(param->alim, param->lbpa, param->mfba, tree_bits, outputfile, param->algebraic_polynomial,1); 
 		}
 		else
 		{
