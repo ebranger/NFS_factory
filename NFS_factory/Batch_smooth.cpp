@@ -10,6 +10,10 @@
 
 using namespace std;
 
+#define MAX_TREE_LEVELS 20
+//max 22 requires ~3GB of RAM. However, for SNFS-200 I seem to get the same speed for lower size, which saves a lot of RAM. 20 is ~7% slower, but saved 2GB of RAM, so worth it.
+//For larger factorizations, consider increasing this a little, but for every +1 the memory requirement for the tree roughly doubles.
+
 #define MAX_SQUARINGS_IN_CHECK 1 //Bernsteins algorithm does squaring at the bottom nodes, to handle powers of primes. This is the largest power checked.
 //may want to do a small-prime check spearately, so that only the larger primes are still present when checking.
 // Note: max squarings 2 means max power is 2^2=4.
@@ -26,7 +30,7 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	long long max_prime_limit = pow(2.0, lbp);
 
 	//if fblim and 2^lbp match, then we batch-check all numbers against the full primorial and do no cofactorization of any remaining numbers.
-	// fblim > 2^lbp makes little sense? so assume equal, otherwise we will end up printing relations with some factors too large. Maybe check this in input filea nd war nuser?
+	// fblim > 2^lbp makes little sense? so assume equal, otherwise we will end up printing relations with some factors too large. Maybe check this in input file and warn user?
 	if (max_prime_limit > fblim)
 	{
 		do_cofactorization = true;
@@ -36,15 +40,16 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 		do_cofactorization = false;
 	}
 
-	one_lp_limit = max_prime_limit;
-
+	//For handling 2lp cofactorization. 
+	one_lp_bit_limit = lbp;
+	two_lp_min_limit = 2 * floor(log2(fblim));
 	max_cofactor_bit_size = mfb;
 	
 	entries = 0;
 
+	//Estiamte a good tree size for the remainder tree
 	tree_size = (int(log2(fblim))) - 5; // rough guess, works for deg-4 SNFS quite well.
-	tree_size = min(20, tree_size); //max 22 requires ~3GB of RAM. Decent guess based on the size of the prime product and tree for deg-4 poly values. Update: Seem to get the same speed for lower size, which saves a lot of RAM. 20 is ~7% slower, but saved 2GB of RAM, so worth it.
-
+	tree_size = min(MAX_TREE_LEVELS, tree_size); 
 
 	start_entry = pow(2, (double)(tree_size - 1)) - 1;
 	max_entries_before_check = pow(2, (double)tree_size - 1);
@@ -105,8 +110,10 @@ void Batch_smooth::Setup_prime_product(int smooth_bound)
 {
 	//So apparently mpir knows primorials. Problem solved!
 
-	if (smooth_bound < 10)
+	if (smooth_bound < 1000)
 	{
+		//I expect a minimum bound of ~2^20, anything less is probably a bad idea. 
+		//Use 1000 as a basic sanity check. 
 		return;
 	}
 
@@ -139,8 +146,8 @@ void Batch_smooth::Setup_memory(int tree_levels, int max_bits_in_input)
 	//allocate enough memory to hold all the numbers in the product tree without having to increase any mpz size
 	int temp = pow(2, (double)(tree_levels));
 	inputs = new mpz_class*[temp - 1];
-	lp1 = new unsigned int[temp];
-	lp2 = new unsigned int[temp];
+	lp1 = new unsigned long long[temp];
+	lp2 = new unsigned long long[temp];
 	int limit;
 
 	temp = temp / 2;
@@ -158,7 +165,6 @@ void Batch_smooth::Setup_memory(int tree_levels, int max_bits_in_input)
 		//set large prime list to 0
 		lp1[i] = 0;
 		lp2[i] = 0;
-
 	}
 
 	temp = max_bits_in_input;
@@ -176,7 +182,6 @@ void Batch_smooth::Setup_memory(int tree_levels, int max_bits_in_input)
 		}
 		temp = temp * 2;
 	}
-
 }
 
 //Add one relation to be batch-smoothness checked.
@@ -195,21 +200,23 @@ void Batch_smooth::Add_number(long long a_val, long long b_val, char* relation_f
 	{
 		Do_batch_check();
 	}
-
 }
 
 //Check whether a remainder factors into two numbers less than the lp limit. 
 //If it does, it is a valid relation!
 bool Batch_smooth::check_two_lp_smooth(mpz_class number, unsigned int index)
 {
-	if (mpz_sizeinbase(number.get_mpz_t(), 2) > max_cofactor_bit_size)
+	int cofactor_bits = mpz_sizeinbase(number.get_mpz_t(), 2);
+
+	if (cofactor_bits > max_cofactor_bit_size)
 	{
 		//Too big to be split into two primes both less than lp_limit
 		return false;
 	}
-	if (number > one_lp_limit)
+
+	if (cofactor_bits > two_lp_min_limit)
 	{
-		//must split in two small primes in order to be smooth
+		//Can potentially split into two large primes, small enough to be useful
 		if (mpz_probab_prime_p(number.get_mpz_t(), 1))
 		{
 			return false;
@@ -224,19 +231,27 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class number, unsigned int index)
 			return false;
 		}
 
-		if (*factor1 > one_lp_limit)
+		//check if the factors are too big.
+		if (mpz_sizeinbase(factor1->get_mpz_t(), 2) > one_lp_bit_limit)
 		{
 			return false;
 		}
-		if (*factor2 > one_lp_limit)
+		if (mpz_sizeinbase(factor2->get_mpz_t(), 2) > one_lp_bit_limit)
 		{
 			return false;
 		}
-		//save the two found factors. Hopefully there were not three factors, that may cause problems here...
+
+		//save the two found factors. I do not expect three factors to ever happen, though that may cause problems here...
 		lp1[index] = factor1->get_ui();
 		lp2[index] = factor2->get_ui();
 
 		return true;
+	}
+
+	if (cofactor_bits > one_lp_bit_limit)
+	{
+		//Should be a prime and too big.
+		return false;
 	}
 
 	if (number == 1)
@@ -255,6 +270,8 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class number, unsigned int index)
 	{
 		//I only see this happening if the remainder was small, and producd of two even smaller primes.
 		//If the small primes occur to high powers then the batch smoothness may have missed the higher powers.
+		//So I assume we will never get here.
+		//may be better to just return false here?
 		num_factors = factor(relation_factor_list, number.get_mpz_t(), 0);
 		lp1[index] = relation_factor_list[num_factors - 1];
 		lp2[index] = relation_factor_list[num_factors - 2];
@@ -263,7 +280,6 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class number, unsigned int index)
 
 	//if the remainder after dividing out all small primes is less than the limit, it is prime and smooth (or possibly composite with high-power primes in relation, but still OK.)
 	return true;
-
 }
 
 //Perform the remainder tree calculations.
@@ -367,7 +383,6 @@ void Batch_smooth::Do_batch_check()
 
 			mpz_tdiv_r_2exp(inputs[i + 1]->get_mpz_t(), inputs[i + 1]->get_mpz_t(), product_bits[(i - 1) / 2] + guard);
 			mpz_div_2exp(inputs[i + 1]->get_mpz_t(), inputs[i + 1]->get_mpz_t(), product_bits[(i - 1) / 2] - product_bits[i + 1]);
-
 		}
 	}
 
@@ -517,7 +532,6 @@ void Batch_smooth::Output_solutions()
 				mpz_divexact(relation_value->get_mpz_t(), relation_value->get_mpz_t(), temp_number->get_mpz_t());
 				//*relation_value = *relation_value / *temp_number;
 				mpz_gcd(temp_number->get_mpz_t(), relation_value->get_mpz_t(), temp_number->get_mpz_t());
-
 			}
 
 			//Now to factor the relation value
@@ -528,18 +542,12 @@ void Batch_smooth::Output_solutions()
 
 				if (lp1[index] > 1)
 				{
-					relation_factor_list[num_factors] = lp1[index];
-					lp1[index] = 0;
-					mpz_divexact_ui(relation_value->get_mpz_t(), relation_value->get_mpz_t(), relation_factor_list[num_factors]);
-					num_factors++;
+					mpz_divexact_ui(relation_value->get_mpz_t(), relation_value->get_mpz_t(), lp1[index]);
 				}
 
 				if (lp2[index] > 1)
 				{
-					relation_factor_list[num_factors] = lp2[index];
-					lp2[index] = 0;
-					mpz_divexact_ui(relation_value->get_mpz_t(), relation_value->get_mpz_t(), relation_factor_list[num_factors]);
-					num_factors++;
+					mpz_divexact_ui(relation_value->get_mpz_t(), relation_value->get_mpz_t(), lp2[index]);
 				}
 				//run Pollard rho factoring on the remaining part of the relation. Since it is smooth Pollard rho should be a decent choice.
 				num_factors += factor(relation_factor_list + num_factors, relation_value->get_mpz_t(), 1);
@@ -575,16 +583,34 @@ void Batch_smooth::Output_solutions()
 			if (side == 0)
 			{
 				//rational relations to be printed first. These should just have been found and stored in the list. 
-				//TODO: test this program when batch checking rational values, and test the outputting done here
 			}
 			else
 			{
-				//algebraic relations are found, so print the saved rational factor first.
+				//algebraic relations are found, so print the saved rational factors first.
 				strcpy(text_ptr, list_of_factors[index]);
 				text_ptr += strlen(text_ptr);
 				*text_ptr = ':';
 				text_ptr++;
 				*text_ptr = '\0';
+			}
+
+			//Handle large primes that may have been saved earlier.
+			if (lp1[index] > 1)
+			{
+				char_written = sprintf(text_ptr, "%X", lp1[index]);
+				text_ptr += char_written;
+				*text_ptr = ',';
+				text_ptr++;
+				lp1[index] = 0;
+			}
+
+			if (lp2[index] > 1)
+			{
+				char_written = sprintf(text_ptr, "%X", lp2[index]);
+				text_ptr += char_written;
+				*text_ptr = ',';
+				text_ptr++;
+				lp2[index] = 0;
 			}
 
 			//Print the found factors for the smoothnes.checked and factored relation value.
@@ -593,13 +619,15 @@ void Batch_smooth::Output_solutions()
 				char_written = sprintf(text_ptr, "%X", relation_factor_list[i]);
 
 				text_ptr += char_written;
-				if (i < num_factors - 1)
+				if (i < num_factors)
 				{
 					*text_ptr = ',';
 					text_ptr++;
 				}
 			}
 
+			//remove the final comma that was printed.
+			text_ptr--;
 			*text_ptr = '\0';
 
 			if (side == 0)
@@ -628,6 +656,7 @@ void Batch_smooth::Output_solutions()
 			num_good++;
 		}
 
+		//reset for next iteration.
 		*inputs[i] = 1;
 		a_vals[index] = 0;
 		b_vals[index] = 0;

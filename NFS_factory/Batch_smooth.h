@@ -30,8 +30,8 @@ private:
 
 	int num_factors;
 	unsigned int* relation_factor_list; //for Pollard rho factoring of the found relations.
-	unsigned int* lp1;
-	unsigned int* lp2;
+	unsigned long long* lp1;
+	unsigned long long* lp2;
 
 	bool product_set_up;
 	bool precheck;
@@ -52,7 +52,8 @@ private:
 
 	bool using_snfs_deg4_binomial;
 	
-	long long one_lp_limit;
+	int one_lp_bit_limit;
+	long long two_lp_min_limit;
 	int max_cofactor_bit_size;
 	bool do_cofactorization;
 	bool check_two_lp_smooth(mpz_class number, unsigned int index);

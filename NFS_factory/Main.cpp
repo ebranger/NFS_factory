@@ -295,9 +295,9 @@ int read_batch_from_file(string filename, Batch_smooth* batch)
 	batch->Do_batch_check();
 
 	delete value;
-	return batch->Get_num_relations_found();
 	delete alglist;
 	delete ratlist;
+	return batch->Get_num_relations_found();
 }
 
 //Read a list of binary values and convert to a char array for printing.
@@ -397,33 +397,20 @@ int main(int argc, char* argv[])
 
 	//Check the polynomial to ensure input is reasonable.
 
-	//currently, maximum primes of 32 bits is the maximum that can be handled. Several changes are needed before 33 or larger will work.
-	if (param->rlim > 4294967296 && param->smoothness_checking_side == 0)
+	//Primes of 32 bits is the maximum that can be handled by the batch factoring code. Several changes are needed before 33 or larger will work (mainly in how an identified relation is fully factored).
+	if (param->rlim > 8589934591 && param->smoothness_checking_side == 0)
 	{
 		cout << "Batch smoothness checking can only be done for primes of 32 bits or less. Use a lower rlim" << endl;
 		return -1;
 	}
 
-	if (param->alim > 4294967296 && param->smoothness_checking_side == 1)
+	if (param->alim > 8589934591 && param->smoothness_checking_side == 1)
 	{
 		cout << "Batch smoothness checking can only be done for primes of 32 bits or less. Use a lower alim" << endl;
 		return -1;
 	}
 
-	//currently, lbpr/a of 32 is the maximum that can be handled. Several changes are needed before 33 or larger will work.
-	if (param->lbpr > 32 && param->smoothness_checking_side == 0)
-	{
-		cout << "A large prime bound of >32 bits is not suported. Use a lower lbpr." << endl;
-		return -1;
-	}
-
-	if (param->lbpa > 32 && param->smoothness_checking_side == 1)
-	{
-		cout << "A large prime bound of >32 bits is not suported. Use a lower lbpa." << endl;
-		return -1;
-	}
-
-	//currently, lbpr/a of 32 is the maximum that can be handled. Several changes are needed before 33 or larger will work.
+	//Can only handle cofactorization with 2lp, so no point in checking numbers that are too big for this.
 	if (param->lbpr *2 > param->mfbr && param->smoothness_checking_side == 0)
 	{
 		cout << "Three large prime cofactorization not supported. Use a lower mfbr." << endl;
@@ -436,8 +423,6 @@ int main(int argc, char* argv[])
 		return -1;
 	}
 
-
-		
 	//Estimate size needed to hold the value of the algebraic/rational polynomial values. 
 	int tree_bits;
 	if (param->smoothness_checking_side == 0)
