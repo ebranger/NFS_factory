@@ -411,13 +411,13 @@ int main(int argc, char* argv[])
 	}
 
 	//Can only handle cofactorization with 2lp, so no point in checking numbers that are too big for this.
-	if (param->lbpr *2 > param->mfbr && param->smoothness_checking_side == 0)
+	if (param->lbpr *2 < param->mfbr && param->smoothness_checking_side == 0)
 	{
 		cout << "Three large prime cofactorization not supported. Use a lower mfbr." << endl;
 		return -1;
 	}
 
-	if (param->lbpa * 2 > param->mfba && param->smoothness_checking_side == 1)
+	if (param->lbpa * 2 < param->mfba && param->smoothness_checking_side == 1)
 	{
 		cout << "Three large prime cofactorization not supported. Use a lower mfba." << endl;
 		return -1;
