@@ -288,6 +288,12 @@ int read_batch_from_file(string filename, Batch_smooth* batch)
 
 		relation_num++;
 
+		if (relation_num == 2097152)
+		{
+			//Debug break for testing.
+			return batch->Get_num_relations_found();
+		}
+
 	next_relation:;
 	}
 
@@ -334,11 +340,18 @@ int read_batch_from_binary_file(string filename, Batch_smooth* batch)
 	unsigned int relation_list[20];
 	int factors_in_list;
 	char *line_end;
+	char* relation_line = new char[300];
 
 	int relation_num = 0;
 
-	ifstream infile(filename, ios::binary);
-	char* relation_line = new char[300];
+	ifstream infile;
+	infile.open(filename, ios::binary);
+	
+	if (infile.fail())
+	{
+		cout << "Failed to open input saved relations file." << endl;
+		return 0;
+	}
 
 	while (infile.peek() != EOF)
 	{
@@ -356,7 +369,7 @@ int read_batch_from_binary_file(string filename, Batch_smooth* batch)
 		}
 		get_relation_factor_list(relation_list, relation_list[0], relation_line);
 
-		//Add the relation to 
+		//Add the relation to be bacth smoothnes checked.
 		batch->Add_number(a, b, relation_line);
 		relation_num++;
 
@@ -480,5 +493,5 @@ int main(int argc, char* argv[])
 
 	cout << "Batch checking complete." << endl;
 
-	return 0;
+ 	return 0;
 }

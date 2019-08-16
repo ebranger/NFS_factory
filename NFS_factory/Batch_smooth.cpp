@@ -31,7 +31,7 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 
 	//if fblim and 2^lbp match, then we batch-check all numbers against the full primorial and do no cofactorization of any remaining numbers.
 	// fblim > 2^lbp makes little sense? so assume equal, otherwise we will end up printing relations with some factors too large. Maybe check this in input file and warn user?
-	if (max_prime_limit > fblim)
+	if (max_prime_limit >= fblim)
 	{
 		do_cofactorization = true;
 	}
@@ -61,6 +61,7 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 
 	Setup_prime_product(fblim);
 	product_set_up = true;
+	max_batch_prime = fblim;
 
 	Setup_memory(tree_size, max_bits_in_input);
 
@@ -241,6 +242,17 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class number, unsigned int index)
 			return false;
 		}
 
+		//check that the factors are actual large primes. If it turns out to be a small prime that occured to a high
+		//power, it can cause problems later when it is assumed to be a prime larger than the rlim/alim.
+		if (mpz_sizeinbase(factor1->get_mpz_t(), 2) > one_lp_bit_limit)
+		{
+			return false;
+		}
+		if (mpz_sizeinbase(factor2->get_mpz_t(), 2) > one_lp_bit_limit)
+		{
+			return false;
+		}
+
 		//save the two found factors. I do not expect three factors to ever happen, though that may cause problems here...
 		lp1[index] = factor1->get_ui();
 		lp2[index] = factor2->get_ui();
@@ -260,23 +272,29 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class number, unsigned int index)
 		return true;
 	}
 
-	//should be one large prime by now.
-	if (mpz_probab_prime_p(number.get_mpz_t(), 1))
+	//should be one large prime by now. Make sure it is actually a large prime as well.
+	if (mpz_probab_prime_p(number.get_mpz_t(), 1) && number > max_batch_prime)
 	{
 		lp1[index] = mpz_get_ui(number.get_mpz_t());
 		lp2[index] = 0;
 	}
 	else
 	{
-		//I only see this happening if the remainder was small, and producd of two even smaller primes.
-		//If the small primes occur to high powers then the batch smoothness may have missed the higher powers.
-		//So I assume we will never get here.
-		//may be better to just return false here?
+		//I have seen this happen when the remainder was a product of one large prime and one very small that occured to a high power in the relation,
+		//and the small prime was not found by the batch code due to the high power.
+		//Since this seems to happend very rarely, for now just do a basic check if the sizes of the two factors makes the relation valid,
+		//and let the relation factoring code handle it later, without any lp hints from here.
 		num_factors = factor(relation_factor_list, number.get_mpz_t(), 0);
-		lp1[index] = relation_factor_list[num_factors - 1];
-		lp2[index] = relation_factor_list[num_factors - 2];
-	}
 
+		for (int i = 0; i <= num_factors; i++)
+		{
+			if (log2(relation_factor_list[i]) >= one_lp_bit_limit)
+			{
+				return false;
+			}
+		}
+
+	}
 
 	//if the remainder after dividing out all small primes is less than the limit, it is prime and smooth (or possibly composite with high-power primes in relation, but still OK.)
 	return true;

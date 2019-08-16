@@ -51,6 +51,7 @@ private:
 	Polynomial* poly;
 
 	bool using_snfs_deg4_binomial;
+	int max_batch_prime;
 	
 	int one_lp_bit_limit;
 	long long two_lp_min_limit;
