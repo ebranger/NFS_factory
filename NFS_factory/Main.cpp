@@ -288,11 +288,11 @@ int read_batch_from_file(string filename, Batch_smooth* batch)
 
 		relation_num++;
 
-		if (relation_num == 2097152)
-		{
-			//Debug break for testing.
-			return batch->Get_num_relations_found();
-		}
+		//if (relation_num == 2097152)
+		//{
+		//	//Debug break for testing.
+		//	return batch->Get_num_relations_found();
+		//}
 
 	next_relation:;
 	}
