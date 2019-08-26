@@ -11,7 +11,7 @@
 using namespace std;
 
 #define MAX_TREE_LEVELS 20
-//max 22 requires ~3GB of RAM. However, for SNFS-200 I seem to get the same speed for lower size, which saves a lot of RAM. 20 is ~7% slower, but saved 2GB of RAM, so worth it.
+//max 22 requires ~3GB of RAM. However, for SNFS-220 I seem to get the same speed for lower size, which saves a lot of RAM. 20 is ~7% slower, but saved 2GB of RAM, so worth it.
 //For larger factorizations, consider increasing this a little, but for every +1 the memory requirement for the tree roughly doubles.
 
 #define MAX_SQUARINGS_IN_CHECK 1 //Bernsteins algorithm does squaring at the bottom nodes, to handle powers of primes. This is the largest power checked.
@@ -40,6 +40,13 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 		do_cofactorization = false;
 	}
 
+	prime_product = new mpz_class();
+	*prime_product = 1;
+
+	Setup_prime_product(fblim);
+	product_set_up = true;
+	max_batch_prime = fblim;
+
 	//For handling 2lp cofactorization. 
 	one_lp_bit_limit = lbp;
 	two_lp_min_limit = 2 * floor(log2(fblim));
@@ -48,20 +55,13 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	entries = 0;
 
 	//Estiamte a good tree size for the remainder tree
-	tree_size = (int(log2(fblim))) - 5; // rough guess, works for deg-4 SNFS quite well.
-	tree_size = min(MAX_TREE_LEVELS, tree_size); 
+	tree_size = ceil(log2((mpz_sizeinbase(prime_product->get_mpz_t(), 2)/max_bits_in_input))) + 1; // +1 since max_bits_in_input seems to overestminate slightly.
+	tree_size = min(MAX_TREE_LEVELS, tree_size);  // Force the remainder tree to not be too big to save memory.
 
 	start_entry = pow(2, (double)(tree_size - 1)) - 1;
 	max_entries_before_check = pow(2, (double)tree_size - 1);
 	save_filename = filename;
 	num_relations_found = 0;
-
-	prime_product = new mpz_class();
-	*prime_product = 1;
-
-	Setup_prime_product(fblim);
-	product_set_up = true;
-	max_batch_prime = fblim;
 
 	Setup_memory(tree_size, max_bits_in_input);
 
@@ -132,10 +132,6 @@ void Batch_smooth::Setup_prime_product(int smooth_bound)
 
 	long size = mpz_sizeinbase(prime_product->get_mpz_t(), 2);
 	cout << "Size of prime product: " << size << " bits." << endl;
-
-	//test for removing small factors before the larger multiplications happen.
-	//small_factors = new mpz_class;
-	//mpz_primorial_ui(small_factors->get_mpz_t(), 262144 * 4);
 
 	return;
 }
