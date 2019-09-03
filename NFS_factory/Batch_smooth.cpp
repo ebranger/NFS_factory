@@ -611,7 +611,7 @@ void Batch_smooth::Output_solutions()
 			//Handle large primes that may have been saved earlier.
 			if (lp1[index] > 1)
 			{
-				char_written = sprintf(text_ptr, "%X", lp1[index]);
+				char_written = sprintf(text_ptr, "%llX", lp1[index]);
 				text_ptr += char_written;
 				*text_ptr = ',';
 				text_ptr++;
@@ -620,7 +620,7 @@ void Batch_smooth::Output_solutions()
 
 			if (lp2[index] > 1)
 			{
-				char_written = sprintf(text_ptr, "%X", lp2[index]);
+				char_written = sprintf(text_ptr, "%llX", lp2[index]);
 				text_ptr += char_written;
 				*text_ptr = ',';
 				text_ptr++;
