@@ -198,6 +198,7 @@ int read_batch_from_file(string filename, Batch_smooth* batch)
 	char *line_end;
 
 	int relation_num = 0;
+	int failed_relations = 0;
 
 	while (!feof(infile)) {
 		//read a,b,rational factor list from each line of the input.
@@ -205,6 +206,12 @@ int read_batch_from_file(string filename, Batch_smooth* batch)
 		fgets(buffer, sizeof(buffer), infile);
 
 		tmp = buffer;
+
+		if (buffer[0] == '#')
+		{
+			//Comment, so skip this line.
+			goto next_relation;
+		}
 
 		if (buffer[0] == '-')
 		{
@@ -233,6 +240,8 @@ int read_batch_from_file(string filename, Batch_smooth* batch)
 
 		if (*tmp != ',')
 		{
+			//should be a comma separating a and b
+			failed_relations++;
 			goto next_relation;
 		}
 
@@ -247,6 +256,8 @@ int read_batch_from_file(string filename, Batch_smooth* batch)
 
 		if (*tmp != ':')
 		{
+			//should be a colon separating b and the rational factor list.
+			failed_relations++;
 			goto next_relation;
 		}
 
@@ -294,11 +305,16 @@ int read_batch_from_file(string filename, Batch_smooth* batch)
 		//	return batch->Get_num_relations_found();
 		//}
 
-	next_relation:;
+		next_relation:;
 	}
 
 	//Finish any remaining relations, even if the tree is not filled.
 	batch->Do_batch_check();
+
+	if (failed_relations >= 100)
+	{
+		cout << "Failed to parse " << failed_relations << " relations out of a total of " << relation_num + failed_relations << " relations." << endl;
+	}
 
 	delete value;
 	delete alglist;
@@ -411,13 +427,13 @@ int main(int argc, char* argv[])
 	//Check the polynomial to ensure input is reasonable.
 
 	//Primes of 32 bits is the maximum that can be handled by the batch factoring code. Several changes are needed before 33 or larger will work (mainly in how an identified relation is fully factored).
-	if (param->rlim > 8589934591 && param->smoothness_checking_side == 0)
+	if (param->rlim > 4294967295 && param->smoothness_checking_side == 0)
 	{
 		cout << "Batch smoothness checking can only be done for primes of 32 bits or less. Use a lower rlim" << endl;
 		return -1;
 	}
 
-	if (param->alim > 8589934591 && param->smoothness_checking_side == 1)
+	if (param->alim > 4294967295 && param->smoothness_checking_side == 1)
 	{
 		cout << "Batch smoothness checking can only be done for primes of 32 bits or less. Use a lower alim" << endl;
 		return -1;
