@@ -17,9 +17,9 @@ Polynomial::Polynomial()
 {
 	//create a new polynomial class, initialize coefficients and set to 0.
 	degree = 0;
-	coefficients = new mpz_class*[2*POLYNOMIAL_MAX_DEGREE+1];
+	coefficients = new mpz_class*[2*POLYNOMIAL_MAX_DEGREE + 1];
 
-	for (int i = 0; i <= 2*POLYNOMIAL_MAX_DEGREE+1; i++)
+	for (int i = 0; i <= 2*POLYNOMIAL_MAX_DEGREE; i++)
 	{
 		coefficients[i] = new mpz_class;
 		*coefficients[i] = 0;
@@ -32,7 +32,7 @@ Polynomial::Polynomial(Polynomial* input)
 	degree = input->degree;
 	coefficients = new mpz_class*[2*POLYNOMIAL_MAX_DEGREE + 1];
 
-	for (int i = 0; i <= 2 * POLYNOMIAL_MAX_DEGREE + 1; i++)
+	for (int i = 0; i <= 2 * POLYNOMIAL_MAX_DEGREE; i++)
 	{
 		coefficients[i] = new mpz_class;
 		*coefficients[i] = 0;
@@ -46,10 +46,11 @@ Polynomial::Polynomial(Polynomial* input)
 
 Polynomial::~Polynomial(void)
 {
-	for(int i = 0; i <= 2*POLYNOMIAL_MAX_DEGREE + 1; i++)
+	for(int i = 0; i <= 2*POLYNOMIAL_MAX_DEGREE; i++)
 	{
 		delete coefficients[i];
 	}
+	delete[] coefficients;
 }
 
 void Polynomial::copy(Polynomial* input)
@@ -57,7 +58,7 @@ void Polynomial::copy(Polynomial* input)
 	//copy an entire polynoial.
 	degree = input->degree;
 
-	for (int i = 2*POLYNOMIAL_MAX_DEGREE+1; i > degree; i--)
+	for (int i = 2*POLYNOMIAL_MAX_DEGREE; i > degree; i--)
 	{
 		*coefficients[i] = 0;
 	}
@@ -135,7 +136,7 @@ void Polynomial::set_coeff(uint8 coeff, int32 value)
 void Polynomial::clear()
 {
 	//Set all coefficients to 0.
-	for (int i = 0; i <= 2*POLYNOMIAL_MAX_DEGREE+1; i++)
+	for (int i = 0; i <= 2*POLYNOMIAL_MAX_DEGREE; i++)
 	{
 		*coefficients[i] = 0;
 	}
@@ -256,7 +257,7 @@ void Polynomial::debug_print_poly()
 void Polynomial::update_degree()
 {
 	//Update the degree if it has changed.
-	int i = 2*POLYNOMIAL_MAX_DEGREE+1;
+	int i = 2*POLYNOMIAL_MAX_DEGREE;
 
 	while (i >= 0 && *coefficients[i] == 0)
 	{
@@ -535,6 +536,7 @@ void Polynomial::get_polyroots_modp(uint32* numroots, uint32* rootlist, uint32 p
 				currentroot++;
 			}
 		}
+		delete mpztemp;
 		return;
 	}
 
@@ -563,6 +565,9 @@ void Polynomial::get_polyroots_modp(uint32* numroots, uint32* rootlist, uint32 p
 
 	if(allroots->degree == 0)
 	{
+		delete mpztemp;
+		delete allroots;
+		delete temp;
 		return;
 	}
 	else
@@ -579,6 +584,7 @@ void Polynomial::get_polyroots_modp(uint32* numroots, uint32* rootlist, uint32 p
 
 		delete temp;
 		delete mpztemp;
+		delete allroots;
 		return;
 	}
 
