@@ -1,3 +1,13 @@
+0.11 
+	- Fixed a bug printing large primes > 32 bits (thanks henryzz)
+	- Fixed a VS msiconfiguration that caused builds in release mode to crash (thanks henryzz)
+	- Added additional logging when failing to parse a relation, and warns the user if too many relations could not be parsed. 
+	- Removed some code intended to speed up the calculations but that did not.
+	- Some fixes to the mpz polynomial code.
+	- Use squfof when applicable instead of the tinyqs code.
+	- Added an option for not printing primes less than a limit, default is 1000 matching Msieve data. If set to 1, all primes are printed, 
+	  which is needed by CADO. 
+
 0.1 First release of the code. 
 
 0.07 General speedups. Implemented a 2lp routine, using a fast-qs grabbed from Msieve. The program can now read relations also in a binary format, which can save some space.

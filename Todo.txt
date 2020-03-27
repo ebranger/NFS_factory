@@ -1,16 +1,17 @@
 This is a list of things that could be improved.
 
-Better adjustment of tree size.
-
 Check that the polynomials match the input number. At currently I assume that this check is done by the python driver.
 
-Faster factorization of found relations. For now, just use the Pollard rho implementation from gnfs-lasieve.
-If the relations factorization becomes really fast, consider storing only the (a,b) pair, and reconstruct the entire relation if it found to be smooth.
+Faster factorization of found relations. For now, just use the Pollard rho implementation from gnfs-lasieve, with squfof for the final factorization.
+If the relations factorization becomes really fast, consider storing only the (a,b) pair, and reconstruct the entire relation if it is found to be smooth.
+A fast tiny ECM would probably be better, and also for 2lp handling.
+A fast tiny ECM with early abort would also be useful for any 3lp factoring.
 
 Improvements can be done to further save space in the binary relation format. 
 
-Test rational side batch smoothness checking. I have used batch smoothness checking only on the algebraic side, mainly on degree-4 polynomials.
+Further test rational side batch smoothness checking. I have used batch smoothness checking only on the algebraic side, mainly on degree-4 polynomials.
 
-For smoothness checking on the algebraic side, include only factor-base primes in the prime product.
+For smoothness checking on the algebraic side, include only factor-base primes in the prime product. I tried this with generating a 
+factor base using the code in Polynomial.cpp, but it turned out way to slow to be useful.
 
 
