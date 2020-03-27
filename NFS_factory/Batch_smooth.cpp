@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <time.h>
 #include "cofactorize.h"
+#include "Prime_product.h"
 
 #include "smintfact.h"
 
@@ -22,7 +23,7 @@ using namespace std;
 #define MAX_CHARS_IN_RELATION_LIST 150 //from the relations i have, this should be enought space to hold any relation. 
 
 //Initialize the batch smoothness class
-Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side)
+Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit)
 {
 	//init.
 	temp_number = new mpz_class;
@@ -39,6 +40,19 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	{ 
 		do_cofactorization = false;
 	}
+
+	poly = input_poly;
+
+	if (poly->poly_is_binomial_SNFS_deg4())
+	{
+		using_snfs_deg4_binomial = true;
+	}
+	else
+	{
+		using_snfs_deg4_binomial = false;
+	}
+
+	side = batch_checking_side;
 
 	prime_product = new mpz_class();
 	*prime_product = 1;
@@ -62,25 +76,11 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	max_entries_before_check = pow(2, (double)tree_size - 1);
 	save_filename = filename;
 	num_relations_found = 0;
+	min_saved_prime_limit = print_limit; //Do not print primes less than this. Msieve reconstructs primes less than 1000, CADO needs all primes (so set this to 1 to print everything).
 
 	Setup_memory(tree_size, max_bits_in_input);
 
-	poly = input_poly;
-
-	if (poly->poly_is_binomial_SNFS_deg4())
-	{
-		using_snfs_deg4_binomial = true;
-	}
-	else
-	{
-		using_snfs_deg4_binomial = false;
-	}
-
-	side = batch_checking_side;
-
-	relation_factor_list = new unsigned int[20]; //I expect more like 10 factors maximum to be stored, but better not run out of space!
-
-	precheck = true; //Debug, remove all tiny factors before batch-checking. Does not really affect the results much, though one or two more relations are found. And solves some crashes in the squfof code...
+	relation_factor_list = new unsigned int[40]; //I expect more like 10 factors maximum to be stored if primes < 1000 are omitted, but better not run out of space!
 
 	factor1 = new mpz_class;
 	factor2 = new mpz_class;
@@ -92,8 +92,6 @@ Batch_smooth::~Batch_smooth(void)
 	Output_solutions();
 	delete[] inputs;
 	delete prime_product;
-	delete no_print_product;
-	delete predivide_tiny_product;
 
 	for (int i = 0; i < num_relations_per_batch; i++)
 	{
@@ -119,16 +117,12 @@ void Batch_smooth::Setup_prime_product(int smooth_bound)
 	}
 
 	mpz_primorial_ui(prime_product->get_mpz_t(), smooth_bound);
-	mpz_primorial_ui(temp_number->get_mpz_t(), int(sqrt((double)smooth_bound))); //Extra small primes. this saves having to do some squarings in the batch tree bottom node, and adds very few bits to the product.
+	mpz_primorial_ui(temp_number->get_mpz_t(), int(sqrt((double)smooth_bound)));		//Extra small primes. this saves having to do some squarings in the batch tree bottom node, and adds very few bits to the product.
 	*prime_product = *prime_product * *temp_number;
-	mpz_primorial_ui(temp_number->get_mpz_t(), int(sqrt(sqrt((double)smooth_bound)))); // Extra even smaller primes.
+	mpz_primorial_ui(temp_number->get_mpz_t(), int(sqrt(sqrt((double)smooth_bound))));	// Extra even smaller primes.
 	*prime_product = *prime_product * (*temp_number * *temp_number);
-
-	predivide_tiny_product = new mpz_class;
-	*predivide_tiny_product = "10821610800"; // trial divide out the smallest primes that may occur to some higher power. This tests 2*2*2*2*3*3*3*5*5*7*7*11*11*13*13, for all 4-bit primes at least squared.
-
-	no_print_product = new mpz_class;
-	mpz_primorial_ui(no_print_product->get_mpz_t(), 1000); // For removing all factors less than 1000, since they will not be printed.
+	*temp_number = "10821610800";														//and the smallest primes to an even higher level!
+	*prime_product = *prime_product * (*temp_number * *temp_number);
 
 	long size = mpz_sizeinbase(prime_product->get_mpz_t(), 2);
 	cout << "Size of prime product: " << size << " bits." << endl;
@@ -219,13 +213,31 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class number, unsigned int index)
 			return false;
 		}
 
-		//Update: use SIQS, so 0 means fail and 1 means sucess, the name num_factors is now misleading...
-		num_factors = tinyqs(number.get_mpz_t(), factor1->get_mpz_t(), factor2->get_mpz_t());
+		*factor1 = 0;
+		*factor2 = 0;
 
-		if (num_factors == 0)
+		if (cofactor_bits <= 62)
 		{
-			//unsuccesful
-			return false;
+			uint32 factor;
+			factor = squfof(number.get_mpz_t());
+			if (factor > 0)
+			{
+				*factor1 = factor;
+				*factor2 = number / *factor1;
+			}
+		}
+
+		if (*factor1 == 0)
+		{
+			//either squfof failed or it is too big for squfof, so do qs.
+			int qs_sucess = tinyqs(number.get_mpz_t(), factor1->get_mpz_t(), factor2->get_mpz_t());
+
+			if (qs_sucess == 0)
+			{
+				//unsuccesful
+				return false;
+			}
+
 		}
 
 		//check if the factors are too big.
@@ -240,11 +252,11 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class number, unsigned int index)
 
 		//check that the factors are actual large primes. If it turns out to be a small prime that occured to a high
 		//power, it can cause problems later when it is assumed to be a prime larger than the rlim/alim.
-		if (mpz_sizeinbase(factor1->get_mpz_t(), 2) > one_lp_bit_limit)
+		if (!mpz_probab_prime_p(factor1->get_mpz_t(), 1))
 		{
 			return false;
 		}
-		if (mpz_sizeinbase(factor2->get_mpz_t(), 2) > one_lp_bit_limit)
+		if (!mpz_probab_prime_p(factor2->get_mpz_t(), 1))
 		{
 			return false;
 		}
@@ -301,7 +313,6 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class number, unsigned int index)
 //Use a scaled remainder tree for speed.
 void Batch_smooth::Do_batch_check()
 {
-
 	int limit;
 	int index;
 
@@ -321,22 +332,6 @@ void Batch_smooth::Do_batch_check()
 		if (*inputs[start_entry + index] < 0)
 		{
 			*inputs[start_entry + index] *= -1;
-		}
-
-		if (precheck == true)
-		{
-			//divide out tiny factors that can easily occur to high powers.
-
-			//mpz_gcd(temp_number->get_mpz_t(), inputs[start_entry + index]->get_mpz_t(), predivide_tiny_product->get_mpz_t());
-			mpz_gcd(temp_number->get_mpz_t(), inputs[start_entry + index]->get_mpz_t(), predivide_tiny_product->get_mpz_t());
-			//cout << "begin: \n" <<  *inputs[start_entry + entries] << "\n" << *small_prime_product << "\n" << temp_number << endl;
-			while (*temp_number > 1)
-			{
-				mpz_divexact(inputs[start_entry + index]->get_mpz_t(), inputs[start_entry + index]->get_mpz_t(), temp_number->get_mpz_t());
-				//*inputs[start_entry + entries] = *inputs[start_entry + entries] / *temp_number;
-				mpz_gcd(temp_number->get_mpz_t(), inputs[start_entry + index]->get_mpz_t(), temp_number->get_mpz_t());
-				//cout << *inputs[start_entry + entries] << endl;
-			}
 		}
 	}
 
@@ -538,16 +533,6 @@ void Batch_smooth::Output_solutions()
 				*relation_value = *relation_value * -1;
 			}
 
-			//divide out factors < 1000 that will not be printed. Msieve reconstructs these.
-			mpz_gcd(temp_number->get_mpz_t(), relation_value->get_mpz_t(), no_print_product->get_mpz_t());
-
-			while (*temp_number > 1)
-			{
-				mpz_divexact(relation_value->get_mpz_t(), relation_value->get_mpz_t(), temp_number->get_mpz_t());
-				//*relation_value = *relation_value / *temp_number;
-				mpz_gcd(temp_number->get_mpz_t(), relation_value->get_mpz_t(), temp_number->get_mpz_t());
-			}
-
 			//Now to factor the relation value
 			if (*relation_value > 1)
 			{
@@ -563,6 +548,7 @@ void Batch_smooth::Output_solutions()
 				{
 					mpz_divexact_ui(relation_value->get_mpz_t(), relation_value->get_mpz_t(), lp2[index]);
 				}
+
 				//run Pollard rho factoring on the remaining part of the relation. Since it is smooth Pollard rho should be a decent choice.
 				num_factors += factor(relation_factor_list + num_factors, relation_value->get_mpz_t(), 1);
 			}
@@ -630,13 +616,16 @@ void Batch_smooth::Output_solutions()
 			//Print the found factors for the smoothnes.checked and factored relation value.
 			for (int i = 0; i < num_factors; i++)
 			{
-				char_written = sprintf(text_ptr, "%X", relation_factor_list[i]);
-
-				text_ptr += char_written;
-				if (i < num_factors)
+				if (relation_factor_list[i] >= min_saved_prime_limit)
 				{
-					*text_ptr = ',';
-					text_ptr++;
+					char_written = sprintf(text_ptr, "%X", relation_factor_list[i]);
+
+					text_ptr += char_written;
+					if (i < num_factors)
+					{
+						*text_ptr = ',';
+						text_ptr++;
+					}
 				}
 			}
 
@@ -674,7 +663,6 @@ void Batch_smooth::Output_solutions()
 		*inputs[i] = 1;
 		a_vals[index] = 0;
 		b_vals[index] = 0;
-
 	}
 
 	fclose(outfile);

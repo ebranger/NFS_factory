@@ -9,7 +9,7 @@ using namespace std;
 class Batch_smooth
 {
 public:
-	Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side);
+	Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit);
 	~Batch_smooth(void);
 	void Do_batch_check();
 	void Add_number( long long a_val, long long b_val, char* relation_factor_list);
@@ -22,8 +22,6 @@ private:
 	mpz_class** inputs;
 	long long * a_vals, * b_vals;
 	char** list_of_factors; // holds the already known smooth side factor list.
-	mpz_class* no_print_product; // divide out factors less than 1000; they will not be printed.
-	mpz_class* predivide_tiny_product;
 	mpz_class* temp_number;
 	mpz_class* relation_value;
 	mpz_class* small_factors;
@@ -34,7 +32,6 @@ private:
 	unsigned long long* lp2;
 
 	bool product_set_up;
-	bool precheck;
 	void Setup_prime_product(int smooth_bound);
 	void Setup_memory(int tree_levels, int max_bits_in_input);
 	
@@ -47,6 +44,7 @@ private:
 	int max_entries_before_check;
 	long num_relations_found;
 	int num_relations_per_batch;
+	int min_saved_prime_limit;
 
 	Polynomial* poly;
 
@@ -60,7 +58,5 @@ private:
 	bool check_two_lp_smooth(mpz_class number, unsigned int index);
 	int smooth_factor_reduce;
 	mpz_class *factor1, *factor2;
-
-
 };
 

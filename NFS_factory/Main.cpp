@@ -42,6 +42,7 @@ struct nfs_parameters {
 	int mfbr, mfba;
 	int max_rational_coefficient_bits;
 	int max_algebraic_coefficient_bits;
+	int print_limit; // Skip printing all primes less than this.
 };
 
 //Function for reading a polynomial. Read only the parameters of interest to this program and store in an nfs_parameter struct.
@@ -82,7 +83,6 @@ void read_polynomial(string filename, nfs_parameters* params)
 			//Otherwise, both Y0 and Y1 needs to be set. 
 			if (data.length() == 1 && data[0] == 'm')
 			{
-
 				*number = line;
 				*number = *number * -1;
 				params->rational_polynomial->set_coeff(0, number);
@@ -159,6 +159,14 @@ void read_polynomial(string filename, nfs_parameters* params)
 				else if (data == "maxb")
 				{
 					params->maxb = stoi(line);
+				}
+			}
+			else if (data.length() == 5)
+			{
+				//skip printing small primes.
+				if (data == "print")
+				{
+					params->print_limit = stoi(line);
 				}
 			}
 		}
@@ -301,7 +309,8 @@ int read_batch_from_file(string filename, Batch_smooth* batch)
 
 		//if (relation_num == 2097152)
 		//{
-		//	//Debug break for testing.
+			//Debug break for testing.
+		//	cout << "Debug break for speed testing." << endl;
 		//	return batch->Get_num_relations_found();
 		//}
 
@@ -347,7 +356,7 @@ void get_relation_factor_list(unsigned int* list, int entries, char* relation_li
 //Read relations from a binary format file. 
 int read_batch_from_binary_file(string filename, Batch_smooth* batch)
 {
-	//The binary format is (int)a, (uint)b, (int)num_primes, (int)prime1 ... (int)prime_num_primes
+	//The binary format is (int)a, (uint)b, (int)num_primes, (uint)prime1 ... (uint)prime_num_primes
 	char buffer[512];
 	int a, b;
 	bool a_negative;
@@ -381,7 +390,7 @@ int read_batch_from_binary_file(string filename, Batch_smooth* batch)
 		//read the primes.
 		for (int i = 1; i <= relation_list[0]; i++)
 		{
-			infile.read(reinterpret_cast<char*>(&relation_list[i]), sizeof(int));
+			infile.read(reinterpret_cast<char*>(&relation_list[i]), sizeof(unsigned int));
 		}
 		get_relation_factor_list(relation_list, relation_list[0], relation_line);
 
@@ -418,6 +427,8 @@ int main(int argc, char* argv[])
 	nfs_parameters* param = new nfs_parameters();
 	param->maxa = 2147483647; //31 bit as default for now. The data I have should be filtered to have this.
 	param->maxb = 2147483647;
+
+	param->print_limit = 1000; //Msieve default. 
 
 	param->algebraic_polynomial = new Polynomial();
 	param->rational_polynomial = new Polynomial();
@@ -463,18 +474,17 @@ int main(int argc, char* argv[])
 		tree_bits = param->max_algebraic_coefficient_bits  + 30 * param->algebraic_polynomial->get_degree(); // Assume maxumum a, b is 30 bits (should be filtered to <29 bits in my SNFS-220 data....) and maximum coefficient is 30 bits (at bigger coefficients, batch factoring becomes too slow, and regular SNFS may be preferred? )
 	}
 
-
 	//Check that we read the input polynomial correctly.
 	if (param->algebraic_polynomial->get_degree() > 0 && param->rational_polynomial->get_degree() > 0 && param->lbpa > 0 && param->lbpr > 0 && param->smoothness_checking_side != 2)
 	{
 		time = clock();
 		if (param->smoothness_checking_side == 0)
 		{
-			batch = new Batch_smooth(param->rlim, param->lbpr, param->mfbr, tree_bits, outputfile, param->rational_polynomial,0); 
+			batch = new Batch_smooth(param->rlim, param->lbpr, param->mfbr, tree_bits, outputfile, param->rational_polynomial,0,param->print_limit); 
 		}
 		else if (param->smoothness_checking_side == 1)
 		{
-			batch = new Batch_smooth(param->alim, param->lbpa, param->mfba, tree_bits, outputfile, param->algebraic_polynomial,1); 
+			batch = new Batch_smooth(param->alim, param->lbpa, param->mfba, tree_bits, outputfile, param->algebraic_polynomial,1, param->print_limit);
 		}
 		else
 		{
@@ -507,7 +517,5 @@ int main(int argc, char* argv[])
 
 	cout << "Batch-checking all numbers took " << (clock() - time) / 1000 << " seconds. Found a total of " << total_num_relations << " relations." << endl;
 
-	cout << "Batch checking complete." << endl;
-
- 	return 0;
+	cout << "Batch checking complete." << endl; 	return 0;
 }

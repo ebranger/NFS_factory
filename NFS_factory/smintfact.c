@@ -96,8 +96,11 @@ int prho(mpz_t factor1, mpz_t factor2, mpz_t n, s32 c, s32 maxIts)
     
 
 /******************************************************************/    
-const s32 td_primes[]={2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53};
-const s32 num_td_primes=16;
+const s32 td_primes[]={ 
+2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31,
+37, 41, 43, 47, 53, 59, 61};
+const s32 num_td_primes=18;
+
 /******************************************************************/    
 int doTrialDiv(u32 *factors, mpz_t n)
 /******************************************************************/    
@@ -112,10 +115,12 @@ int doTrialDiv(u32 *factors, mpz_t n)
   }
 
   for (i=0; i<num_td_primes; i++) {
-    while (mpz_tdiv_qr_ui(q, r, n, td_primes[i])==0) {
-      factors[numFacts++] = td_primes[i];
-      mpz_set(n, q);
-    }
+	  if ((mpz_tdiv_qr_ui(q, r, n, td_primes[i]) == 0)) {
+		  factors[numFacts++] = td_primes[i];
+		  while (mpz_tdiv_qr_ui(q, r, n, td_primes[i]) == 0) {
+			  mpz_set(n, q);
+		  }
+	  }
   }
   return numFacts;
 }
@@ -152,6 +157,13 @@ int factor(u32 *factors, mpz_t n, int useTrialDivision)
     mpz_tdiv_q_2exp(remain, remain, 1);
   }
 
+  if (useTrialDivision) {
+	  numFactors = numFactors + doTrialDiv(factors, remain);
+	  if (n == 1) {
+		  return numFactors;
+	  }
+  }
+
   if (mpz_probab_prime_p(remain, 1)) {
     if (mpz_fits_ulong_p(remain)) {
       factors[numFactors++] = mpz_get_ui(remain);
@@ -161,12 +173,9 @@ int factor(u32 *factors, mpz_t n, int useTrialDivision)
 
 	/* Do some SQUFOF factoring at first */
   size = mpz_sizeinbase(remain,2);
-  if (size < 60)
+  if (size <= 62)
   {
-	  //gmp_printf("%s is an mpz %Zd\n", "here", remain);
-	  //printf("Its size in base 2 is %d\n",size);
-
-	  //Msieev squfof call
+	  //Msieve squfof call
 	  sq_f = squfof(remain);
   }
   else
