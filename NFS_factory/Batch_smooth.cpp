@@ -5,7 +5,6 @@
 #include <cerrno>
 #include <time.h>
 #include "cofactorize.h"
-#include "Prime_product.h"
 
 #include "smintfact.h"
 
