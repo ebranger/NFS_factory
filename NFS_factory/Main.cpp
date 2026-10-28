@@ -11,8 +11,8 @@ benefit from your work.
 
 Some parts of the code (and also this header), included in this
 distribution have been reused from other sources. In particular I
-have benefitted greatly from the work of Jason Papadopoulos's msieve, 
-the batch factorization code in CADO-NFS, and relation factoring code 
+have benefitted greatly from the work of Jason Papadopoulos's msieve,
+the batch factorization code in CADO-NFS, and relation factoring code
 found in gnfs-lasieve by Franke and Kleinjung.
 ----------------------------------------------------------------------*/
 
@@ -28,25 +28,44 @@ found in gnfs-lasieve by Franke and Kleinjung.
 #include <sstream>
 #include <stdio.h>
 #include <stdlib.h>
-#include <direct.h>
+#include <ctype.h>
+#include <limits.h>
 
 using namespace std;
+
+#define MAX_LINE_LENGTH 1024 //Longer lines in a relation file are skipped. gnfs-lasieve relations are typically less than 200 characters.
+#define MAX_BINARY_PRIMES 32 //Maximum number of primes in one relation in a binary relation file. More than this is treated as a corrupt file.
 
 struct nfs_parameters {
 	//only those possibly needed. In principle only one side is needed...
 	Polynomial* rational_polynomial, *algebraic_polynomial;
 	int lbpr, lbpa;
 	int smoothness_checking_side; // 0 for rational, 1 for algebraic.
-	long long maxa, maxb;
+	long long maxa, maxb; // Relations with larger |a| or b are skipped.
+	long long maxrels; // Stop after reading this many relations. 0 means no limit.
 	long long rlim, alim;
 	int mfbr, mfba;
 	int max_rational_coefficient_bits;
 	int max_algebraic_coefficient_bits;
 	int print_limit; // Skip printing all primes less than this.
+	bool cado_format; // Print all primes on both sides, with multiplicity, as CADO-NFS requires.
 };
 
+//Remove leading and trailing whitespace.
+string trim(const string& text)
+{
+	size_t first = text.find_first_not_of(" \t\r\n");
+	if (first == string::npos)
+	{
+		return "";
+	}
+	size_t last = text.find_last_not_of(" \t\r\n");
+	return text.substr(first, last - first + 1);
+}
+
 //Function for reading a polynomial. Read only the parameters of interest to this program and store in an nfs_parameter struct.
-void read_polynomial(string filename, nfs_parameters* params)
+//Returns false if the file could not be read, or if a value could not be parsed.
+bool read_polynomial(string filename, nfs_parameters* params)
 {
 	ifstream read;
 	read.open(filename, ifstream::in);
@@ -54,133 +73,226 @@ void read_polynomial(string filename, nfs_parameters* params)
 	if (read.fail())
 	{
 		cout << "Failed to open input polynomial file." << endl;
-		return;
+		return false;
 	}
 
 	//values indicating nothing read.
 	params->lbpa = 0;
 	params->lbpr = 0;
+	params->mfba = 0;
+	params->mfbr = 0;
+	params->alim = 0;
+	params->rlim = 0;
 	params->smoothness_checking_side = 2;
 
 	params->max_algebraic_coefficient_bits = 0;
 	params->max_rational_coefficient_bits = 0;
 
 	string line;
-	int position;
 	string data;
-
-	mpz_class* number = new mpz_class;
+	mpz_class number;
+	int line_number = 0;
 
 	while (getline(read, line))
 	{
-		if (line.length() > 0 && line.substr(0, 1) != "#")
-		{
-			position = line.find_first_of(":");
-			data = line.substr(0, position);
-			line = line.erase(0, position + 1);
+		line_number++;
+		line = trim(line);
 
+		if (line.length() == 0 || line[0] == '#')
+		{
+			continue;
+		}
+
+		size_t position = line.find(':');
+		if (position == string::npos)
+		{
+			continue;
+		}
+		data = trim(line.substr(0, position));
+		line = trim(line.substr(position + 1));
+
+		try
+		{
 			//For rational root given as x - m in the input. This is a short form occasionally used.
-			//Otherwise, both Y0 and Y1 needs to be set. 
-			if (data.length() == 1 && data[0] == 'm')
+			//Otherwise, both Y0 and Y1 needs to be set.
+			if (data == "m")
 			{
-				*number = line;
-				*number = *number * -1;
-				params->rational_polynomial->set_coeff(0, number);
+				number = line;
+				number = number * -1;
+				params->rational_polynomial->set_coeff(0, &number);
 				params->rational_polynomial->set_coeff(1, 1);
-				params->max_rational_coefficient_bits = mpz_sizeinbase(number->get_mpz_t(), 2);
+				params->max_rational_coefficient_bits = (int)mpz_sizeinbase(number.get_mpz_t(), 2);
 			}
 			//Polynomials in GGNFS format.
-			else if (data.length() == 2)
+			else if (data.length() == 2 && data[0] == 'c' && isdigit(data[1]))
 			{
-				if (data[0] == 'c' && isdigit(data[1]))
+				number = line;
+				params->algebraic_polynomial->set_coeff(data[1] - '0', &number);
+				if ((int)mpz_sizeinbase(number.get_mpz_t(), 2) > params->max_algebraic_coefficient_bits)
 				{
-					*number = line;
-					data = data.erase(0, 1);
-					params->algebraic_polynomial->set_coeff(stoi(data), number);
-					if (mpz_sizeinbase(number->get_mpz_t(), 2) > params->max_algebraic_coefficient_bits)
-					{
-						params->max_algebraic_coefficient_bits = mpz_sizeinbase(number->get_mpz_t(), 2);
-					}
-				}
-				else if (data[0] == 'Y' && isdigit(data[1]))
-				{
-					*number = line;
-					data = data.erase(0, 1);
-					params->rational_polynomial->set_coeff(stoi(data), number);
-					if (mpz_sizeinbase(number->get_mpz_t(), 2) > params->max_rational_coefficient_bits)
-					{
-						params->max_rational_coefficient_bits = mpz_sizeinbase(number->get_mpz_t(), 2);
-					}
+					params->max_algebraic_coefficient_bits = (int)mpz_sizeinbase(number.get_mpz_t(), 2);
 				}
 			}
-			else if (data.length() == 4)
+			else if (data.length() == 2 && data[0] == 'Y' && isdigit(data[1]))
 			{
-				//Factorbase limits on the algebraic side
-				if (data == "alim")
+				number = line;
+				params->rational_polynomial->set_coeff(data[1] - '0', &number);
+				if ((int)mpz_sizeinbase(number.get_mpz_t(), 2) > params->max_rational_coefficient_bits)
 				{
-					params->alim = stoi(line);
-				}
-				//Factorbase limits on the rational side
-				else if (data == "rlim")
-				{
-					params->rlim = stoi(line);
-				}
-				//Maximum bits for large primes on the algebraic side
-				if (data == "lpba")
-				{
-					params->lbpa = stoi(line);
-				}
-				//Maximum bits for large primes on the rational side
-				else if (data == "lpbr")
-				{
-					params->lbpr = stoi(line);
-				}
-				//Maximum bits for the remainder on the algebraic side after batch smoothness checking, to be factored by QS/squfof
-				if (data == "mfba")
-				{
-					params->mfba = stoi(line);
-				}
-				//Maximum bits for the remainder on the rational side after batch smoothness checking, to be factored by QS/squfof
-				else if (data == "mfbr")
-				{
-					params->mfbr = stoi(line);
-				}
-				//The side to perform batch smoothnes checking on. 0 is rational, 1 is algebraic
-				else if (data == "side")
-				{
-					params->smoothness_checking_side = stoi(line);
-				}
-				//maximum a value in a relation. Relations with larger (absolute) values are discarded
-				else if (data == "maxa")
-				{
-					params->maxa = stoi(line);
-				}
-				//Maximum b value in a relation. Relations with larger values are discarded
-				else if (data == "maxb")
-				{
-					params->maxb = stoi(line);
+					params->max_rational_coefficient_bits = (int)mpz_sizeinbase(number.get_mpz_t(), 2);
 				}
 			}
-			else if (data.length() == 5)
+			//Factorbase limits on the algebraic side
+			else if (data == "alim")
 			{
-				//skip printing small primes.
-				if (data == "print")
+				params->alim = stoll(line);
+			}
+			//Factorbase limits on the rational side
+			else if (data == "rlim")
+			{
+				params->rlim = stoll(line);
+			}
+			//Maximum bits for large primes on the algebraic side
+			else if (data == "lpba")
+			{
+				params->lbpa = stoi(line);
+			}
+			//Maximum bits for large primes on the rational side
+			else if (data == "lpbr")
+			{
+				params->lbpr = stoi(line);
+			}
+			//Maximum bits for the remainder on the algebraic side after batch smoothness checking, to be factored by QS/squfof
+			else if (data == "mfba")
+			{
+				params->mfba = stoi(line);
+			}
+			//Maximum bits for the remainder on the rational side after batch smoothness checking, to be factored by QS/squfof
+			else if (data == "mfbr")
+			{
+				params->mfbr = stoi(line);
+			}
+			//The side to perform batch smoothnes checking on. 0 is rational, 1 is algebraic
+			else if (data == "side")
+			{
+				params->smoothness_checking_side = stoi(line);
+			}
+			//maximum a value in a relation. Relations with larger (absolute) values are discarded
+			else if (data == "maxa")
+			{
+				params->maxa = stoll(line);
+			}
+			//Maximum b value in a relation. Relations with larger values are discarded
+			else if (data == "maxb")
+			{
+				params->maxb = stoll(line);
+			}
+			//Stop after reading this many relations from the relation file. Useful for testing.
+			else if (data == "maxrels")
+			{
+				params->maxrels = stoll(line);
+			}
+			//skip printing small primes.
+			else if (data == "print")
+			{
+				params->print_limit = stoi(line);
+			}
+			//Output format: msieve (default) or cado.
+			else if (data == "format")
+			{
+				if (line == "cado")
 				{
-					params->print_limit = stoi(line);
+					params->cado_format = true;
+				}
+				else if (line == "msieve")
+				{
+					params->cado_format = false;
+				}
+				else
+				{
+					cout << "Unknown output format " << line << " on line " << line_number << " of the polynomial file. Use msieve or cado." << endl;
+					return false;
 				}
 			}
+		}
+		catch (const exception&)
+		{
+			cout << "Could not read the value of " << data << " on line " << line_number << " of the polynomial file." << endl;
+			return false;
 		}
 	}
 
 	read.close();
-	delete number;
+	return true;
+}
+
+//Parse a decimal integer with an optional leading minus sign. Returns a pointer to the first character after the number,
+//or NULL if there was no number, or it was too long to be a reasonable a or b value.
+const char* parse_integer(const char* text, long long* value)
+{
+	bool negative = false;
+	int digits = 0;
+
+	if (*text == '-')
+	{
+		negative = true;
+		text++;
+	}
+
+	*value = 0;
+	while (isdigit(*text))
+	{
+		*value = 10 * *value + (*text - '0');
+		text++;
+		digits++;
+	}
+
+	if (digits == 0 || digits > 18)
+	{
+		return NULL;
+	}
+
+	if (negative)
+	{
+		*value = -*value;
+	}
+	return text;
+}
+
+//Check that a factor list only contains hexadecimal numbers separated by commas. An empty list is allowed.
+bool valid_factor_list(const char* list)
+{
+	bool expect_digit = true;
+
+	for (const char* c = list; *c != '\0'; c++)
+	{
+		if (isxdigit(*c))
+		{
+			expect_digit = false;
+		}
+		else if (*c == ',' && !expect_digit)
+		{
+			expect_digit = true;
+		}
+		else
+		{
+			return false;
+		}
+	}
+
+	//No trailing comma, unless the list is empty.
+	return !expect_digit || *list == '\0';
+}
+
+//Check if a relation is within the allowed range of a and b values.
+bool relation_in_range(long long a, long long b, nfs_parameters* param)
+{
+	return llabs(a) <= param->maxa && b <= param->maxb;
 }
 
 //Function for reading relations to be processed.
-int read_batch_from_file(string filename, Batch_smooth* batch)
+int read_batch_from_file(string filename, Batch_smooth* batch, nfs_parameters* param)
 {
-	mpz_class* value = new mpz_class;
-
 	FILE* infile;
 
 	infile = fopen(filename.c_str(), "r");
@@ -191,218 +303,224 @@ int read_batch_from_file(string filename, Batch_smooth* batch)
 		return -1;
 	}
 
-	char buffer[512];
+	char buffer[MAX_LINE_LENGTH];
 	long long a, b;
-	bool a_negative;
-	char *tmp;
+	const char *tmp;
 	char* ratlist, *alglist;
-	string line;
-	unsigned int relation_list[20];
-	unsigned int copy_testing[20];
 
-	ratlist = new char[200]; //plenty of space
-	alglist = new char[200]; // plenty of space
+	long long relation_num = 0;
+	long long failed_relations = 0;
+	long long skipped_relations = 0;
+	bool incomplete_last_line = false;
 
-	char *line_end;
+	//fgets and char checking is so much faster than stringstream...
+	while (fgets(buffer, sizeof(buffer), infile) != NULL)
+	{
+		//read a,b,rational factor list and algebraic factor list from each line of the input.
+		size_t length = strlen(buffer);
 
-	int relation_num = 0;
-	int failed_relations = 0;
-
-	while (!feof(infile)) {
-		//read a,b,rational factor list from each line of the input.
-		//fgets and char checking is so much faster than stringstream...
-		fgets(buffer, sizeof(buffer), infile);
-
-		tmp = buffer;
-
-		if (buffer[0] == '#')
+		if (length == 0 || buffer[length - 1] != '\n')
 		{
-			//Comment, so skip this line.
-			goto next_relation;
-		}
+			if (feof(infile))
+			{
+				//The last line has no newline. A siever that is stopped may leave such an incomplete line, so skip it.
+				incomplete_last_line = true;
+				break;
+			}
 
-		if (buffer[0] == '-')
-		{
-			a_negative = true;
-			tmp++;
-		}
-		else
-		{
-			a_negative = false;
-		}
-
-		a = 0;
-		b = 0;
-
-		//a is stored in decimal and can be negative
-		while (isdigit(*tmp))
-		{
-			a = 10 * a + (*tmp - '0');
-			tmp++;
-		}
-
-		if (a_negative)
-		{
-			a = a *-1;
-		}
-
-		if (*tmp != ',')
-		{
-			//should be a comma separating a and b
+			//Line too long. Skip the rest of it.
+			int c;
+			while ((c = fgetc(infile)) != EOF && c != '\n');
 			failed_relations++;
-			goto next_relation;
+			continue;
 		}
 
-		tmp++;
-
-		//b is stored in decimal and is positive
-		while (isdigit(*tmp))
+		//Remove the line ending.
+		buffer[--length] = '\0';
+		if (length > 0 && buffer[length - 1] == '\r')
 		{
-			b = 10 * b + (*tmp - '0');
-			tmp++;
+			buffer[--length] = '\0';
 		}
 
-		if (*tmp != ':')
+		if (length == 0 || buffer[0] == '#')
 		{
-			//should be a colon separating b and the rational factor list.
+			//Empty line or comment, so skip this line.
+			continue;
+		}
+
+		//The line should be a,b:rational factor list:algebraic factor list
+		ratlist = strchr(buffer, ':');
+		alglist = (ratlist != NULL) ? strchr(ratlist + 1, ':') : NULL;
+
+		if (alglist == NULL || strchr(alglist + 1, ':') != NULL)
+		{
 			failed_relations++;
-			goto next_relation;
+			continue;
 		}
 
-		*tmp++;
+		*ratlist++ = '\0';
+		*alglist++ = '\0';
 
-		if (*tmp == ':')
+		//a is stored in decimal and can be negative, b is stored in decimal and is positive.
+		tmp = parse_integer(buffer, &a);
+		if (tmp == NULL || *tmp != ',')
 		{
-			//empty rational list, but perhaps a complete algebraic one
-			*tmp++;
-			*ratlist = '\0';
-		}
-		else
-		{
-			strcpy(ratlist, tmp);
-			line_end = strstr(ratlist, ":");
-			*line_end = '\0';
-			tmp = line_end + 1;
+			failed_relations++;
+			continue;
 		}
 
-		strcpy(alglist, tmp);
-		//Store the relation list in a char array tmp.
-		line_end = strstr(alglist, "\n");
-
-		if (line_end != NULL)
+		tmp = parse_integer(tmp + 1, &b);
+		if (tmp == NULL || *tmp != '\0' || b <= 0)
 		{
-			//algebraic list, the line ends ends with "\n\0". remove the newline.
-			*line_end = '\0';
+			failed_relations++;
+			continue;
 		}
 
-		//Add the relation to be bacth smoothnes checked.
-		if (batch->side == 0)
+		if (!valid_factor_list(ratlist) || !valid_factor_list(alglist))
 		{
-			batch->Add_number(a, b, alglist);
+			failed_relations++;
+			continue;
 		}
-		else
+
+		if (!relation_in_range(a, b, param))
 		{
-			batch->Add_number(a, b, ratlist);
+			skipped_relations++;
+			continue;
+		}
+
+		//Add the relation to be batch smoothness checked. The factor list of the other side is saved for printing.
+		if (!batch->Add_number(a, b, (batch->side == 0) ? alglist : ratlist))
+		{
+			failed_relations++;
+			continue;
 		}
 
 		relation_num++;
 
-		//if (relation_num == 2097152)
-		//{
-			//Debug break for testing.
-		//	cout << "Debug break for speed testing." << endl;
-		//	return batch->Get_num_relations_found();
-		//}
-
-		next_relation:;
+		if (param->maxrels > 0 && relation_num >= param->maxrels)
+		{
+			cout << "Stopping after " << relation_num << " relations (maxrels)." << endl;
+			break;
+		}
 	}
+
+	fclose(infile);
 
 	//Finish any remaining relations, even if the tree is not filled.
 	batch->Do_batch_check();
 
-	if (failed_relations >= 100)
+	if (incomplete_last_line)
 	{
-		cout << "Failed to parse " << failed_relations << " relations out of a total of " << relation_num + failed_relations << " relations." << endl;
+		cout << "Skipped an incomplete last line in the relation file." << endl;
 	}
 
-	delete value;
-	delete alglist;
-	delete ratlist;
+	if (failed_relations > 0)
+	{
+		cout << "Failed to parse " << failed_relations << " relations out of a total of " << relation_num + failed_relations + skipped_relations << " relations." << endl;
+	}
+
+	if (skipped_relations > 0)
+	{
+		cout << "Skipped " << skipped_relations << " relations with a or b larger than maxa or maxb." << endl;
+	}
+
 	return batch->Get_num_relations_found();
 }
 
-//Read a list of binary values and convert to a char array for printing.
-void get_relation_factor_list(unsigned int* list, int entries, char* relation_line)
+//Convert a list of primes to a comma separated list of hexadecimal values for printing.
+void get_relation_factor_list(unsigned int* primes, unsigned int num_primes, char* relation_line)
 {
 	char* text_ptr = relation_line;
 
-	int char_written;
-
-	for (int i = 1; i <= list[0]; i++)
+	for (unsigned int i = 0; i < num_primes; i++)
 	{
-		char_written = sprintf(text_ptr, "%X", list[i]);
-
-		text_ptr += char_written;
-		if (i < entries)
+		if (i > 0)
 		{
-			*text_ptr = ',';
-			text_ptr++;
+			*text_ptr++ = ',';
 		}
+		text_ptr += sprintf(text_ptr, "%X", primes[i]);
 	}
 
 	*text_ptr = '\0';
 }
 
-//Read relations from a binary format file. 
-int read_batch_from_binary_file(string filename, Batch_smooth* batch)
+//Read relations from a binary format file.
+int read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_parameters* param)
 {
-	//The binary format is (int)a, (uint)b, (int)num_primes, (uint)prime1 ... (uint)prime_num_primes
-	char buffer[512];
+	//The binary format is (int)a, (uint)b, (uint)num_primes, (uint)prime1 ... (uint)prime_num_primes
 	int a;
 	unsigned int b;
-	char *tmp;
-	string line;
-	unsigned int relation_list[20];
-	int factors_in_list;
-	char *line_end;
-	char* relation_line = new char[300];
+	unsigned int num_primes;
+	unsigned int primes[MAX_BINARY_PRIMES];
+	char relation_line[MAX_BINARY_PRIMES * 9 + 1]; //At most 8 hex digits and a comma per prime.
 
-	int relation_num = 0;
+	long long relation_num = 0;
+	long long skipped_relations = 0;
+	bool corrupt = false;
 
 	ifstream infile;
 	infile.open(filename, ios::binary);
-	
+
 	if (infile.fail())
 	{
 		cout << "Failed to open input saved relations file." << endl;
-		return 0;
+		return -1;
 	}
 
 	while (infile.peek() != EOF)
 	{
-		//read (a,b) value of relation
+		//read (a,b) value of relation, and how many primes are stored in the relation.
 		infile.read(reinterpret_cast<char*>(&a), sizeof(int));
 		infile.read(reinterpret_cast<char*>(&b), sizeof(unsigned int));
+		infile.read(reinterpret_cast<char*>(&num_primes), sizeof(unsigned int));
 
-		//read how many primes are stored in the relation.
-		infile.read(reinterpret_cast<char*>(&relation_list[0]), sizeof(int));
+		if (!infile || num_primes > MAX_BINARY_PRIMES)
+		{
+			corrupt = true;
+			break;
+		}
 
 		//read the primes.
-		for (int i = 1; i <= relation_list[0]; i++)
-		{
-			infile.read(reinterpret_cast<char*>(&relation_list[i]), sizeof(unsigned int));
-		}
-		get_relation_factor_list(relation_list, relation_list[0], relation_line);
+		infile.read(reinterpret_cast<char*>(primes), num_primes * sizeof(unsigned int));
 
-		//Add the relation to be bacth smoothnes checked.
+		if (!infile)
+		{
+			corrupt = true;
+			break;
+		}
+
+		if (!relation_in_range(a, b, param))
+		{
+			skipped_relations++;
+			continue;
+		}
+
+		get_relation_factor_list(primes, num_primes, relation_line);
+
+		//Add the relation to be batch smoothness checked.
 		batch->Add_number(a, b, relation_line);
 		relation_num++;
 
+		if (param->maxrels > 0 && relation_num >= param->maxrels)
+		{
+			cout << "Stopping after " << relation_num << " relations (maxrels)." << endl;
+			break;
+		}
 	}
 	infile.close();
 
 	//Check final relations, even if the tree is not filled.
 	batch->Do_batch_check();
+
+	if (corrupt)
+	{
+		cout << "The binary relation file is truncated or corrupt after " << relation_num + skipped_relations << " relations. The rest of the file was skipped." << endl;
+	}
+
+	if (skipped_relations > 0)
+	{
+		cout << "Skipped " << skipped_relations << " relations with a or b larger than maxa or maxb." << endl;
+	}
 
 	return batch->Get_num_relations_found();
 }
@@ -425,47 +543,76 @@ int main(int argc, char* argv[])
 	clock_t time;
 
 	nfs_parameters* param = new nfs_parameters();
-	param->maxa = 2147483647; //31 bit as default for now. The data I have should be filtered to have this.
-	param->maxb = 2147483647;
+	param->maxa = LLONG_MAX; //No limit unless set in the polynomial file.
+	param->maxb = LLONG_MAX;
+	param->maxrels = 0;
 
-	param->print_limit = 1000; //Msieve default. 
+	param->print_limit = 1000; //Msieve default.
+	param->cado_format = false;
 
 	param->algebraic_polynomial = new Polynomial();
 	param->rational_polynomial = new Polynomial();
 
-	read_polynomial(polyfile, param);
-
-	//Check the polynomial to ensure input is reasonable.
-
-	//Primes of 32 bits is the maximum that can be handled by the batch factoring code. Several changes are needed before 33 or larger will work (mainly in how an identified relation is fully factored).
-	if (param->rlim > 4294967295 && param->smoothness_checking_side == 0)
+	if (!read_polynomial(polyfile, param))
 	{
-		cout << "Batch smoothness checking can only be done for primes of 32 bits or less. Use a lower rlim" << endl;
 		return -1;
 	}
 
-	if (param->alim > 4294967295 && param->smoothness_checking_side == 1)
+	//Check the polynomial to ensure input is reasonable.
+	if (param->smoothness_checking_side != 0 && param->smoothness_checking_side != 1)
 	{
-		cout << "Batch smoothness checking can only be done for primes of 32 bits or less. Use a lower alim" << endl;
+		cout << "Could not find which side to check for smoothness. Set side to 0 (rational) or 1 (algebraic) in the polynomial file." << endl;
+		return -1;
+	}
+
+	if (param->algebraic_polynomial->get_degree() == 0 || param->rational_polynomial->get_degree() == 0)
+	{
+		cout << "Failed to read the polynomials from the polynomial file." << endl;
+		return -1;
+	}
+
+	//Values for the side to batch check.
+	bool rational = (param->smoothness_checking_side == 0);
+	long long lim = rational ? param->rlim : param->alim;
+	int lbp = rational ? param->lbpr : param->lbpa;
+	int mfb = rational ? param->mfbr : param->mfba;
+	string side_name = rational ? "r" : "a";
+
+	if (lim < 1000)
+	{
+		cout << "The factor base limit " << side_name << "lim is missing or too small in the polynomial file." << endl;
+		return -1;
+	}
+
+	//Primes of 32 bits is the maximum that can be handled by the batch factoring code. Several changes are needed before 33 or larger will work (mainly in how an identified relation is fully factored).
+	if (lim > 4294967295)
+	{
+		cout << "Batch smoothness checking can only be done for primes of 32 bits or less. Use a lower " << side_name << "lim" << endl;
+		return -1;
+	}
+
+	if (lbp < 1 || lbp > 32)
+	{
+		cout << "The large prime bound lpb" << side_name << " is missing, or larger than 32 bits, in the polynomial file." << endl;
+		return -1;
+	}
+
+	if (mfb < 1)
+	{
+		cout << "mfb" << side_name << " is missing from the polynomial file." << endl;
 		return -1;
 	}
 
 	//Can only handle cofactorization with 2lp, so no point in checking numbers that are too big for this.
-	if (param->lbpr *2 < param->mfbr && param->smoothness_checking_side == 0)
+	if (lbp * 2 < mfb)
 	{
-		cout << "Three large prime cofactorization not supported. Use a lower mfbr." << endl;
+		cout << "Three large prime cofactorization not supported. Use a lower mfb" << side_name << "." << endl;
 		return -1;
 	}
 
-	if (param->lbpa * 2 < param->mfba && param->smoothness_checking_side == 1)
-	{
-		cout << "Three large prime cofactorization not supported. Use a lower mfba." << endl;
-		return -1;
-	}
-
-	//Estimate size needed to hold the value of the algebraic/rational polynomial values. 
+	//Estimate size needed to hold the value of the algebraic/rational polynomial values.
 	int tree_bits;
-	if (param->smoothness_checking_side == 0)
+	if (rational)
 	{
 		tree_bits = param->max_rational_coefficient_bits+30; //Assume max 30 bit a, b values in relation, when calculating the optimal tree size.
 	}
@@ -474,31 +621,23 @@ int main(int argc, char* argv[])
 		tree_bits = param->max_algebraic_coefficient_bits  + 30 * param->algebraic_polynomial->get_degree(); // Assume maxumum a, b is 30 bits and maximum coefficient is 30 bits (at bigger coefficients, batch factoring becomes too slow, and regular SNFS may be preferred? )
 	}
 
-	//Check that we read the input polynomial correctly.
-	if (param->algebraic_polynomial->get_degree() > 0 && param->rational_polynomial->get_degree() > 0 && param->lbpa > 0 && param->lbpr > 0 && param->smoothness_checking_side != 2)
-	{
-		time = clock();
-		if (param->smoothness_checking_side == 0)
-		{
-			batch = new Batch_smooth(param->rlim, param->lbpr, param->mfbr, tree_bits, outputfile, param->rational_polynomial,0,param->print_limit); 
-		}
-		else if (param->smoothness_checking_side == 1)
-		{
-			batch = new Batch_smooth(param->alim, param->lbpa, param->mfba, tree_bits, outputfile, param->algebraic_polynomial,1, param->print_limit);
-		}
-		else
-		{
-			cout << "Could not find which side to check for smoothness. Check the input polynomial." << endl; 
-			return -1;
-		}
+	Polynomial* checked_poly = rational ? param->rational_polynomial : param->algebraic_polynomial;
+	Polynomial* other_poly = rational ? param->algebraic_polynomial : param->rational_polynomial;
 
-		cout << "Prime products set up, it took " << (clock() - time) / 1000 << " seconds." << endl;
+	if (param->cado_format)
+	{
+		//CADO-NFS needs all primes on both sides, so print everything and rebuild the factor list of the other side.
+		param->print_limit = 1;
+		cout << "Writing relations in CADO-NFS format, with all primes on both sides." << endl;
 	}
 	else
 	{
-		cout << "Failed to read input polynomial file." << endl;
-		return -1;
+		other_poly = NULL;
 	}
+
+	time = clock();
+	batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly);
+	cout << "Prime products set up, it took " << (clock() - time) / CLOCKS_PER_SEC << " seconds." << endl;
 
 	time = clock();
 
@@ -507,15 +646,30 @@ int main(int argc, char* argv[])
 	if (inputfile.find(".bin") == string::npos)
 	{
 		//for reading gnfs-lasieve output.
-		total_num_relations = read_batch_from_file(inputfile, batch);
+		total_num_relations = read_batch_from_file(inputfile, batch, param);
 	}
 	else
 	{
 		//for reading binary formated files, assumed to have a .bin extension.
-		total_num_relations = read_batch_from_binary_file(inputfile, batch);
+		total_num_relations = read_batch_from_binary_file(inputfile, batch, param);
 	}
 
-	cout << "Batch-checking all numbers took " << (clock() - time) / 1000 << " seconds. Found a total of " << total_num_relations << " relations." << endl;
+	if (total_num_relations >= 0)
+	{
+		cout << "Batch-checking all numbers took " << (clock() - time) / CLOCKS_PER_SEC << " seconds. Found a total of " << total_num_relations << " relations." << endl;
+	}
 
-	cout << "Batch checking complete." << endl; 	return 0;
+	delete batch;
+	delete param->algebraic_polynomial;
+	delete param->rational_polynomial;
+	delete param;
+
+	if (total_num_relations < 0)
+	{
+		//The relation file could not be read.
+		return -1;
+	}
+
+	cout << "Batch checking complete." << endl;
+	return 0;
 }

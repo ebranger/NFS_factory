@@ -1,5 +1,6 @@
 #include "Batch_smooth.h"
 #include <vector>
+#include <algorithm>
 #include <iostream>
 #include <math.h>
 #include <cerrno>
@@ -19,15 +20,19 @@ using namespace std;
 // Note: max squarings 2 means max power is 2^2=4.
 //Currently: do only 1 squaring, it misses a few very rare relations but increase speed slightly.
 
-#define MAX_CHARS_IN_RELATION_LIST 150 //from the relations i have, this should be enought space to hold any relation. 
+#define MAX_CHARS_IN_RELATION_LIST 320 //Longest saved factor list. Relations with longer lists are rejected. Typical lists are less than 100 characters.
+
+#define MAX_FACTORS_IN_RELATION 512 //Each factor is at least 2, so this is enough for any relation value of up to 512 bits.
+
+#define LP_PRIMALITY_REPS 10 //Miller-Rabin rounds used before accepting a cofactor as a large prime in a relation.
 
 //Initialize the batch smoothness class
-Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit)
+Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly)
 {
 	//init.
 	temp_number = new mpz_class;
 
-	long long max_prime_limit = pow(2.0, lbp);
+	long long max_prime_limit = 1LL << lbp;
 
 	//if fblim and 2^lbp match, then we batch-check all numbers against the full primorial and do no cofactorization of any remaining numbers.
 	// fblim > 2^lbp makes little sense? so assume equal, otherwise we will end up printing relations with some factors too large. Maybe check this in input file and warn user?
@@ -41,6 +46,7 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	}
 
 	poly = input_poly;
+	other_poly = other_side_poly;
 
 	if (poly->poly_is_binomial_SNFS_deg4())
 	{
@@ -57,54 +63,76 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	*prime_product = 1;
 
 	Setup_prime_product(fblim);
-	product_set_up = true;
 	max_batch_prime = fblim;
 
 	//For handling 2lp cofactorization. 
 	one_lp_bit_limit = lbp;
-	two_lp_min_limit = 2 * floor(log2(fblim));
+	two_lp_min_limit = 2 * (long long)floor(log2((double)fblim));
 	max_cofactor_bit_size = mfb;
 	
 	entries = 0;
 
 	//Estiamte a good tree size for the remainder tree
-	tree_size = ceil(log2((mpz_sizeinbase(prime_product->get_mpz_t(), 2)/max_bits_in_input))) + 1; // +1 since max_bits_in_input seems to overestminate slightly.
+	tree_size = (int)ceil(log2((double)(mpz_sizeinbase(prime_product->get_mpz_t(), 2)/max_bits_in_input))) + 1; // +1 since max_bits_in_input seems to overestminate slightly.
 	tree_size = min(MAX_TREE_LEVELS, tree_size);  // Force the remainder tree to not be too big to save memory.
+	tree_size = max(2, tree_size); // The remainder tree needs at least one level above the relations.
 
-	start_entry = pow(2, (double)(tree_size - 1)) - 1;
-	max_entries_before_check = pow(2, (double)tree_size - 1);
+	start_entry = (1 << (tree_size - 1)) - 1;
+	max_entries_before_check = 1 << (tree_size - 1);
 	save_filename = filename;
 	num_relations_found = 0;
+	num_factoring_failures = 0;
+	num_other_side_failures = 0;
 	min_saved_prime_limit = print_limit; //Do not print primes less than this. Msieve reconstructs primes less than 1000, CADO needs all primes (so set this to 1 to print everything).
 
 	Setup_memory(tree_size, max_bits_in_input);
 
-	relation_factor_list = new unsigned int[40]; //I expect more like 10 factors maximum to be stored if primes < 1000 are omitted, but better not run out of space!
+	relation_factor_list = new unsigned int[MAX_FACTORS_IN_RELATION]; //Small primes are stored with multiplicity, so this needs room for many factors.
+	other_side_factor_list = new unsigned int[MAX_FACTORS_IN_RELATION];
 
 	factor1 = new mpz_class;
 	factor2 = new mpz_class;
 }
 
-//Destructor, free all memory that was requested.
+//Destructor, free all memory that was requested. Relations must already have been checked with Do_batch_check.
 Batch_smooth::~Batch_smooth(void)
 {
-	Output_solutions();
+	if (num_factoring_failures > 0)
+	{
+		cout << "Could not fully factor " << num_factoring_failures << " smooth relations, they were not saved." << endl;
+	}
+
+	if (num_other_side_failures > 0)
+	{
+		cout << num_other_side_failures << " smooth relations had a factor list for the other side that did not match its norm, they were not saved." << endl;
+	}
+
+	for (int i = 0; i < 2 * num_relations_per_batch - 1; i++)
+	{
+		delete inputs[i];
+	}
 	delete[] inputs;
 	delete prime_product;
+	delete temp_number;
 
 	for (int i = 0; i < num_relations_per_batch; i++)
 	{
-		delete list_of_factors[i];
+		delete[] list_of_factors[i];
 	}
 	delete[] list_of_factors;
-	delete lp1;
-	delete lp2;
+	delete[] a_vals;
+	delete[] b_vals;
+	delete[] is_smooth;
+	delete[] lp1;
+	delete[] lp2;
+	delete[] relation_factor_list;
+	delete[] other_side_factor_list;
 	delete factor1;
 	delete factor2;
 }
 
 //Setup the primorials to be used.
-void Batch_smooth::Setup_prime_product(int smooth_bound)
+void Batch_smooth::Setup_prime_product(long long smooth_bound)
 {
 	//So apparently mpir knows primorials. Problem solved!
 
@@ -115,7 +143,7 @@ void Batch_smooth::Setup_prime_product(int smooth_bound)
 		return;
 	}
 
-	mpz_primorial_ui(prime_product->get_mpz_t(), smooth_bound);
+	mpz_primorial_ui(prime_product->get_mpz_t(), (mpir_ui)smooth_bound);
 	mpz_primorial_ui(temp_number->get_mpz_t(), int(sqrt((double)smooth_bound)));		//Extra small primes. this saves having to do some squarings in the batch tree bottom node, and adds very few bits to the product.
 	*prime_product = *prime_product * *temp_number;
 	mpz_primorial_ui(temp_number->get_mpz_t(), int(sqrt(sqrt((double)smooth_bound))));	// Extra even smaller primes.
@@ -123,7 +151,7 @@ void Batch_smooth::Setup_prime_product(int smooth_bound)
 	*temp_number = "10821610800";														//and the smallest primes to an even higher level!
 	*prime_product = *prime_product * (*temp_number * *temp_number);
 
-	long size = mpz_sizeinbase(prime_product->get_mpz_t(), 2);
+	size_t size = mpz_sizeinbase(prime_product->get_mpz_t(), 2);
 	cout << "Size of prime product: " << size << " bits." << endl;
 
 	return;
@@ -134,7 +162,7 @@ void Batch_smooth::Setup_prime_product(int smooth_bound)
 void Batch_smooth::Setup_memory(int tree_levels, int max_bits_in_input)
 {
 	//allocate enough memory to hold all the numbers in the product tree without having to increase any mpz size
-	int temp = pow(2, (double)(tree_levels));
+	int temp = 1 << tree_levels;
 	inputs = new mpz_class*[temp - 1];
 	lp1 = new unsigned long long[temp];
 	lp2 = new unsigned long long[temp];
@@ -144,6 +172,7 @@ void Batch_smooth::Setup_memory(int tree_levels, int max_bits_in_input)
 	num_relations_per_batch = temp;
 	a_vals = new long long[num_relations_per_batch];
 	b_vals = new long long[num_relations_per_batch];
+	is_smooth = new bool[num_relations_per_batch];
 
 	list_of_factors = new char*[num_relations_per_batch];
 
@@ -155,13 +184,14 @@ void Batch_smooth::Setup_memory(int tree_levels, int max_bits_in_input)
 		//set large prime list to 0
 		lp1[i] = 0;
 		lp2[i] = 0;
+		is_smooth[i] = false;
 	}
 
 	temp = max_bits_in_input;
 
 	for (int level = tree_levels; level >= 1; level--)
 	{
-		limit = pow(2, (double)(level - 1)) - 1;
+		limit = (1 << (level - 1)) - 1;
 
 		for (int i = limit; i <= 2 * limit; i++)
 		{
@@ -174,13 +204,18 @@ void Batch_smooth::Setup_memory(int tree_levels, int max_bits_in_input)
 	}
 }
 
-//Add one relation to be batch-smoothness checked.
-void Batch_smooth::Add_number(long long a_val, long long b_val, char* relation_factor_list)
+//Add one relation to be batch-smoothness checked. Returns false if the factor list is too long to be saved.
+bool Batch_smooth::Add_number(long long a_val, long long b_val, const char* relation_factor_list)
 {
 	//add one relation for batch-factoring.
+	if (strlen(relation_factor_list) >= MAX_CHARS_IN_RELATION_LIST)
+	{
+		return false;
+	}
 
 	a_vals[entries] = a_val;
 	b_vals[entries] = b_val;
+	is_smooth[entries] = true; //Until the batch check shows otherwise.
 	strcpy(list_of_factors[entries], relation_factor_list);
 
 	entries++;
@@ -190,13 +225,14 @@ void Batch_smooth::Add_number(long long a_val, long long b_val, char* relation_f
 	{
 		Do_batch_check();
 	}
+	return true;
 }
 
-//Check whether a remainder factors into two numbers less than the lp limit. 
+//Check whether a remainder factors into two numbers less than the lp limit.
 //If it does, it is a valid relation!
-bool Batch_smooth::check_two_lp_smooth(mpz_class number, unsigned int index)
+bool Batch_smooth::check_two_lp_smooth(mpz_class& number, unsigned int index)
 {
-	int cofactor_bits = mpz_sizeinbase(number.get_mpz_t(), 2);
+	int cofactor_bits = (int)mpz_sizeinbase(number.get_mpz_t(), 2);
 
 	if (cofactor_bits > max_cofactor_bit_size)
 	{
@@ -251,11 +287,11 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class number, unsigned int index)
 
 		//check that the factors are actual large primes. If it turns out to be a small prime that occured to a high
 		//power, it can cause problems later when it is assumed to be a prime larger than the rlim/alim.
-		if (!mpz_probab_prime_p(factor1->get_mpz_t(), 1))
+		if (!mpz_probab_prime_p(factor1->get_mpz_t(), LP_PRIMALITY_REPS))
 		{
 			return false;
 		}
-		if (!mpz_probab_prime_p(factor2->get_mpz_t(), 1))
+		if (!mpz_probab_prime_p(factor2->get_mpz_t(), LP_PRIMALITY_REPS))
 		{
 			return false;
 		}
@@ -280,7 +316,7 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class number, unsigned int index)
 	}
 
 	//should be one large prime by now. Make sure it is actually a large prime as well.
-	if (mpz_probab_prime_p(number.get_mpz_t(), 1) && number > max_batch_prime)
+	if (number > max_batch_prime && mpz_probab_prime_p(number.get_mpz_t(), LP_PRIMALITY_REPS))
 	{
 		lp1[index] = mpz_get_ui(number.get_mpz_t());
 		lp2[index] = 0;
@@ -293,10 +329,16 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class number, unsigned int index)
 		//and let the relation factoring code handle it later, without any lp hints from here.
 		num_factors = factor(relation_factor_list, number.get_mpz_t(), 0);
 
-		for (int i = 0; i <= num_factors; i++)
+		if (num_factors < 0)
 		{
-			if (log2(relation_factor_list[i]) >= one_lp_bit_limit)
+			return false;
+		}
+
+		for (int i = 0; i < num_factors; i++)
+		{
+			if ((unsigned long long)relation_factor_list[i] >> one_lp_bit_limit != 0)
 			{
+				//factor is 2^lbp or larger.
 				return false;
 			}
 		}
@@ -313,7 +355,12 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class number, unsigned int index)
 void Batch_smooth::Do_batch_check()
 {
 	int limit;
-	int index;
+
+	if (entries == 0)
+	{
+		//Nothing to check.
+		return;
+	}
 
 	//set up polynomial values
 	for (int index = 0; index < entries; index++)
@@ -337,7 +384,7 @@ void Batch_smooth::Do_batch_check()
 	//set up product tree.
 	for (int level = tree_size; level > 1; level--)
 	{
-		limit = pow(2, (double)(level - 2)) - 1;
+		limit = (1 << (level - 2)) - 1;
 
 		for (int i = limit; i <= 2 * limit; i++)
 		{
@@ -345,22 +392,22 @@ void Batch_smooth::Do_batch_check()
 		}
 	}
 
-	long size = mpz_sizeinbase(inputs[0]->get_mpz_t(), 2);
+	size_t size = mpz_sizeinbase(inputs[0]->get_mpz_t(), 2);
 	cout << "Size of top node of product tree: " << size << " bits." << endl;
 
 
 	//The core remainder tree calculations are based on the CADO-nfs batch function
 
 	long h = tree_size + 2; // extra fudge bits.
-	unsigned long i, j, guard, *product_bits;
+	unsigned long i, guard, *product_bits;
 	product_bits = new unsigned long[2 * num_relations_per_batch];
 
 	guard = h;
 
 	//Get the size of all products, they are needed for shifts later.
-	for (i = 0; i < 2 * num_relations_per_batch - 1; i++)
+	for (i = 0; i < (unsigned long)(2 * num_relations_per_batch - 1); i++)
 	{
-		product_bits[i] = mpz_sizeinbase(inputs[i]->get_mpz_t(), 2);
+		product_bits[i] = (unsigned long)mpz_sizeinbase(inputs[i]->get_mpz_t(), 2);
 	}
 
 	mpz_class Q;
@@ -371,7 +418,7 @@ void Batch_smooth::Do_batch_check()
 
 	for (int level = 2; level <= tree_size - 1; level++)
 	{
-		limit = pow(2, (double)(level - 1)) - 1;
+		limit = (1 << (level - 1)) - 1;
 
 		for (int i = limit; i <= 2 * limit; i = i + 2)
 		{
@@ -391,7 +438,7 @@ void Batch_smooth::Do_batch_check()
 	}
 
 	//for the bottom node, i.e. the relation numbers, store the Prime_product % number in Q, to keep the number (in input_number[]). Then it can be used later for squaring tests mod the number.
-	for (i = num_relations_per_batch - 1; i < 2 * num_relations_per_batch - 1; i = i + 2)
+	for (i = num_relations_per_batch - 1; i < (unsigned long)(2 * num_relations_per_batch - 1); i = i + 2)
 	{
 		//One bottom node
 		Q = *inputs[(i - 1) / 2] * *inputs[i + 1];
@@ -421,8 +468,7 @@ void Batch_smooth::Do_batch_check()
 			if (!check_two_lp_smooth(Q, i - num_relations_per_batch + 1))
 			{
 				//not smooth.
-				a_vals[i - num_relations_per_batch + 1] = 0;
-				b_vals[i - num_relations_per_batch + 1] = 0;
+				is_smooth[i - num_relations_per_batch + 1] = false;
 			}
 		}
 		else
@@ -432,8 +478,7 @@ void Batch_smooth::Do_batch_check()
 				//Do not do 2lp testing. If Q = 0 then the number is smooth
 
 				//not smooth.
-				a_vals[i - num_relations_per_batch + 1] = 0;
-				b_vals[i - num_relations_per_batch + 1] = 0;
+				is_smooth[i - num_relations_per_batch + 1] = false;
 			}
 		}
 
@@ -466,8 +511,7 @@ void Batch_smooth::Do_batch_check()
 			if (!check_two_lp_smooth(Q, i - num_relations_per_batch + 2))
 			{
 				//not smooth.
-				a_vals[i - num_relations_per_batch + 2] = 0;
-				b_vals[i - num_relations_per_batch + 2] = 0;
+				is_smooth[i - num_relations_per_batch + 2] = false;
 			}
 		}
 		else
@@ -477,16 +521,87 @@ void Batch_smooth::Do_batch_check()
 				//Do not do 2lp testing. If Q = 0 then the relation is smooth
 
 				//not smooth.
-				a_vals[i - num_relations_per_batch + 2] = 0;
-				b_vals[i - num_relations_per_batch + 2] = 0;
+				is_smooth[i - num_relations_per_batch + 2] = false;
 			}
 		}
 	}
 
 	Output_solutions();
 
-	delete product_bits;
+	delete[] product_bits;
 	return;
+}
+
+//Append a prime to a comma separated list of hexadecimal primes.
+static void append_prime(string& list, unsigned long long prime)
+{
+	char hex[20];
+	sprintf(hex, "%llX", prime);
+
+	if (!list.empty())
+	{
+		list += ',';
+	}
+	list += hex;
+}
+
+//Rebuild the factor list of the side that was not batch checked, with all primes and their multiplicities, as CADO-NFS requires.
+//The saved list is checked against the norm, and primes left out by the siever (typically small ones) are added.
+//Returns false if a saved prime does not divide the norm, or if the norm could not be fully factored.
+bool Batch_smooth::Complete_other_side(int index, string& list)
+{
+	mpz_class norm;
+	other_poly->evaluate_polynomial_homogenous(&norm, a_vals[index], b_vals[index]);
+	mpz_abs(norm.get_mpz_t(), norm.get_mpz_t());
+
+	if (norm == 0)
+	{
+		return false;
+	}
+
+	vector<unsigned long long> primes;
+
+	//Divide out the primes from the saved list, once per time they are listed.
+	const char* text = list_of_factors[index];
+	while (*text != '\0')
+	{
+		char* end;
+		unsigned long long prime = strtoull(text, &end, 16);
+
+		if (prime < 2 || !mpz_divisible_ui_p(norm.get_mpz_t(), (mpir_ui)prime))
+		{
+			return false;
+		}
+		mpz_divexact_ui(norm.get_mpz_t(), norm.get_mpz_t(), (mpir_ui)prime);
+		primes.push_back(prime);
+
+		text = (*end == ',') ? end + 1 : end;
+	}
+
+	//Factor whatever is left, which also finds any higher multiplicities of the listed primes.
+	if (norm > 1)
+	{
+		int num_other_factors = factor(other_side_factor_list, norm.get_mpz_t(), 1);
+
+		if (num_other_factors < 0)
+		{
+			return false;
+		}
+
+		for (int j = 0; j < num_other_factors; j++)
+		{
+			primes.push_back(other_side_factor_list[j]);
+		}
+	}
+
+	sort(primes.begin(), primes.end());
+
+	list.clear();
+	for (size_t j = 0; j < primes.size(); j++)
+	{
+		append_prime(list, primes[j]);
+	}
+	return true;
 }
 
 //For each relation passing the batch smoothnes checking, complete the relation and print it.
@@ -494,12 +609,13 @@ void Batch_smooth::Output_solutions()
 {
 	//Print all found relations to file
 	int limit;
-	limit = pow(2, (double)(tree_size - 1)) - 1;
+	limit = (1 << (tree_size - 1)) - 1;
 	int index;
 
-	char* relation_text = new char[200]; // i expect that a relation fits in a maximum of 130 bytes, but would rather not run out of space.
-	char* text_ptr;
-	int char_written;
+	string checked_side_list; //factors of the relation value that was batch checked.
+	string other_side_list; //factors of the other side, if it is rebuilt.
+	string relation_text;
+	char ab_text[50];
 
 	int num_good = 0;
 
@@ -518,147 +634,104 @@ void Batch_smooth::Output_solutions()
 		index = i - limit;
 
 		//If the relation passed the smoothness test, and has been checked.
-		if (a_vals[index] != 0 && index < entries)
+		if (index < entries && is_smooth[index])
 		{
 			relation_value = inputs[i];
 
-			//negative values are handled by msieve, ignore here. 
+			//negative values are handled by msieve, ignore here.
 			if (*relation_value < 0)
 			{
 				*relation_value = *relation_value * -1;
 			}
 
-			//Now to factor the relation value
-			if (*relation_value > 1)
-			{
-				//factor the relation. First, check for already factored 2lp primes.
-				num_factors = 0;
+			//factor the relation. First, divide out already factored large primes.
+			num_factors = 0;
 
-				if (lp1[index] > 1)
-				{
-					mpz_divexact_ui(relation_value->get_mpz_t(), relation_value->get_mpz_t(), lp1[index]);
-				}
-
-				if (lp2[index] > 1)
-				{
-					mpz_divexact_ui(relation_value->get_mpz_t(), relation_value->get_mpz_t(), lp2[index]);
-				}
-
-				//run Pollard rho factoring on the remaining part of the relation. Since it is smooth Pollard rho should be a decent choice.
-				num_factors += factor(relation_factor_list + num_factors, relation_value->get_mpz_t(), 1);
-			}
-			else
-			{
-				//No factors to print. Should not happen now that all primes are available for printing?
-				num_factors = 0;
-			}
-
-			if (num_factors == -1)
-			{
-				//Typically: one factor is too big for an uint32
-				//cout << "failed to factor a relation!" << endl;
-				//cout << a_vals[index] << " " << b_vals[index] << endl;
-			}
-
-			//Print the relation to file.
-			text_ptr = relation_text;
-
-			char_written = sprintf(text_ptr, "%lld", a_vals[index]);
-
-			text_ptr += char_written;
-			*text_ptr = ',';
-			text_ptr++;
-
-			char_written = sprintf(text_ptr, "%lld", b_vals[index]);
-
-			text_ptr += char_written;
-			*text_ptr = ':';
-			text_ptr++;
-			*text_ptr = '\0';
-
-			if (side == 0)
-			{
-				//rational relations to be printed first. These should just have been found and stored in the list. 
-			}
-			else
-			{
-				//algebraic relations are found, so print the saved rational factors first.
-				strcpy(text_ptr, list_of_factors[index]);
-				text_ptr += strlen(text_ptr);
-				*text_ptr = ':';
-				text_ptr++;
-				*text_ptr = '\0';
-			}
-
-			//Handle large primes that may have been saved earlier.
 			if (lp1[index] > 1)
 			{
-				char_written = sprintf(text_ptr, "%llX", lp1[index]);
-				text_ptr += char_written;
-				*text_ptr = ',';
-				text_ptr++;
-				lp1[index] = 0;
+				mpz_divexact_ui(relation_value->get_mpz_t(), relation_value->get_mpz_t(), lp1[index]);
 			}
 
 			if (lp2[index] > 1)
 			{
-				char_written = sprintf(text_ptr, "%llX", lp2[index]);
-				text_ptr += char_written;
-				*text_ptr = ',';
-				text_ptr++;
-				lp2[index] = 0;
+				mpz_divexact_ui(relation_value->get_mpz_t(), relation_value->get_mpz_t(), lp2[index]);
 			}
 
-			//Print the found factors for the smoothnes.checked and factored relation value.
-			for (int i = 0; i < num_factors; i++)
+			//run Pollard rho factoring on the remaining part of the relation. Since it is smooth Pollard rho should be a decent choice.
+			if (*relation_value > 1)
 			{
-				if (relation_factor_list[i] >= min_saved_prime_limit)
-				{
-					char_written = sprintf(text_ptr, "%X", relation_factor_list[i]);
-
-					text_ptr += char_written;
-					if (i < num_factors)
-					{
-						*text_ptr = ',';
-						text_ptr++;
-					}
-				}
+				num_factors = factor(relation_factor_list, relation_value->get_mpz_t(), 1);
 			}
 
-			//remove the final comma that was printed.
-			text_ptr--;
-			*text_ptr = '\0';
-
-			if (side == 0)
+			if (num_factors < 0)
 			{
-				*text_ptr = ':';
-				text_ptr++;
-
-				//rational relations were just found and printed, now fill in the saved algebraic ones.
-				//TODO: test this program when batch checking rational values, and test the outputting done here
-				strcpy(text_ptr, list_of_factors[index]);
-				text_ptr += strlen(text_ptr);
+				//Typically: one factor is too big for an uint32. An incomplete relation is useless, so skip it.
+				num_factoring_failures++;
+			}
+			else if (other_poly != NULL && !Complete_other_side(index, other_side_list))
+			{
+				num_other_side_failures++;
 			}
 			else
 			{
-				//algebraic relations are found, so now all rational and algebraic relations have already been printed.
+				const char* saved_list = (other_poly != NULL) ? other_side_list.c_str() : list_of_factors[index];
 
+				//The factor list for the batch checked side: large primes first, then the other factors.
+				checked_side_list.clear();
+
+				if (lp1[index] > 1)
+				{
+					append_prime(checked_side_list, lp1[index]);
+				}
+
+				if (lp2[index] > 1)
+				{
+					append_prime(checked_side_list, lp2[index]);
+				}
+
+				for (int j = 0; j < num_factors; j++)
+				{
+					if (relation_factor_list[j] >= (unsigned int)min_saved_prime_limit)
+					{
+						append_prime(checked_side_list, relation_factor_list[j]);
+					}
+				}
+
+				//The relation is a,b:rational factors:algebraic factors
+				sprintf(ab_text, "%lld,%lld:", a_vals[index], b_vals[index]);
+				relation_text = ab_text;
+
+				if (side == 0)
+				{
+					//rational factors were just found, the algebraic ones were saved.
+					relation_text += checked_side_list;
+					relation_text += ':';
+					relation_text += saved_list;
+				}
+				else
+				{
+					//algebraic factors were just found, the rational ones were saved.
+					relation_text += saved_list;
+					relation_text += ':';
+					relation_text += checked_side_list;
+				}
+
+				relation_text += '\n';
+
+				//print the found relation
+				fputs(relation_text.c_str(), outfile);
+
+				num_good++;
 			}
-
-			*text_ptr = '\n';
-			text_ptr++;
-			*text_ptr = '\0';
-
-			//print the found relation
-			fputs(relation_text, outfile);
-
-			num_good++;
 		}
 
 		//reset for next iteration.
 		*inputs[i] = 1;
 		a_vals[index] = 0;
 		b_vals[index] = 0;
+		is_smooth[index] = false;
+		lp1[index] = 0;
+		lp2[index] = 0;
 	}
 
 	fclose(outfile);
@@ -666,7 +739,6 @@ void Batch_smooth::Output_solutions()
 	cout << "Ran a batch, found " << num_good << " smooth numbers" << endl;
 	num_relations_found += num_good;
 	entries = 0;
-	delete relation_text;
 }
 
 int Batch_smooth::Get_num_relations_found()

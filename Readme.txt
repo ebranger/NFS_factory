@@ -27,6 +27,14 @@ The polynomial file describes the polynomial used for the current factorization,
 
 The polynomial file contains the polynomial pair and factorization parameters in a GGNFS format, and NFS_factory needs the polynomial pair, rlim/alim, lbpr/lbpa and mfbr/mfba to run. The batch smoothness checking will test the relations for all primes up to rlim/alim, and any remiainder is checked if it is a single large prime if it is less than lbpr/lbpa, or double-large prime if it is less than mfbr/mfba. One more parameter is required to control which polynomial should be checked for smoothness. Batch smoothness checking is done on the rational side if “side: 0” is specified in the polynomial file, and on the algebraic side if “side: 1” is specified.
 
+A few optional parameters can also be given in the polynomial file:
+- format: msieve (default) or cado. With "format: cado" all primes are printed on both sides of each relation, with multiplicity, as CADO-NFS requires. The factor list of the side that is not batch checked is then rebuilt from its norm, and relations where the stored factors do not match the norm are skipped. With "format: msieve" that factor list is printed as it was read, and small primes are left out, since msieve finds them itself.
+- print: primes smaller than this are not printed for the batch checked side (default 1000, which msieve handles). Not needed with "format: cado".
+- maxa, maxb: relations with |a| larger than maxa, or b larger than maxb, are skipped. There is no limit by default.
+- maxrels: stop after this many relations have been read from the relation file. Useful for testing and timing.
+
+Lines in a GGNFS/msieve relation file that cannot be parsed are skipped and counted, as is an incomplete last line, which a siever that is stopped may leave behind. A binary relation file that ends in the middle of a relation is also detected.
+
 Once NFS_factory has processed and found enough relations, msieve or CADO-NFS is needed for the postprocessing, and this code was made with msieve in mind.
 
 Parameter selection

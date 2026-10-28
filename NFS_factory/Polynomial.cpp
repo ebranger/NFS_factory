@@ -337,6 +337,8 @@ void Polynomial::make_monic(uint32 p)
 	if (*temp == 0)
 	{
 		cout << "Inversion failed in poly_make_moic" << endl;
+		delete temp;
+		delete prime;
 		return;
 	}
 

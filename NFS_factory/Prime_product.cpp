@@ -3,21 +3,23 @@
 #include <iostream>
 using namespace std;
 
-//Adapted from code used to generate a factorbase for a lattice siever, 
+//Adapted from code used to generate a factorbase for a lattice siever,
+//Experimental: a prime product with only the primes that can divide the polynomial norms. Not used by the program yet.
 
 #define ERATOSTHENES_LINEWIDTH 16384 //Fits in cache, works for now.
 
-void multiply_recursively(vector<uint32> primes, uint32 lowest_prime_index, uint32 highest_prime_index, mpz_class* product, uint32 square_lim, uint32 double_square_lim)
+//Multiply the primes with index lowest_prime_index to highest_prime_index (inclusive) into product.
+void multiply_recursively(const vector<uint32>& primes, uint32 lowest_prime_index, uint32 highest_prime_index, mpz_class* product, uint32 square_lim, uint32 double_square_lim)
 {
 	if (highest_prime_index - lowest_prime_index >= 10)
 	{
-		int mid_index = (highest_prime_index + lowest_prime_index) / 2;
+		uint32 mid_index = (highest_prime_index + lowest_prime_index) / 2;
 		multiply_recursively(primes, lowest_prime_index, mid_index, product, square_lim, double_square_lim);
 		multiply_recursively(primes, mid_index + 1, highest_prime_index, product, square_lim, double_square_lim);
 	}
-	else 
+	else
 	{
-		for (int i = lowest_prime_index; i <= highest_prime_index; i++)
+		for (uint32 i = lowest_prime_index; i <= highest_prime_index; i++)
 		{
 			*product = *product * primes[i];
 			if (primes[i] >= square_lim)
@@ -165,11 +167,13 @@ void setup_prime_product(Polynomial* poly, uint32 maxprime, mpz_class* prime_pro
 		}
 	}
 
-	multiply_recursively(primelist, 0, num_primes, prime_product, int(sqrt(maxprime)), int(sqrt(sqrt(maxprime))));
-	
+	if (num_primes > 0)
+	{
+		multiply_recursively(primelist, 0, num_primes - 1, prime_product, int(sqrt(maxprime)), int(sqrt(sqrt(maxprime))));
+	}
+
 	//Cleanup
 	delete number_of_roots;
-	delete rootlist;
-	delete sieve_line;
-	primelist.empty();
+	delete[] rootlist;
+	delete[] sieve_line;
 }
