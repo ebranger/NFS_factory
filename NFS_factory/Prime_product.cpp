@@ -3,6 +3,7 @@
 #include <iostream>
 #include <algorithm>
 #include <math.h>
+#include <intrin.h>
 using namespace std;
 
 //Only primes that can divide the norm F(a,b) of a relation are needed in the prime product. For a polynomial of degree d,
@@ -89,27 +90,77 @@ static void find_primes(uint32 max_prime, vector<uint32>& primes)
 	}
 }
 
-static inline uint32 mulmod(uint32 a, uint32 b, uint32 p)
+//Arithmetic modulo an odd prime p < 2^32 in Montgomery form, with R = 2^64. This avoids divisions in the root tests.
+struct montgomery_field
 {
-	return (uint32)((uint64)a * b % p);
-}
+	uint64 p;
+	uint64 ninv; //-1/p mod 2^64
+	uint64 one; //R mod p, which is 1 in Montgomery form
+	uint64 r2; //R^2 mod p, for converting to Montgomery form
 
-static uint32 powmod(uint32 base, uint32 exponent, uint32 p)
-{
-	uint64 result = 1;
-	uint64 b = base % p;
-
-	while (exponent > 0)
+	montgomery_field(uint32 prime)
 	{
-		if (exponent & 1)
+		p = prime;
+		uint64 inverse = p; //correct to 3 bits, since p * p = 1 mod 8 for odd p.
+		for (int i = 0; i < 5; i++)
 		{
-			result = result * b % p;
+			inverse *= 2 - p * inverse;
 		}
-		b = b * b % p;
-		exponent >>= 1;
+		ninv = 0 - inverse;
+		one = (0 - p) % p;
+		uint64 high, low = _umul128(one, one, &high);
+		_udiv128(high, low, p, &r2);
 	}
-	return (uint32)result;
-}
+
+	//a * b / R mod p, for a, b < p.
+	uint64 multiply(uint64 a, uint64 b) const
+	{
+		uint64 t = a * b; //less than 2^64, since a, b < 2^32
+		uint64 m = t * ninv;
+		uint64 high;
+		_umul128(m, p, &high);
+		//t + m * p is divisible by R, and the low part of the sum carries unless t is 0.
+		uint64 result = high + (t != 0);
+		return (result >= p) ? result - p : result;
+	}
+
+	uint64 to_montgomery(uint64 a) const
+	{
+		return multiply(a, r2);
+	}
+
+	uint64 add(uint64 a, uint64 b) const
+	{
+		uint64 sum = a + b;
+		return (sum >= p) ? sum - p : sum;
+	}
+
+	uint64 subtract(uint64 a, uint64 b) const
+	{
+		return (a >= b) ? a - b : a + p - b;
+	}
+
+	//base^exponent, with base and result in Montgomery form.
+	uint64 power(uint64 base, uint64 exponent) const
+	{
+		uint64 result = one;
+		while (exponent > 0)
+		{
+			if (exponent & 1)
+			{
+				result = multiply(result, base);
+			}
+			base = multiply(base, base);
+			exponent >>= 1;
+		}
+		return result;
+	}
+
+	uint64 inverse(uint64 a) const
+	{
+		return power(a, p - 2);
+	}
+};
 
 static uint32 gcd(uint32 a, uint32 b)
 {
@@ -123,7 +174,7 @@ static uint32 gcd(uint32 a, uint32 b)
 }
 
 //Degree of a polynomial, or -1 for the zero polynomial.
-static int poly_degree(const uint32* a, int max_degree)
+static int poly_degree(const uint64* a, int max_degree)
 {
 	for (int i = max_degree; i >= 0; i--)
 	{
@@ -135,8 +186,9 @@ static int poly_degree(const uint32* a, int max_degree)
 	return -1;
 }
 
-//result = a * b mod (g, p), where g is monic of degree d and a, b have degree less than d.
-static void poly_mulmod(const uint32* a, const uint32* b, const uint32* g, int d, uint32 p, uint32* result)
+//result = a^2 mod g, where g is monic of degree d and a has degree less than d. All coefficients in Montgomery form.
+//Each product a[i] * a[j] with i < j is computed once and added twice.
+static void poly_sqrmod(const montgomery_field& field, const uint64* a, const uint64* g, int d, uint64* result)
 {
 	uint64 product[2 * MAX_POLY_DEGREE];
 
@@ -147,9 +199,11 @@ static void poly_mulmod(const uint32* a, const uint32* b, const uint32* g, int d
 
 	for (int i = 0; i < d; i++)
 	{
-		for (int j = 0; j < d; j++)
+		product[2 * i] = field.add(product[2 * i], field.multiply(a[i], a[i]));
+		for (int j = i + 1; j < d; j++)
 		{
-			product[i + j] = (product[i + j] + (uint64)a[i] * b[j]) % p;
+			uint64 t = field.multiply(a[i], a[j]);
+			product[i + j] = field.add(product[i + j], field.add(t, t));
 		}
 	}
 
@@ -161,19 +215,31 @@ static void poly_mulmod(const uint32* a, const uint32* b, const uint32* g, int d
 		{
 			for (int j = 0; j < d; j++)
 			{
-				product[k - d + j] = (product[k - d + j] + (p - c) * (uint64)g[j]) % p;
+				product[k - d + j] = field.subtract(product[k - d + j], field.multiply(c, g[j]));
 			}
 		}
 	}
 
 	for (int i = 0; i < d; i++)
 	{
-		result[i] = (uint32)product[i];
+		result[i] = product[i];
 	}
 }
 
-//Degree of gcd(a, b) mod p. a and b are overwritten.
-static int poly_gcd_degree(uint32* a, uint32* b, int max_degree, uint32 p)
+//result = a * x mod g, where g is monic of degree d and a has degree less than d. All coefficients in Montgomery form.
+static void poly_mulx(const montgomery_field& field, const uint64* a, const uint64* g, int d, uint64* result)
+{
+	uint64 top = a[d - 1];
+
+	for (int i = d - 1; i > 0; i--)
+	{
+		result[i] = field.subtract(a[i - 1], field.multiply(top, g[i]));
+	}
+	result[0] = field.subtract(0, field.multiply(top, g[0]));
+}
+
+//Degree of gcd(a, b). a and b are overwritten. All coefficients in Montgomery form.
+static int poly_gcd_degree(const montgomery_field& field, uint64* a, uint64* b, int max_degree)
 {
 	int da = poly_degree(a, max_degree);
 	int db = poly_degree(b, max_degree);
@@ -181,13 +247,13 @@ static int poly_gcd_degree(uint32* a, uint32* b, int max_degree, uint32 p)
 	while (db >= 0)
 	{
 		//a = a mod b
-		uint32 inverse = powmod(b[db], p - 2, p);
+		uint64 inverse = field.inverse(b[db]);
 		while (da >= db)
 		{
-			uint32 c = mulmod(a[da], inverse, p);
+			uint64 c = field.multiply(a[da], inverse);
 			for (int j = 0; j <= db; j++)
 			{
-				a[da - db + j] = (uint32)((a[da - db + j] + (uint64)(p - c) * b[j]) % p);
+				a[da - db + j] = field.subtract(a[da - db + j], field.multiply(c, b[j]));
 			}
 			da = poly_degree(a, da - 1);
 		}
@@ -224,20 +290,20 @@ static bool has_root(const uint32* f, int d, uint32 p)
 		return false;
 	}
 
+	montgomery_field field(p);
+
 	//Make the polynomial monic.
-	uint32 g[MAX_POLY_DEGREE + 1];
-	uint32 inverse = powmod(f[d], p - 2, p);
+	uint64 g[MAX_POLY_DEGREE + 1];
+	uint64 inverse = field.inverse(field.to_montgomery(f[d]));
 	for (int i = 0; i <= d; i++)
 	{
-		g[i] = mulmod(f[i], inverse, p);
+		g[i] = field.multiply(field.to_montgomery(f[i]), inverse);
 	}
 
 	//Compute x^p mod g by squaring and multiplying, starting from x.
-	uint32 r[MAX_POLY_DEGREE + 1] = { 0 };
-	uint32 x[MAX_POLY_DEGREE + 1] = { 0 };
-	uint32 temp[MAX_POLY_DEGREE + 1];
-	r[1] = 1;
-	x[1] = 1;
+	uint64 r[MAX_POLY_DEGREE + 1] = { 0 };
+	uint64 temp[MAX_POLY_DEGREE + 1];
+	r[1] = field.one;
 
 	int top_bit = 31;
 	while (((p >> top_bit) & 1) == 0)
@@ -247,10 +313,10 @@ static bool has_root(const uint32* f, int d, uint32 p)
 
 	for (int bit = top_bit - 1; bit >= 0; bit--)
 	{
-		poly_mulmod(r, r, g, d, p, temp);
+		poly_sqrmod(field, r, g, d, temp);
 		if ((p >> bit) & 1)
 		{
-			poly_mulmod(temp, x, g, d, p, r);
+			poly_mulx(field, temp, g, d, r);
 		}
 		else
 		{
@@ -259,7 +325,7 @@ static bool has_root(const uint32* f, int d, uint32 p)
 	}
 
 	//f has a root mod p if gcd(g, x^p - x) is not constant.
-	r[1] = (r[1] + p - 1) % p;
+	r[1] = field.subtract(r[1], field.one);
 	for (int i = d; i <= MAX_POLY_DEGREE; i++)
 	{
 		r[i] = 0;
@@ -271,10 +337,11 @@ static bool has_root(const uint32* f, int d, uint32 p)
 		return true;
 	}
 
-	return poly_gcd_degree(g, r, d, p) >= 1;
+	return poly_gcd_degree(field, g, r, d) >= 1;
 }
 
 //Check if a binomial f = c_d x^d + c_0 has a root mod p, i.e. if -c_0 / c_d is a d-th power mod p.
+//That is the same as -c_0 * c_d^(d-1) being a d-th power, since the two differ by the d-th power c_d^d, which avoids an inversion.
 static bool binomial_has_root(uint32 c_d, uint32 c_0, int d, uint32 p)
 {
 	if (c_0 == 0)
@@ -282,9 +349,10 @@ static bool binomial_has_root(uint32 c_d, uint32 c_0, int d, uint32 p)
 		return true;
 	}
 
-	uint32 k = mulmod(p - c_0, powmod(c_d, p - 2, p), p);
+	montgomery_field field(p);
+	uint64 value = field.multiply(field.to_montgomery(p - c_0), field.power(field.to_montgomery(c_d), d - 1));
 	uint32 g = gcd((uint32)d, p - 1);
-	return powmod(k, (p - 1) / g, p) == 1;
+	return field.power(value, (p - 1) / g) == field.one;
 }
 
 //Multiply the factors into result, using a balanced product tree.
