@@ -10,6 +10,7 @@
 #include "smintfact.h"
 #include "Profile.h"
 #include "Prime_product.h"
+#include "Smooth_factor.h"
 
 using namespace std;
 
@@ -336,14 +337,14 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class& number, unsigned int index)
 		*factor1 = 0;
 		*factor2 = 0;
 
-		if (cofactor_bits <= 62)
+		if (cofactor_bits <= 63 && mpz_odd_p(number.get_mpz_t()))
 		{
-			uint32 factor;
-			factor = squfof(number.get_mpz_t());
-			if (factor > 0)
+			//Pollard rho with 64-bit arithmetic.
+			unsigned long long factor;
+			if (split_composite64(mpz_get_ui(number.get_mpz_t()), &factor))
 			{
-				*factor1 = factor;
-				*factor2 = number / *factor1;
+				mpz_set_ui(factor1->get_mpz_t(), factor);
+				mpz_divexact_ui(factor2->get_mpz_t(), number.get_mpz_t(), factor);
 			}
 		}
 
@@ -381,9 +382,9 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class& number, unsigned int index)
 			return false;
 		}
 
-		//save the two found factors. I do not expect three factors to ever happen, though that may cause problems here...
-		lp1[index] = factor1->get_ui();
-		lp2[index] = factor2->get_ui();
+		//save the two found factors, the smaller first. I do not expect three factors to ever happen, though that may cause problems here...
+		lp1[index] = min(factor1->get_ui(), factor2->get_ui());
+		lp2[index] = max(factor1->get_ui(), factor2->get_ui());
 
 		return true;
 	}
@@ -750,7 +751,11 @@ bool Batch_smooth::Complete_other_side(int index, string& list)
 	//Factor whatever is left, which also finds any higher multiplicities of the listed primes.
 	if (norm > 1)
 	{
-		int num_other_factors = factor(other_side_factor_list, norm.get_mpz_t(), 1);
+		int num_other_factors = factor_smooth(other_side_factor_list, norm.get_mpz_t(), MAX_FACTORS_IN_RELATION);
+		if (num_other_factors < 0)
+		{
+			num_other_factors = factor(other_side_factor_list, norm.get_mpz_t(), 1);
+		}
 
 		if (num_other_factors < 0)
 		{
@@ -842,7 +847,12 @@ void Batch_smooth::Output_solutions()
 			if (*relation_value > 1)
 			{
 				unsigned long long tf = profile_now();
-				num_factors = factor(relation_factor_list, relation_value->get_mpz_t(), 1);
+				num_factors = factor_smooth(relation_factor_list, relation_value->get_mpz_t(), MAX_FACTORS_IN_RELATION);
+				if (num_factors < 0)
+				{
+					//Too large for the fast method, use the general one.
+					num_factors = factor(relation_factor_list, relation_value->get_mpz_t(), 1);
+				}
 				profile_add(PROF_FACTOR, tf);
 			}
 

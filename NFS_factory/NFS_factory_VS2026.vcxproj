@@ -18,6 +18,7 @@
     <ClCompile Include="Prime_product.cpp" />
     <ClCompile Include="Profile.cpp" />
     <ClCompile Include="smintfact.c" />
+    <ClCompile Include="Smooth_factor.cpp" />
     <ClCompile Include="squfof.c" />
   </ItemGroup>
   <ItemGroup>
@@ -27,6 +28,7 @@
     <ClInclude Include="Prime_product.h" />
     <ClInclude Include="Profile.h" />
     <ClInclude Include="smintfact.h" />
+    <ClInclude Include="Smooth_factor.h" />
     <ClInclude Include="squfof.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
