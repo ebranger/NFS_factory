@@ -36,6 +36,7 @@ using namespace std;
 
 #define MAX_LINE_LENGTH 1024 //Longer lines in a relation file are skipped. gnfs-lasieve relations are typically less than 200 characters.
 #define MAX_BINARY_PRIMES 32 //Maximum number of primes in one relation in a binary relation file. More than this is treated as a corrupt file.
+#define READ_BUFFER_SIZE (16 * 1024 * 1024) //Binary relation files are read in blocks of this size.
 
 struct nfs_parameters {
 	//only those possibly needed. In principle only one side is needed...
@@ -309,6 +310,7 @@ int read_batch_from_file(string filename, Batch_smooth* batch, nfs_parameters* p
 		cout << "Could not open input file." << endl;
 		return -1;
 	}
+	setvbuf(infile, NULL, _IOFBF, 1 << 20);
 
 	char buffer[MAX_LINE_LENGTH];
 	long long a, b;
@@ -337,7 +339,7 @@ int read_batch_from_file(string filename, Batch_smooth* batch, nfs_parameters* p
 
 			//Line too long. Skip the rest of it.
 			int c;
-			while ((c = fgetc(infile)) != EOF && c != '\n');
+			while ((c = _fgetc_nolock(infile)) != EOF && c != '\n');
 			failed_relations++;
 			continue;
 		}
@@ -434,24 +436,36 @@ int read_batch_from_file(string filename, Batch_smooth* batch, nfs_parameters* p
 	return batch->Get_num_relations_found();
 }
 
-//Convert a list of primes to a comma separated list of hexadecimal values for printing.
-void get_relation_factor_list(unsigned int* primes, unsigned int num_primes, char* relation_line)
+//A buffer for reading a binary file in large blocks.
+struct read_buffer
 {
-	char* text_ptr = relation_line;
+	FILE* file;
+	vector<unsigned char> data;
+	size_t position; //first unread byte
+	size_t filled; //bytes of data in the buffer
 
-	for (unsigned int i = 0; i < num_primes; i++)
+	//Make sure at least bytes unread bytes are in the buffer. Returns false at the end of the file.
+	bool ensure(size_t bytes)
 	{
-		if (i > 0)
+		while (filled - position < bytes)
 		{
-			*text_ptr++ = ',';
+			//Move the unread part to the start and fill up the rest.
+			memmove(data.data(), data.data() + position, filled - position);
+			filled -= position;
+			position = 0;
+
+			size_t read = fread(data.data() + filled, 1, data.size() - filled, file);
+			if (read == 0)
+			{
+				return false;
+			}
+			filled += read;
 		}
-		text_ptr += sprintf(text_ptr, "%X", primes[i]);
+		return true;
 	}
+};
 
-	*text_ptr = '\0';
-}
-
-//Read relations from a binary format file.
+//Read relations from a binary format file. 
 int read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_parameters* param)
 {
 	//The binary format is (int)a, (uint)b, (uint)num_primes, (uint)prime1 ... (uint)prime_num_primes
@@ -459,42 +473,43 @@ int read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_parame
 	unsigned int b;
 	unsigned int num_primes;
 	unsigned int primes[MAX_BINARY_PRIMES];
-	char relation_line[MAX_BINARY_PRIMES * 9 + 1]; //At most 8 hex digits and a comma per prime.
 
 	long long relation_num = 0;
 	long long skipped_relations = 0;
 	bool corrupt = false;
+	bool stopped = false;
 
-	ifstream infile;
-	infile.open(filename, ios::binary);
+	read_buffer input;
+	input.file = fopen(filename.c_str(), "rb");
 
-	if (infile.fail())
+	if (input.file == NULL)
 	{
 		cout << "Failed to open input saved relations file." << endl;
 		return -1;
 	}
 
-	while (infile.peek() != EOF)
+	input.data.resize(READ_BUFFER_SIZE);
+	input.position = 0;
+	input.filled = 0;
+
+	while (input.ensure(3 * sizeof(unsigned int)))
 	{
 		//read (a,b) value of relation, and how many primes are stored in the relation.
-		infile.read(reinterpret_cast<char*>(&a), sizeof(int));
-		infile.read(reinterpret_cast<char*>(&b), sizeof(unsigned int));
-		infile.read(reinterpret_cast<char*>(&num_primes), sizeof(unsigned int));
+		const unsigned char* record = input.data.data() + input.position;
+		memcpy(&a, record, sizeof(int));
+		memcpy(&b, record + 4, sizeof(unsigned int));
+		memcpy(&num_primes, record + 8, sizeof(unsigned int));
 
-		if (!infile || num_primes > MAX_BINARY_PRIMES)
+		if (num_primes > MAX_BINARY_PRIMES || !input.ensure((3 + num_primes) * sizeof(unsigned int)))
 		{
 			corrupt = true;
 			break;
 		}
 
 		//read the primes.
-		infile.read(reinterpret_cast<char*>(primes), num_primes * sizeof(unsigned int));
-
-		if (!infile)
-		{
-			corrupt = true;
-			break;
-		}
+		record = input.data.data() + input.position;
+		memcpy(primes, record + 12, num_primes * sizeof(unsigned int));
+		input.position += (3 + num_primes) * sizeof(unsigned int);
 
 		if (!relation_in_range(a, b, param))
 		{
@@ -502,19 +517,24 @@ int read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_parame
 			continue;
 		}
 
-		get_relation_factor_list(primes, num_primes, relation_line);
-
 		//Add the relation to be batch smoothness checked.
-		batch->Add_number(a, b, relation_line);
+		batch->Add_number_binary(a, b, primes, num_primes);
 		relation_num++;
 
 		if (param->maxrels > 0 && relation_num >= param->maxrels)
 		{
 			cout << "Stopping after " << relation_num << " relations (maxrels)." << endl;
+			stopped = true;
 			break;
 		}
 	}
-	infile.close();
+
+	if (!corrupt && !stopped && input.filled > input.position)
+	{
+		//Part of a relation is left at the end of the file.
+		corrupt = true;
+	}
+	fclose(input.file);
 
 	//Check final relations, even if the tree is not filled.
 	batch->Do_batch_check();

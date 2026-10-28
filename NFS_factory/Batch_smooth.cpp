@@ -31,6 +31,8 @@ using namespace std;
 #define WRAPAROUND_MIN_LIMBS 512 //Use wraparound products in the remainder tree for nodes of at least this many limbs. Tuned on an i7-14700F.
 #define FFT_MULMOD_2EXPP1_CUTOFF 256 //From the MPIR build (gmp-mparam.h). Below this, MPIR does not use the FFT for products mod B^n + 1.
 
+static void append_prime(string& list, unsigned long long prime);
+
 //MPIR functions for multiplication modulo B^n + 1 with the FFT. They are declared in gmp-impl.h, which is not part of the installed headers.
 extern "C"
 {
@@ -59,6 +61,7 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 
 	poly = input_poly;
 	other_poly = other_side_poly;
+	binary_lists = false;
 
 	if (poly->poly_is_binomial_SNFS_deg4())
 	{
@@ -228,6 +231,7 @@ bool Batch_smooth::Add_number(long long a_val, long long b_val, const char* rela
 	b_vals[entries] = b_val;
 	is_smooth[entries] = true; //Until the batch check shows otherwise.
 	strcpy(list_of_factors[entries], relation_factor_list);
+	binary_lists = false;
 
 	entries++;
 
@@ -237,6 +241,76 @@ bool Batch_smooth::Add_number(long long a_val, long long b_val, const char* rela
 		Do_batch_check();
 	}
 	return true;
+}
+
+//Add one relation to be batch-smoothness checked, with the factor list of the other side given as primes, as read from a binary relation file.
+//The primes are only converted to text if the relation is smooth. Returns false if there are too many primes to be saved.
+bool Batch_smooth::Add_number_binary(long long a_val, long long b_val, const unsigned int* primes, unsigned int num_primes)
+{
+	if (num_primes > MAX_SAVED_PRIMES)
+	{
+		return false;
+	}
+
+	a_vals[entries] = a_val;
+	b_vals[entries] = b_val;
+	is_smooth[entries] = true; //Until the batch check shows otherwise.
+
+	//The saved list holds the number of primes, followed by the primes.
+	unsigned int* saved = reinterpret_cast<unsigned int*>(list_of_factors[entries]);
+	saved[0] = num_primes;
+	memcpy(saved + 1, primes, num_primes * sizeof(unsigned int));
+	binary_lists = true;
+
+	entries++;
+
+	//Is the tree full?
+	if (entries == max_entries_before_check)
+	{
+		Do_batch_check();
+	}
+	return true;
+}
+
+//The saved factor list of the other side of a relation, as text.
+void Batch_smooth::Get_saved_list(int index, string& list)
+{
+	if (!binary_lists)
+	{
+		list = list_of_factors[index];
+		return;
+	}
+
+	const unsigned int* saved = reinterpret_cast<const unsigned int*>(list_of_factors[index]);
+	list.clear();
+	for (unsigned int i = 1; i <= saved[0]; i++)
+	{
+		append_prime(list, saved[i]);
+	}
+}
+
+//The saved factor list of the other side of a relation, as numbers.
+void Batch_smooth::Get_saved_primes(int index, vector<unsigned long long>& primes)
+{
+	primes.clear();
+
+	if (binary_lists)
+	{
+		const unsigned int* saved = reinterpret_cast<const unsigned int*>(list_of_factors[index]);
+		for (unsigned int i = 1; i <= saved[0]; i++)
+		{
+			primes.push_back(saved[i]);
+		}
+		return;
+	}
+
+	const char* text = list_of_factors[index];
+	while (*text != '\0')
+	{
+		char* end;
+		primes.push_back(strtoull(text, &end, 16));
+		text = (*end == ',') ? end + 1 : end;
+	}
 }
 
 //Check whether a remainder factors into two numbers less than the lp limit.
@@ -661,22 +735,16 @@ bool Batch_smooth::Complete_other_side(int index, string& list)
 	}
 
 	vector<unsigned long long> primes;
+	Get_saved_primes(index, primes);
 
 	//Divide out the primes from the saved list, once per time they are listed.
-	const char* text = list_of_factors[index];
-	while (*text != '\0')
+	for (size_t j = 0; j < primes.size(); j++)
 	{
-		char* end;
-		unsigned long long prime = strtoull(text, &end, 16);
-
-		if (prime < 2 || !mpz_divisible_ui_p(norm.get_mpz_t(), (mpir_ui)prime))
+		if (primes[j] < 2 || !mpz_divisible_ui_p(norm.get_mpz_t(), (mpir_ui)primes[j]))
 		{
 			return false;
 		}
-		mpz_divexact_ui(norm.get_mpz_t(), norm.get_mpz_t(), (mpir_ui)prime);
-		primes.push_back(prime);
-
-		text = (*end == ',') ? end + 1 : end;
+		mpz_divexact_ui(norm.get_mpz_t(), norm.get_mpz_t(), (mpir_ui)primes[j]);
 	}
 
 	//Factor whatever is left, which also finds any higher multiplicities of the listed primes.
@@ -789,7 +857,11 @@ void Batch_smooth::Output_solutions()
 			}
 			else
 			{
-				const char* saved_list = (other_poly != NULL) ? other_side_list.c_str() : list_of_factors[index];
+				if (other_poly == NULL)
+				{
+					Get_saved_list(index, other_side_list);
+				}
+				const string& saved_list = other_side_list;
 
 				//The factor list for the batch checked side: large primes first, then the other factors.
 				checked_side_list.clear();

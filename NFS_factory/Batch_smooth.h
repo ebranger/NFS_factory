@@ -7,6 +7,8 @@
 #include "Polynomial.h"
 using namespace std;
 
+#define MAX_SAVED_PRIMES 64 //Most primes in the saved factor list of a relation from a binary relation file.
+
 class Batch_smooth
 {
 public:
@@ -16,6 +18,7 @@ public:
 	~Batch_smooth(void);
 	void Do_batch_check();
 	bool Add_number(long long a_val, long long b_val, const char* relation_factor_list);
+	bool Add_number_binary(long long a_val, long long b_val, const unsigned int* primes, unsigned int num_primes);
 	int Get_num_relations_found();
 
 	int side;
@@ -25,7 +28,10 @@ private:
 	mpz_class** inputs;
 	long long * a_vals, * b_vals;
 	bool* is_smooth; // set by the batch check for relations that are smooth.
-	char** list_of_factors; // holds the already known smooth side factor list.
+	char** list_of_factors; // holds the already known smooth side factor list, as text or (binary_lists) as the number of primes followed by the primes.
+	bool binary_lists;
+	void Get_saved_list(int index, string& list);
+	void Get_saved_primes(int index, vector<unsigned long long>& primes);
 	mpz_class* temp_number;
 	mpz_class* relation_value;
 
