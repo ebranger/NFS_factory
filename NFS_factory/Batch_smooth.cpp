@@ -13,8 +13,7 @@
 
 using namespace std;
 
-#define MAX_TREE_LEVELS 19 //Default for the maximum number of levels, can be changed with treelevels in the polynomial file.
-//With the prime product only holding primes that can divide the norm, 19 levels is as fast as 20 for SNFS-240 on an i7-14700F, with half the memory.
+#define MAX_TREE_LEVELS 20 //Default for the maximum number of levels, can be changed with treelevels in the polynomial file.
 //max 22 requires ~3GB of RAM. However, for SNFS-220 I seem to get the same speed for lower size, which saves a lot of RAM. 20 is ~7% slower, but saved 2GB of RAM, so worth it.
 //For larger factorizations, consider increasing this a little, but for every +1 the memory requirement for the tree roughly doubles.
 
@@ -86,7 +85,11 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	entries = 0;
 
 	//Estiamte a good tree size for the remainder tree
-	tree_size = (int)ceil(log2((double)(mpz_sizeinbase(prime_product->get_mpz_t(), 2)/max_bits_in_input))) + 1; // +1 since max_bits_in_input seems to overestminate slightly.
+	//Choose the smallest tree where the product of the relation values at the root is at least half the size of the prime product.
+	//A larger tree makes the prime product modulo the root cheaper, but costs one more level of products and twice the memory.
+	//For SNFS-240 on an i7-14700F, the root being 0.57 times the prime product (19 levels) was as fast as 1.15 times (20 levels),
+	//and 0.29 times (18 levels) about 5 % slower.
+	tree_size = (int)ceil(log2((double)mpz_sizeinbase(prime_product->get_mpz_t(), 2) / max_bits_in_input));
 	tree_size = min((max_tree_levels > 0) ? max_tree_levels : MAX_TREE_LEVELS, tree_size);  // Force the remainder tree to not be too big to save memory.
 	tree_size = max(2, tree_size); // The remainder tree needs at least one level above the relations.
 
