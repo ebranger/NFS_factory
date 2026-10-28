@@ -114,12 +114,12 @@ int doTrialDiv(u32 *factors, mpz_t n)
     initialized=1;
   }
 
+  /* Record each prime once per time it divides n, so the factor list
+     has the correct multiplicities. */
   for (i=0; i<num_td_primes; i++) {
-	  if ((mpz_tdiv_qr_ui(q, r, n, td_primes[i]) == 0)) {
+	  while (mpz_tdiv_qr_ui(q, r, n, td_primes[i]) == 0) {
 		  factors[numFacts++] = td_primes[i];
-		  while (mpz_tdiv_qr_ui(q, r, n, td_primes[i]) == 0) {
-			  mpz_set(n, q);
-		  }
+		  mpz_set(n, q);
 	  }
   }
   return numFacts;
@@ -158,10 +158,12 @@ int factor(u32 *factors, mpz_t n, int useTrialDivision)
   }
 
   if (useTrialDivision) {
-	  numFactors = numFactors + doTrialDiv(factors, remain);
-	  if (n == 1) {
-		  return numFactors;
-	  }
+	  /* Append after the factors of 2 already found. */
+	  numFactors = numFactors + doTrialDiv(factors + numFactors, remain);
+  }
+
+  if (mpz_cmp_ui(remain, 1) == 0) {
+	  return numFactors;
   }
 
   if (mpz_probab_prime_p(remain, 1)) {
