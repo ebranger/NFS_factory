@@ -16,6 +16,7 @@
     <ClCompile Include="Main.cpp" />
     <ClCompile Include="Polynomial.cpp" />
     <ClCompile Include="Prime_product.cpp" />
+    <ClCompile Include="Profile.cpp" />
     <ClCompile Include="smintfact.c" />
     <ClCompile Include="squfof.c" />
   </ItemGroup>
@@ -24,6 +25,7 @@
     <ClInclude Include="cofactorize.h" />
     <ClInclude Include="Polynomial.h" />
     <ClInclude Include="Prime_product.h" />
+    <ClInclude Include="Profile.h" />
     <ClInclude Include="smintfact.h" />
     <ClInclude Include="squfof.h" />
   </ItemGroup>

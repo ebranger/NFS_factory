@@ -32,6 +32,9 @@ A few optional parameters can also be given in the polynomial file:
 - print: primes smaller than this are not printed for the batch checked side (default 1000, which msieve handles). Not needed with "format: cado".
 - maxa, maxb: relations with |a| larger than maxa, or b larger than maxb, are skipped. There is no limit by default.
 - maxrels: stop after this many relations have been read from the relation file. Useful for testing and timing.
+- treelevels: the maximum number of levels in the remainder tree (default 19). Each level less halves the memory use of the tree, at some cost in speed.
+
+At the end of a run, the program prints how the time was spent on the different steps, and the peak memory use.
 
 Lines in a GGNFS/msieve relation file that cannot be parsed are skipped and counted, as is an incomplete last line, which a siever that is stopped may leave behind. A binary relation file that ends in the middle of a relation is also detected.
 

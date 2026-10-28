@@ -13,6 +13,11 @@ uint8 Polynomial::get_degree()
 	return degree;
 }
 
+const mpz_class& Polynomial::get_coefficient(uint8 coeff)
+{
+	return *coefficients[coeff];
+}
+
 Polynomial::Polynomial()
 {
 	//create a new polynomial class, initialize coefficients and set to 0.

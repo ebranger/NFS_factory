@@ -3,6 +3,7 @@
 #include <fstream>
 #include <sstream>
 #include <string.h>
+#include <vector>
 #include "Polynomial.h"
 using namespace std;
 
@@ -11,7 +12,7 @@ class Batch_smooth
 public:
 	//other_side_poly: if not NULL, the factor list of the side that is not batch checked is rebuilt from its norm, with all primes and their multiplicities (as CADO-NFS requires).
 	//If NULL, that factor list is printed as it was read.
-	Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly);
+	Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, int max_tree_levels);
 	~Batch_smooth(void);
 	void Do_batch_check();
 	bool Add_number(long long a_val, long long b_val, const char* relation_factor_list);
@@ -39,6 +40,7 @@ private:
 
 	void Output_solutions();
 	bool Complete_other_side(int index, string& list);
+	bool Timed_complete_other_side(int index, string& list);
 
 	string save_filename;
 	int tree_size;
@@ -63,5 +65,9 @@ private:
 	bool do_cofactorization;
 	bool check_two_lp_smooth(mpz_class& number, unsigned int index);
 	mpz_class *factor1, *factor2;
+
+	void Middle_product(mpz_ptr result, mpz_srcptr y, mpz_srcptr x, mp_bitcnt_t shift, mp_bitcnt_t precision);
+	vector<mp_limb_t> wrap_buffer; //scratch space for the wraparound products.
+	mpz_class wrap_result[2];
 };
 

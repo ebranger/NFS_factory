@@ -24,6 +24,7 @@ found in gnfs-lasieve by Franke and Kleinjung.
 #include <string.h>
 #include "Polynomial.h"
 #include "Batch_smooth.h"
+#include "Profile.h"
 #include <time.h>
 #include <sstream>
 #include <stdio.h>
@@ -49,6 +50,7 @@ struct nfs_parameters {
 	int max_algebraic_coefficient_bits;
 	int print_limit; // Skip printing all primes less than this.
 	bool cado_format; // Print all primes on both sides, with multiplicity, as CADO-NFS requires.
+	int tree_levels; // Maximum number of levels in the remainder tree. 0 means the default.
 };
 
 //Remove leading and trailing whitespace.
@@ -196,6 +198,11 @@ bool read_polynomial(string filename, nfs_parameters* params)
 			else if (data == "print")
 			{
 				params->print_limit = stoi(line);
+			}
+			//Maximum number of levels in the remainder tree. Each level less halves the memory use of the tree.
+			else if (data == "treelevels")
+			{
+				params->tree_levels = stoi(line);
 			}
 			//Output format: msieve (default) or cado.
 			else if (data == "format")
@@ -541,6 +548,7 @@ int main(int argc, char* argv[])
 	Batch_smooth* batch;
 
 	clock_t time;
+	unsigned long long program_start = profile_now();
 
 	nfs_parameters* param = new nfs_parameters();
 	param->maxa = LLONG_MAX; //No limit unless set in the polynomial file.
@@ -549,6 +557,7 @@ int main(int argc, char* argv[])
 
 	param->print_limit = 1000; //Msieve default.
 	param->cado_format = false;
+	param->tree_levels = 0;
 
 	param->algebraic_polynomial = new Polynomial();
 	param->rational_polynomial = new Polynomial();
@@ -636,12 +645,22 @@ int main(int argc, char* argv[])
 	}
 
 	time = clock();
-	batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly);
+	unsigned long long t = profile_now();
+	batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels);
+	profile_add(PROF_SETUP, t);
 	cout << "Prime products set up, it took " << (clock() - time) / CLOCKS_PER_SEC << " seconds." << endl;
 
 	time = clock();
 
 	int total_num_relations = 0;
+
+	//The time in the readers that is not spent on batch checking is counted as reading.
+	unsigned long long batch_cycles = 0;
+	for (int i = PROF_POLY_EVAL; i < PROF_NUM_PHASES; i++)
+	{
+		batch_cycles -= profile_cycles[i];
+	}
+	t = profile_now();
 
 	if (inputfile.find(".bin") == string::npos)
 	{
@@ -653,6 +672,13 @@ int main(int argc, char* argv[])
 		//for reading binary formated files, assumed to have a .bin extension.
 		total_num_relations = read_batch_from_binary_file(inputfile, batch, param);
 	}
+
+	unsigned long long reader_cycles = profile_now() - t;
+	for (int i = PROF_POLY_EVAL; i < PROF_NUM_PHASES; i++)
+	{
+		batch_cycles += profile_cycles[i];
+	}
+	profile_cycles[PROF_READ] += reader_cycles - batch_cycles;
 
 	if (total_num_relations >= 0)
 	{
@@ -670,6 +696,7 @@ int main(int argc, char* argv[])
 		return -1;
 	}
 
+	print_profile(profile_now() - program_start);
 	cout << "Batch checking complete." << endl;
 	return 0;
 }

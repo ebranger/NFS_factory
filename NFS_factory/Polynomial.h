@@ -23,6 +23,7 @@ public:
 	void copy(Polynomial* input);
 
 	uint8 get_degree();
+	const mpz_class& get_coefficient(uint8 coeff);
 
 	void set_coeff(uint8 coeff, mpz_class* value);
 	void set_coeff(uint8 coeff, int32 value);

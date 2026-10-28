@@ -8,10 +8,13 @@
 #include "cofactorize.h"
 
 #include "smintfact.h"
+#include "Profile.h"
+#include "Prime_product.h"
 
 using namespace std;
 
-#define MAX_TREE_LEVELS 20
+#define MAX_TREE_LEVELS 19 //Default for the maximum number of levels, can be changed with treelevels in the polynomial file.
+//With the prime product only holding primes that can divide the norm, 19 levels is as fast as 20 for SNFS-240 on an i7-14700F, with half the memory.
 //max 22 requires ~3GB of RAM. However, for SNFS-220 I seem to get the same speed for lower size, which saves a lot of RAM. 20 is ~7% slower, but saved 2GB of RAM, so worth it.
 //For larger factorizations, consider increasing this a little, but for every +1 the memory requirement for the tree roughly doubles.
 
@@ -26,8 +29,18 @@ using namespace std;
 
 #define LP_PRIMALITY_REPS 10 //Miller-Rabin rounds used before accepting a cofactor as a large prime in a relation.
 
+#define WRAPAROUND_MIN_LIMBS 512 //Use wraparound products in the remainder tree for nodes of at least this many limbs. Tuned on an i7-14700F.
+#define FFT_MULMOD_2EXPP1_CUTOFF 256 //From the MPIR build (gmp-mparam.h). Below this, MPIR does not use the FFT for products mod B^n + 1.
+
+//MPIR functions for multiplication modulo B^n + 1 with the FFT. They are declared in gmp-impl.h, which is not part of the installed headers.
+extern "C"
+{
+	int __gmpn_mulmod_Bexpp1_fft(mp_ptr op, mp_size_t pl, mp_srcptr n, mp_size_t nl, mp_srcptr m, mp_size_t ml);
+	mpir_si __mpir_fft_adjust_limbs(mp_size_t limbs);
+}
+
 //Initialize the batch smoothness class
-Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly)
+Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, int max_tree_levels)
 {
 	//init.
 	temp_number = new mpz_class;
@@ -74,7 +87,7 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 
 	//Estiamte a good tree size for the remainder tree
 	tree_size = (int)ceil(log2((double)(mpz_sizeinbase(prime_product->get_mpz_t(), 2)/max_bits_in_input))) + 1; // +1 since max_bits_in_input seems to overestminate slightly.
-	tree_size = min(MAX_TREE_LEVELS, tree_size);  // Force the remainder tree to not be too big to save memory.
+	tree_size = min((max_tree_levels > 0) ? max_tree_levels : MAX_TREE_LEVELS, tree_size);  // Force the remainder tree to not be too big to save memory.
 	tree_size = max(2, tree_size); // The remainder tree needs at least one level above the relations.
 
 	start_entry = (1 << (tree_size - 1)) - 1;
@@ -143,13 +156,8 @@ void Batch_smooth::Setup_prime_product(long long smooth_bound)
 		return;
 	}
 
-	mpz_primorial_ui(prime_product->get_mpz_t(), (mpir_ui)smooth_bound);
-	mpz_primorial_ui(temp_number->get_mpz_t(), int(sqrt((double)smooth_bound)));		//Extra small primes. this saves having to do some squarings in the batch tree bottom node, and adds very few bits to the product.
-	*prime_product = *prime_product * *temp_number;
-	mpz_primorial_ui(temp_number->get_mpz_t(), int(sqrt(sqrt((double)smooth_bound))));	// Extra even smaller primes.
-	*prime_product = *prime_product * (*temp_number * *temp_number);
-	*temp_number = "10821610800";														//and the smallest primes to an even higher level!
-	*prime_product = *prime_product * (*temp_number * *temp_number);
+	//Only the primes that can divide the norms are included, with small primes to higher powers.
+	setup_prime_product(poly, (uint32)smooth_bound, prime_product);
 
 	size_t size = mpz_sizeinbase(prime_product->get_mpz_t(), 2);
 	cout << "Size of prime product: " << size << " bits." << endl;
@@ -362,6 +370,8 @@ void Batch_smooth::Do_batch_check()
 		return;
 	}
 
+	unsigned long long t = profile_now();
+
 	//set up polynomial values
 	for (int index = 0; index < entries; index++)
 	{
@@ -381,6 +391,8 @@ void Batch_smooth::Do_batch_check()
 		}
 	}
 
+	t = profile_add(PROF_POLY_EVAL, t);
+
 	//set up product tree.
 	for (int level = tree_size; level > 1; level--)
 	{
@@ -391,6 +403,8 @@ void Batch_smooth::Do_batch_check()
 			*inputs[i] = *inputs[2 * i + 1] * *inputs[2 * i + 2];
 		}
 	}
+
+	t = profile_add(PROF_PRODUCT_TREE, t);
 
 	size_t size = mpz_sizeinbase(inputs[0]->get_mpz_t(), 2);
 	cout << "Size of top node of product tree: " << size << " bits." << endl;
@@ -413,8 +427,10 @@ void Batch_smooth::Do_batch_check()
 	mpz_class Q;
 
 	Q = *prime_product % *inputs[0]; //do a mod since the prime product may well be much larger than the top number of the tree.
+	t = profile_add(PROF_TOP_MOD, t);
 	mpz_mul_2exp(Q.get_mpz_t(), Q.get_mpz_t(), product_bits[0] + guard);
 	mpz_tdiv_q(inputs[0]->get_mpz_t(), Q.get_mpz_t(), inputs[0]->get_mpz_t()); // now the root of the tree is prime_product / product_of_input_numbers * 2^(bits in product of input number + a few guard bits)
+	t = profile_add(PROF_TOP_SCALE, t);
 
 	for (int level = 2; level <= tree_size - 1; level++)
 	{
@@ -422,8 +438,19 @@ void Batch_smooth::Do_batch_check()
 
 		for (int i = limit; i <= 2 * limit; i = i + 2)
 		{
-			//calculate the next level of the tree. 
+			//calculate the next level of the tree.
 			// so if the parent node is Num / (leaf1 * leaf2), multiply by the leaves and right-shift since the fraction is now smaller, requiring fewer bits of storage.
+			unsigned long parent_bits = product_bits[(i - 1) / 2];
+
+			if ((parent_bits + guard) / GMP_LIMB_BITS >= WRAPAROUND_MIN_LIMBS)
+			{
+				//Large numbers: only the middle part of the products is needed, which is faster to get with a wraparound product.
+				Middle_product(wrap_result[0].get_mpz_t(), inputs[(i - 1) / 2]->get_mpz_t(), inputs[i + 1]->get_mpz_t(), parent_bits - product_bits[i], parent_bits + guard);
+				Middle_product(wrap_result[1].get_mpz_t(), inputs[(i - 1) / 2]->get_mpz_t(), inputs[i]->get_mpz_t(), parent_bits - product_bits[i + 1], parent_bits + guard);
+				mpz_swap(inputs[i]->get_mpz_t(), wrap_result[0].get_mpz_t());
+				mpz_swap(inputs[i + 1]->get_mpz_t(), wrap_result[1].get_mpz_t());
+				continue;
+			}
 
 			*inputs[i] = *inputs[(i - 1) / 2] * *inputs[i];
 			*inputs[i + 1] = *inputs[(i - 1) / 2] * *inputs[i + 1];
@@ -436,6 +463,9 @@ void Batch_smooth::Do_batch_check()
 			mpz_div_2exp(inputs[i + 1]->get_mpz_t(), inputs[i + 1]->get_mpz_t(), product_bits[(i - 1) / 2] - product_bits[i + 1]);
 		}
 	}
+
+	t = profile_add(PROF_REMAINDER_TREE, t);
+	unsigned long long cofactor_start = profile_cycles[PROF_COFACTOR];
 
 	//for the bottom node, i.e. the relation numbers, store the Prime_product % number in Q, to keep the number (in input_number[]). Then it can be used later for squaring tests mod the number.
 	for (i = num_relations_per_batch - 1; i < (unsigned long)(2 * num_relations_per_batch - 1); i = i + 2)
@@ -465,7 +495,10 @@ void Batch_smooth::Do_batch_check()
 			mpz_divexact(Q.get_mpz_t(), inputs[i]->get_mpz_t(), temp_number->get_mpz_t());
 
 			//Check if Q is 2lp smooth
-			if (!check_two_lp_smooth(Q, i - num_relations_per_batch + 1))
+			unsigned long long tc = profile_now();
+			bool smooth = check_two_lp_smooth(Q, i - num_relations_per_batch + 1);
+			profile_add(PROF_COFACTOR, tc);
+			if (!smooth)
 			{
 				//not smooth.
 				is_smooth[i - num_relations_per_batch + 1] = false;
@@ -508,7 +541,10 @@ void Batch_smooth::Do_batch_check()
 			mpz_divexact(Q.get_mpz_t(), inputs[i + 1]->get_mpz_t(), temp_number->get_mpz_t());
 
 			//Check if Q is 2lp smooth
-			if (!check_two_lp_smooth(Q, i - num_relations_per_batch + 2))
+			unsigned long long tc = profile_now();
+			bool smooth = check_two_lp_smooth(Q, i - num_relations_per_batch + 2);
+			profile_add(PROF_COFACTOR, tc);
+			if (!smooth)
 			{
 				//not smooth.
 				is_smooth[i - num_relations_per_batch + 2] = false;
@@ -526,10 +562,72 @@ void Batch_smooth::Do_batch_check()
 		}
 	}
 
+	profile_add(PROF_LEAVES, t);
+	profile_cycles[PROF_LEAVES] -= profile_cycles[PROF_COFACTOR] - cofactor_start; //cofactorization is counted separately.
+
 	Output_solutions();
 
 	delete[] product_bits;
 	return;
+}
+
+//Compute the bits from shift up to precision of (y * x) mod 2^precision, i.e. (y * x mod 2^precision) >> shift.
+//y must be less than 2^precision, and x less than 2^(shift + 1).
+//The product is computed modulo B^n + 1, with n a little more than precision bits, using the FFT of MPIR. That is
+//cheaper than the full product. The part of the product above B^n wraps around and is subtracted from the low bits,
+//below the bits that are needed, so the result can be one too small. The guard bits of the scaled remainder tree
+//absorb such errors, just as they absorb the truncation errors of the shifts.
+void Batch_smooth::Middle_product(mpz_ptr result, mpz_srcptr y, mpz_srcptr x, mp_bitcnt_t shift, mp_bitcnt_t precision)
+{
+	mp_size_t limbs = (mp_size_t)((precision + 2 * GMP_LIMB_BITS - 1) / GMP_LIMB_BITS); //at least 64 bits more than precision.
+	if (limbs >= FFT_MULMOD_2EXPP1_CUTOFF)
+	{
+		limbs = (mp_size_t)__mpir_fft_adjust_limbs(limbs);
+	}
+
+	if (wrap_buffer.size() < (size_t)limbs + 1)
+	{
+		wrap_buffer.resize(limbs + 1);
+	}
+	mp_ptr product = wrap_buffer.data();
+
+	if (__gmpn_mulmod_Bexpp1_fft(product, limbs, y->_mp_d, abs(y->_mp_size), x->_mp_d, abs(x->_mp_size)) != 0)
+	{
+		//The product is B^n, i.e. -1 mod B^n + 1, which only happens if the needed bits are all zero.
+		mpz_set_ui(result, 0);
+		return;
+	}
+
+	//Shift down the needed bits.
+	mp_bitcnt_t out_bits = precision - shift;
+	mp_size_t out_limbs = (mp_size_t)((out_bits + GMP_LIMB_BITS - 1) / GMP_LIMB_BITS);
+	mp_size_t first_limb = (mp_size_t)(shift / GMP_LIMB_BITS);
+	mp_size_t source_limbs = (mp_size_t)((precision + GMP_LIMB_BITS - 1) / GMP_LIMB_BITS) - first_limb;
+
+	if (result->_mp_alloc < source_limbs)
+	{
+		mpz_realloc2(result, source_limbs * GMP_LIMB_BITS);
+	}
+
+	if (shift % GMP_LIMB_BITS != 0)
+	{
+		mpn_rshift(result->_mp_d, product + first_limb, source_limbs, (unsigned int)(shift % GMP_LIMB_BITS));
+	}
+	else
+	{
+		mpn_copyi(result->_mp_d, product + first_limb, source_limbs);
+	}
+
+	if (out_bits % GMP_LIMB_BITS != 0)
+	{
+		result->_mp_d[out_limbs - 1] &= (((mp_limb_t)1) << (out_bits % GMP_LIMB_BITS)) - 1;
+	}
+
+	while (out_limbs > 0 && result->_mp_d[out_limbs - 1] == 0)
+	{
+		out_limbs--;
+	}
+	result->_mp_size = (int)out_limbs;
 }
 
 //Append a prime to a comma separated list of hexadecimal primes.
@@ -604,6 +702,15 @@ bool Batch_smooth::Complete_other_side(int index, string& list)
 	return true;
 }
 
+//Complete_other_side, with the time counted in the profile.
+bool Batch_smooth::Timed_complete_other_side(int index, string& list)
+{
+	unsigned long long t = profile_now();
+	bool result = Complete_other_side(index, list);
+	profile_add(PROF_OTHER_SIDE, t);
+	return result;
+}
+
 //For each relation passing the batch smoothnes checking, complete the relation and print it.
 void Batch_smooth::Output_solutions()
 {
@@ -618,6 +725,9 @@ void Batch_smooth::Output_solutions()
 	char ab_text[50];
 
 	int num_good = 0;
+
+	unsigned long long t_start = profile_now();
+	unsigned long long factor_start = profile_cycles[PROF_FACTOR] + profile_cycles[PROF_OTHER_SIDE];
 
 	FILE* outfile;
 
@@ -660,7 +770,9 @@ void Batch_smooth::Output_solutions()
 			//run Pollard rho factoring on the remaining part of the relation. Since it is smooth Pollard rho should be a decent choice.
 			if (*relation_value > 1)
 			{
+				unsigned long long tf = profile_now();
 				num_factors = factor(relation_factor_list, relation_value->get_mpz_t(), 1);
+				profile_add(PROF_FACTOR, tf);
 			}
 
 			if (num_factors < 0)
@@ -668,7 +780,7 @@ void Batch_smooth::Output_solutions()
 				//Typically: one factor is too big for an uint32. An incomplete relation is useless, so skip it.
 				num_factoring_failures++;
 			}
-			else if (other_poly != NULL && !Complete_other_side(index, other_side_list))
+			else if (other_poly != NULL && !Timed_complete_other_side(index, other_side_list))
 			{
 				num_other_side_failures++;
 			}
@@ -735,6 +847,9 @@ void Batch_smooth::Output_solutions()
 	}
 
 	fclose(outfile);
+
+	profile_add(PROF_WRITE, t_start);
+	profile_cycles[PROF_WRITE] -= profile_cycles[PROF_FACTOR] + profile_cycles[PROF_OTHER_SIDE] - factor_start; //factoring is counted separately.
 
 	cout << "Ran a batch, found " << num_good << " smooth numbers" << endl;
 	num_relations_found += num_good;
