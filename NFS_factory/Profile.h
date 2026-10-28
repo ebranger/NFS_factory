@@ -9,8 +9,7 @@ enum profile_phase {
 	PROF_READ,            //reading and parsing the relation file
 	PROF_POLY_EVAL,       //polynomial values of the relations
 	PROF_PRODUCT_TREE,    //product tree of the polynomial values
-	PROF_TOP_MOD,         //prime product modulo the root of the product tree
-	PROF_TOP_SCALE,       //scaling the remainder at the root, P mod root * 2^k / root
+	PROF_ROOT,            //root of the remainder tree, (P mod root) * 2^k / root
 	PROF_REMAINDER_TREE,  //scaled remainder tree down to the parents of the leaves
 	PROF_LEAVES,          //remainders of the leaves, squarings and gcd
 	PROF_COFACTOR,        //checking the cofactors for large primes (squfof, tinyqs)

@@ -73,6 +73,8 @@ private:
 	mpz_class *factor1, *factor2;
 
 	void Middle_product(mpz_ptr result, mpz_srcptr y, mpz_srcptr x, mp_bitcnt_t shift, mp_bitcnt_t precision);
+	void Scaled_root_value(mpz_ptr root, mp_bitcnt_t precision);
+	mpz_class root_shifted, root_inverse, root_remainder, root_quotient; //temporaries for Scaled_root_value.
 	vector<mp_limb_t> wrap_buffer; //scratch space for the wraparound products.
 	mpz_class wrap_result[2];
 };

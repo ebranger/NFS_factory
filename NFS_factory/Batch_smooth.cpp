@@ -504,11 +504,9 @@ void Batch_smooth::Do_batch_check()
 
 	mpz_class Q;
 
-	Q = *prime_product % *inputs[0]; //do a mod since the prime product may well be much larger than the top number of the tree.
-	t = profile_add(PROF_TOP_MOD, t);
-	mpz_mul_2exp(Q.get_mpz_t(), Q.get_mpz_t(), product_bits[0] + guard);
-	mpz_tdiv_q(inputs[0]->get_mpz_t(), Q.get_mpz_t(), inputs[0]->get_mpz_t()); // now the root of the tree is prime_product / product_of_input_numbers * 2^(bits in product of input number + a few guard bits)
-	t = profile_add(PROF_TOP_SCALE, t);
+	// now the root of the tree is prime_product / product_of_input_numbers * 2^(bits in product of input number + a few guard bits)
+	Scaled_root_value(inputs[0]->get_mpz_t(), product_bits[0] + guard);
+	t = profile_add(PROF_ROOT, t);
 
 	for (int level = 2; level <= tree_size - 1; level++)
 	{
@@ -647,6 +645,62 @@ void Batch_smooth::Do_batch_check()
 
 	delete[] product_bits;
 	return;
+}
+
+//Replace the root of the product tree X by the root of the scaled remainder tree, floor((P mod X) * 2^precision / X),
+//where P is the prime product. One inverse of X is computed and used both for P mod X (Barrett reduction) and for the
+//scaling, which is faster than two divisions that each compute an inverse. The result can be one too small, which the
+//guard bits absorb, just as they absorb the truncation errors further down in the tree.
+void Batch_smooth::Scaled_root_value(mpz_ptr root, mp_bitcnt_t precision)
+{
+	mp_bitcnt_t bits = mpz_sizeinbase(root, 2);
+	mp_size_t limbs = abs(root->_mp_size);
+	mp_bitcnt_t normalize = limbs * GMP_LIMB_BITS - bits;
+
+	//V = B^(limbs + 1) + I is the inverse of the root shifted to fill limbs + 1 limbs, so that root * V < 2^E <= root * (V + 1)
+	//with E = 128 * limbs + 64 - normalize. The extra limb makes the scaling below accurate to less than one unit.
+	mpz_mul_2exp(root_shifted.get_mpz_t(), root, normalize + GMP_LIMB_BITS);
+	mpz_ptr v = root_inverse.get_mpz_t();
+	if (v->_mp_alloc < limbs + 2)
+	{
+		mpz_realloc2(v, (limbs + 2) * GMP_LIMB_BITS);
+	}
+	mpn_invert(v->_mp_d, root_shifted.get_mpz_t()->_mp_d, limbs + 1);
+	v->_mp_d[limbs + 1] = 1;
+	v->_mp_size = (int)(limbs + 2);
+	mp_bitcnt_t e = 128 * limbs + GMP_LIMB_BITS - normalize;
+
+	//r = P mod X. Barrett reduction needs P < 2^(2 * bits), which the choice of tree size gives, otherwise divide.
+	mpz_ptr r = root_remainder.get_mpz_t();
+	mp_bitcnt_t product_size = mpz_sizeinbase(prime_product->get_mpz_t(), 2);
+
+	if (product_size < bits)
+	{
+		mpz_set(r, prime_product->get_mpz_t());
+	}
+	else if (product_size <= 2 * bits)
+	{
+		//mu = floor(2^(2 * bits) / X), or one less. The quotient estimate is then at most 3 too small.
+		mpz_ptr q = root_quotient.get_mpz_t();
+		mpz_tdiv_q_2exp(q, v, e - 2 * bits);
+		mpz_tdiv_q_2exp(r, prime_product->get_mpz_t(), bits - 1);
+		mpz_mul(q, q, r);
+		mpz_tdiv_q_2exp(q, q, bits + 1);
+		mpz_mul(q, q, root);
+		mpz_sub(r, prime_product->get_mpz_t(), q);
+		while (mpz_cmp(r, root) >= 0)
+		{
+			mpz_sub(r, r, root);
+		}
+	}
+	else
+	{
+		mpz_tdiv_r(r, prime_product->get_mpz_t(), root);
+	}
+
+	//floor(r * 2^precision / X) = floor(r * V / 2^(e - precision)), or one less.
+	mpz_mul(root, r, v);
+	mpz_tdiv_q_2exp(root, root, e - precision);
 }
 
 //Compute the bits from shift up to precision of (y * x) mod 2^precision, i.e. (y * x mod 2^precision) >> shift.
