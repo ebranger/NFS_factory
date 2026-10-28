@@ -173,7 +173,7 @@ int factor(u32 *factors, mpz_t n, int useTrialDivision)
 
 	/* Do some SQUFOF factoring at first */
   size = mpz_sizeinbase(remain,2);
-  if (size <= 62)
+  if (size <= 60)
   {
 	  //Msieve squfof call
 	  sq_f = squfof(remain);

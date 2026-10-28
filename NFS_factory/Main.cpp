@@ -358,8 +358,8 @@ int read_batch_from_binary_file(string filename, Batch_smooth* batch)
 {
 	//The binary format is (int)a, (uint)b, (int)num_primes, (uint)prime1 ... (uint)prime_num_primes
 	char buffer[512];
-	int a, b;
-	bool a_negative;
+	int a;
+	unsigned int b;
 	char *tmp;
 	string line;
 	unsigned int relation_list[20];
@@ -467,11 +467,11 @@ int main(int argc, char* argv[])
 	int tree_bits;
 	if (param->smoothness_checking_side == 0)
 	{
-		tree_bits = param->max_rational_coefficient_bits+30; //Assume max 30 bit a, b values in relation.
+		tree_bits = param->max_rational_coefficient_bits+30; //Assume max 30 bit a, b values in relation, when calculating the optimal tree size.
 	}
 	else
 	{
-		tree_bits = param->max_algebraic_coefficient_bits  + 30 * param->algebraic_polynomial->get_degree(); // Assume maxumum a, b is 30 bits (should be filtered to <29 bits in my SNFS-220 data....) and maximum coefficient is 30 bits (at bigger coefficients, batch factoring becomes too slow, and regular SNFS may be preferred? )
+		tree_bits = param->max_algebraic_coefficient_bits  + 30 * param->algebraic_polynomial->get_degree(); // Assume maxumum a, b is 30 bits and maximum coefficient is 30 bits (at bigger coefficients, batch factoring becomes too slow, and regular SNFS may be preferred? )
 	}
 
 	//Check that we read the input polynomial correctly.

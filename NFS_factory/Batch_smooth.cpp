@@ -378,10 +378,6 @@ void Batch_smooth::Do_batch_check()
 			//calculate the next level of the tree. 
 			// so if the parent node is Num / (leaf1 * leaf2), multiply by the leaves and right-shift since the fraction is now smaller, requiring fewer bits of storage.
 
-			//Q = *inputs[i];
-			//*inputs[i] = *inputs[(i - 1) / 2] * *inputs[i + 1];
-			//*inputs[i + 1] = *inputs[(i - 1) / 2] * Q;
-
 			*inputs[i] = *inputs[(i - 1) / 2] * *inputs[i];
 			*inputs[i + 1] = *inputs[(i - 1) / 2] * *inputs[i + 1];
 			mpz_swap(inputs[i]->get_mpz_t(), inputs[i + 1]->get_mpz_t());
@@ -553,14 +549,15 @@ void Batch_smooth::Output_solutions()
 			}
 			else
 			{
-				//very smooth relation, all factors less than 1000. No factors to print.
+				//No factors to print. Should not happen now that all primes are available for printing?
 				num_factors = 0;
 			}
 
 			if (num_factors == -1)
 			{
-				cout << "failed to factor a relation!" << endl;
-				cout << a_vals[index] << " " << b_vals[index] << endl;
+				//Typically: one factor is too big for an uint32
+				//cout << "failed to factor a relation!" << endl;
+				//cout << a_vals[index] << " " << b_vals[index] << endl;
 			}
 
 			//Print the relation to file.
