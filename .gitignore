@@ -1,0 +1,45 @@
+# Visual Studio
+.vs/
+x64/
+Debug/
+Release/
+*.user
+*.aps
+*.ipch
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+
+# Build outputs
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.iobj
+*.ipdb
+*.lib
+*.log
+*.tlog
+
+# MPIR is built separately, see "Compiling the code.txt"
+third_party/mpir/include/*
+third_party/mpir/lib/*
+!third_party/mpir/README.txt
+
+# Relation data and program output
+*.out
+*.bin
+*.dat
+
+# Local work files that are not part of the published code
+Backups/
+runtest data/
+NFS_factory/old_mpir_2017/
+NFS_factory/Backup_all_code/
+NFS_factory/Temp new mfb/
+NFS_factory/Utilities/
+NFS_factory/Test_input/
+NFS_factory/test/
+NFS_factory/Debug line.txt
+NFS_factory/*.poly

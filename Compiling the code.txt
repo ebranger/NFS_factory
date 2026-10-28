@@ -1,3 +1,78 @@
-I have used Visual studio 2017 community edition to compile the code, the project files are included.
+Compiling NFS_factory
+=====================
 
-The code requires MPIR to buld, which should be interchangable with GMP. I have built MPIR 3.0.0 for my system and placed the resulting files/libraries with the code, but your installation may differ. Files that are needed from MPIR include mppir.h, mpirxx.h, and the compiled mpir libraries.
+The code is compiled with Visual Studio on 64-bit Windows, and the project files are included. It requires the MPIR library (a Windows-friendly fork of GMP), which has to be built separately.
+
+There are two sets of project files:
+
+  NFS_factory_VS2026.sln   Current project files, for Visual Studio 2026 (platform toolset v145), x64 only.
+                           Use this one. The steps below describe how to set it up.
+  NFS_factory.sln          The original Visual Studio 2017 project files (toolset v141), kept as a backup.
+                           Newer Visual Studio versions can upgrade these, but they do not include
+                           Prime_product.cpp and expect MPIR in a hard-coded folder.
+
+Both build the same source files in the NFS_factory folder.
+
+
+1. Install the tools
+--------------------
+
+- Visual Studio 2026 (Community edition is fine) with the "Desktop development with C++" workload.
+- Python 3, only needed to run the MPIR tests (optional).
+- The YASM assembler 1.3.0, needed to build MPIR's assembly code, from https://github.com/yasm/yasm/releases/tag/v1.3.0
+  Download vsyasm-1.3.0-win64.zip and yasm-1.3.0-win64.exe. Create the folder C:\Program Files\yasm and place
+  in it the files from the zip (vsyasm.exe, vsyasm.props, vsyasm.targets, vsyasm.xml) and yasm-1.3.0-win64.exe
+  renamed to yasm.exe.
+  Alternatively, keep them in another folder and set the environment variable YASM_PATH to that folder
+  (including a trailing backslash).
+
+
+2. Build MPIR
+-------------
+
+MPIR is no longer developed, but Brian Gladman maintains its Windows build files, including for Visual Studio 2026:
+https://github.com/BrianGladman/mpir
+
+Download or clone it, open mpir\msvc\vs26\mpir.sln in Visual Studio, and build these projects for x64:
+
+  lib_mpir_skylake_avx   the MPIR library with assembly code for modern Intel and AMD processors (with AVX2).
+                         Use lib_mpir_gc instead on older processors. It needs no YASM, but is much slower.
+  lib_mpir_cxx           the C++ interface (mpirxx).
+
+Build both in the Release configuration, and also in Debug if you want to debug NFS_factory.
+The build copies the results to mpir\lib\x64\Release and mpir\lib\x64\Debug.
+
+Optionally, run the MPIR tests: build mpir\msvc\vs26\mpir-tests.sln and run run-tests.py in the same folder.
+At the time of writing, two things in the MPIR test setup need working around:
+- In the vs26 test projects, the pre-build step calls "check_config $(Platform) $(Configuration) 22";
+  change 22 to 26 in the test .vcxproj files.
+- Build the add-test-lib project first, since a parallel build may try to link the tests before it is ready.
+
+
+3. Copy MPIR into this project
+------------------------------
+
+Copy the files into the third_party\mpir folder next to NFS_factory_VS2026.sln, so that it looks like this:
+
+  third_party\mpir\include\mpir.h
+  third_party\mpir\include\mpirxx.h
+  third_party\mpir\lib\x64\Release\mpir.lib
+  third_party\mpir\lib\x64\Release\mpirxx.lib
+  third_party\mpir\lib\x64\Debug\mpir.lib       (only needed for Debug builds)
+  third_party\mpir\lib\x64\Debug\mpirxx.lib     (only needed for Debug builds)
+
+The headers are in mpir\lib\x64\Release, and are the same for Release and Debug. The .pdb files may be copied
+too, for debugging into MPIR. Another location can be used by changing the MpirDir macro in
+NFS_factory\NFS_factory_VS2026.vcxproj.
+
+The MPIR libraries are built with the static runtime library (/MT, or /MTd for Debug), and the project is set up
+to match. Mixing the two gives linker warning LNK4098, and a slower or broken program.
+
+
+4. Build NFS_factory
+--------------------
+
+Open NFS_factory_VS2026.sln, select Release and x64, and build. The program ends up in x64\Release\NFS_factory.exe.
+
+Run it as:
+  NFS_factory <polynomial file name> <saved relation file name> <output file name>
