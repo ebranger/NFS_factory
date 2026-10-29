@@ -7,6 +7,7 @@
 using namespace std;
 
 unsigned long long profile_cycles[PROF_NUM_PHASES] = { 0 };
+unsigned long long profile_cycles_3lp[PROF_NUM_PHASES] = { 0 };
 
 static const char* phase_names[PROF_NUM_PHASES] = {
 	"Setup",
@@ -19,7 +20,8 @@ static const char* phase_names[PROF_NUM_PHASES] = {
 	"Cofactorization",
 	"Factoring relations",
 	"Other side factors",
-	"Writing relations"
+	"Writing relations",
+	"3LP second stage"
 };
 
 //Print the time spent in each phase, as a share of the total, and the peak memory use.
@@ -45,6 +47,18 @@ void print_profile(unsigned long long total_cycles)
 	if (total_cycles > accounted)
 	{
 		cout << "  " << left << setw(25) << "Other" << right << setw(8) << (total_cycles - accounted) / 1e9 << setw(7) << 100.0 * (total_cycles - accounted) / total_cycles << " %" << endl;
+	}
+
+	if (profile_cycles[PROF_3LP] > 0)
+	{
+		cout << "3LP second stage (Gcycles, share of total):" << endl;
+		for (int i = 0; i < PROF_NUM_PHASES; i++)
+		{
+			if (profile_cycles_3lp[i] > 0)
+			{
+				cout << "  " << left << setw(25) << phase_names[i] << right << setw(8) << profile_cycles_3lp[i] / 1e9 << setw(7) << 100.0 * profile_cycles_3lp[i] / total_cycles << " %" << endl;
+			}
+		}
 	}
 
 	PROCESS_MEMORY_COUNTERS memory;

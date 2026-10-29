@@ -37,6 +37,7 @@ using namespace std;
 #define MAX_LINE_LENGTH 1024 //Longer lines in a relation file are skipped. gnfs-lasieve relations are typically less than 200 characters.
 #define MAX_BINARY_PRIMES 32 //Maximum number of primes in one relation in a binary relation file. More than this is treated as a corrupt file.
 #define READ_BUFFER_SIZE (16 * 1024 * 1024) //Binary relation files are read in blocks of this size.
+#define STAGE2_ONLY_TREE_LEVELS 22 //Default maximum number of levels in the remainder tree of a run on a 3LP candidate file. Such runs are few, so they can use more memory than the runs on relation files.
 
 struct nfs_parameters {
 	//only those possibly needed. In principle only one side is needed...
@@ -52,6 +53,9 @@ struct nfs_parameters {
 	int print_limit; // Skip printing all primes less than this.
 	bool cado_format; // Print all primes on both sides, with multiplicity, as CADO-NFS requires.
 	int tree_levels; // Maximum number of levels in the remainder tree. 0 means the default.
+	int tree_levels_3lp; // Maximum number of levels in the remainder tree of a run on a 3LP candidate file.
+	bool save_3lp; // 3LP candidates (mfb more than 2 lpb) are saved to a file instead of checked in a second stage during the run.
+	string file_3lp; // File for the saved 3LP candidates. Empty means the default name.
 };
 
 //Remove leading and trailing whitespace.
@@ -205,6 +209,11 @@ bool read_polynomial(string filename, nfs_parameters* params)
 			{
 				params->tree_levels = stoi(line);
 			}
+			//The same for runs on a 3LP candidate file.
+			else if (data == "3lptreelevels")
+			{
+				params->tree_levels_3lp = stoi(line);
+			}
 			//Output format: msieve (default) or cado.
 			else if (data == "format")
 			{
@@ -221,6 +230,28 @@ bool read_polynomial(string filename, nfs_parameters* params)
 					cout << "Unknown output format " << line << " on line " << line_number << " of the polynomial file. Use msieve or cado." << endl;
 					return false;
 				}
+			}
+			//3LP candidates: checked in a second stage during the run (auto, default) or saved to a file (save).
+			else if (data == "3lp")
+			{
+				if (line == "save")
+				{
+					params->save_3lp = true;
+				}
+				else if (line == "auto")
+				{
+					params->save_3lp = false;
+				}
+				else
+				{
+					cout << "Unknown 3lp setting " << line << " on line " << line_number << " of the polynomial file. Use auto or save." << endl;
+					return false;
+				}
+			}
+			//File for saved 3LP candidates.
+			else if (data == "3lpfile")
+			{
+				params->file_3lp = line;
 			}
 		}
 		catch (const exception&)
@@ -299,7 +330,7 @@ bool relation_in_range(long long a, long long b, nfs_parameters* param)
 }
 
 //Function for reading relations to be processed.
-int read_batch_from_file(string filename, Batch_smooth* batch, nfs_parameters* param)
+long long read_batch_from_file(string filename, Batch_smooth* batch, nfs_parameters* param)
 {
 	FILE* infile;
 
@@ -416,7 +447,7 @@ int read_batch_from_file(string filename, Batch_smooth* batch, nfs_parameters* p
 	fclose(infile);
 
 	//Finish any remaining relations, even if the tree is not filled.
-	batch->Do_batch_check();
+	batch->Finish();
 
 	if (incomplete_last_line)
 	{
@@ -465,14 +496,19 @@ struct read_buffer
 	}
 };
 
-//Read relations from a binary format file. 
-int read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_parameters* param)
+//Read relations from a binary format file. With candidates, the file holds 3LP candidates, for a batch that is the 3LP second stage.
+long long read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_parameters* param, bool candidates)
 {
 	//The binary format is (int)a, (uint)b, (uint)num_primes, (uint)prime1 ... (uint)prime_num_primes
+	//3LP candidates are followed by (uint64)low and (uint64)high 64 bits of the cofactor.
 	int a;
 	unsigned int b;
 	unsigned int num_primes;
-	unsigned int primes[MAX_BINARY_PRIMES];
+	unsigned int primes[MAX_SAVED_PRIMES];
+	unsigned int max_primes = candidates ? MAX_SAVED_PRIMES : MAX_BINARY_PRIMES;
+	size_t extra_bytes = candidates ? 2 * sizeof(unsigned long long) : 0;
+	unsigned long long cofactor_limbs[2];
+	mpz_class cofactor;
 
 	long long relation_num = 0;
 	long long skipped_relations = 0;
@@ -500,7 +536,7 @@ int read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_parame
 		memcpy(&b, record + 4, sizeof(unsigned int));
 		memcpy(&num_primes, record + 8, sizeof(unsigned int));
 
-		if (num_primes > MAX_BINARY_PRIMES || !input.ensure((3 + num_primes) * sizeof(unsigned int)))
+		if (num_primes > max_primes || !input.ensure((3 + num_primes) * sizeof(unsigned int) + extra_bytes))
 		{
 			corrupt = true;
 			break;
@@ -509,7 +545,11 @@ int read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_parame
 		//read the primes.
 		record = input.data.data() + input.position;
 		memcpy(primes, record + 12, num_primes * sizeof(unsigned int));
-		input.position += (3 + num_primes) * sizeof(unsigned int);
+		if (candidates)
+		{
+			memcpy(cofactor_limbs, record + (3 + num_primes) * sizeof(unsigned int), sizeof(cofactor_limbs));
+		}
+		input.position += (3 + num_primes) * sizeof(unsigned int) + extra_bytes;
 
 		if (!relation_in_range(a, b, param))
 		{
@@ -518,7 +558,17 @@ int read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_parame
 		}
 
 		//Add the relation to be batch smoothness checked.
-		batch->Add_number_binary(a, b, primes, num_primes);
+		if (candidates)
+		{
+			mpz_set_ui(cofactor.get_mpz_t(), (mpir_ui)cofactor_limbs[1]);
+			mpz_mul_2exp(cofactor.get_mpz_t(), cofactor.get_mpz_t(), 64);
+			mpz_add_ui(cofactor.get_mpz_t(), cofactor.get_mpz_t(), (mpir_ui)cofactor_limbs[0]);
+			batch->Add_candidate(a, b, primes, num_primes, cofactor.get_mpz_t());
+		}
+		else
+		{
+			batch->Add_number_binary(a, b, primes, num_primes);
+		}
 		relation_num++;
 
 		if (param->maxrels > 0 && relation_num >= param->maxrels)
@@ -537,7 +587,7 @@ int read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_parame
 	fclose(input.file);
 
 	//Check final relations, even if the tree is not filled.
-	batch->Do_batch_check();
+	batch->Finish();
 
 	if (corrupt)
 	{
@@ -578,6 +628,8 @@ int main(int argc, char* argv[])
 	param->print_limit = 1000; //Msieve default.
 	param->cado_format = false;
 	param->tree_levels = 0;
+	param->tree_levels_3lp = STAGE2_ONLY_TREE_LEVELS;
+	param->save_3lp = false;
 
 	param->algebraic_polynomial = new Polynomial();
 	param->rational_polynomial = new Polynomial();
@@ -632,12 +684,16 @@ int main(int argc, char* argv[])
 		return -1;
 	}
 
-	//Can only handle cofactorization with 2lp, so no point in checking numbers that are too big for this.
-	if (lbp * 2 < mfb)
+	//Cofactors of more than 2 lbp bits can have three large primes, more than that is not supported.
+	if (lbp * 3 < mfb)
 	{
-		cout << "Three large prime cofactorization not supported. Use a lower mfb" << side_name << "." << endl;
+		cout << "More than three large primes is not supported. Use mfb" << side_name << " of at most 3 lpb" << side_name << "." << endl;
 		return -1;
 	}
+
+	//A file of 3LP candidates is checked in the 3LP second stage only.
+	bool candidate_input = inputfile.size() > 4 && inputfile.compare(inputfile.size() - 4, 4, ".3lp") == 0;
+	bool three_lp = mfb > 2 * lbp && !candidate_input;
 
 	//Estimate size needed to hold the value of the algebraic/rational polynomial values.
 	int tree_bits;
@@ -666,13 +722,52 @@ int main(int argc, char* argv[])
 
 	time = clock();
 	unsigned long long t = profile_now();
-	batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels);
+	if (candidate_input)
+	{
+		//The cofactors are less than 2^(3 lbp). The tree size is limited by 3lptreelevels instead of treelevels.
+		cout << "Checking 3LP candidates against all primes up to 2^" << lbp << "." << endl;
+		batch = new Batch_smooth(lim, lbp, mfb, 3 * lbp, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels_3lp, true);
+	}
+	else
+	{
+		batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels);
+	}
+
+	if (three_lp)
+	{
+		Batch_smooth* second_stage = NULL;
+		string candidate_filename;
+
+		if (param->save_3lp)
+		{
+			//By default, one candidate file for each output file and input file, so that runs on different input files can run at the same time.
+			candidate_filename = param->file_3lp;
+			if (candidate_filename.empty())
+			{
+				size_t name_start = inputfile.find_last_of("\\/");
+				candidate_filename = outputfile + "." + inputfile.substr((name_start == string::npos) ? 0 : name_start + 1) + ".3lp";
+			}
+			cout << "Saving 3LP candidates of up to " << mfb << " bits to " << candidate_filename << endl;
+		}
+		else
+		{
+			cout << "Checking 3LP candidates of up to " << mfb << " bits against all primes up to 2^" << lbp << " during the run." << endl;
+			second_stage = new Batch_smooth(lim, lbp, mfb, 3 * lbp, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels, true);
+		}
+
+		if (!batch->Set_three_lp_handling(second_stage, candidate_filename))
+		{
+			cout << "Could not open the 3LP candidate file " << candidate_filename << endl;
+			delete batch;
+			return -1;
+		}
+	}
 	profile_add(PROF_SETUP, t);
 	cout << "Prime products set up, it took " << (clock() - time) / CLOCKS_PER_SEC << " seconds." << endl;
 
 	time = clock();
 
-	int total_num_relations = 0;
+	long long total_num_relations = 0;
 
 	//The time in the readers that is not spent on batch checking is counted as reading.
 	unsigned long long batch_cycles = 0;
@@ -682,7 +777,12 @@ int main(int argc, char* argv[])
 	}
 	t = profile_now();
 
-	if (inputfile.find(".bin") == string::npos)
+	if (candidate_input)
+	{
+		//3LP candidates saved by an earlier run, with a .3lp extension.
+		total_num_relations = read_batch_from_binary_file(inputfile, batch, param, true);
+	}
+	else if (inputfile.find(".bin") == string::npos)
 	{
 		//for reading gnfs-lasieve output.
 		total_num_relations = read_batch_from_file(inputfile, batch, param);
@@ -690,7 +790,7 @@ int main(int argc, char* argv[])
 	else
 	{
 		//for reading binary formated files, assumed to have a .bin extension.
-		total_num_relations = read_batch_from_binary_file(inputfile, batch, param);
+		total_num_relations = read_batch_from_binary_file(inputfile, batch, param, false);
 	}
 
 	unsigned long long reader_cycles = profile_now() - t;

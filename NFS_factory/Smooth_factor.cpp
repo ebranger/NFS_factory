@@ -3,6 +3,7 @@
 //the factor base limit, which is less than 2^32. The value then fits in 128 bits, and any remaining cofactor of at
 //least 2^32 must be composite. Small primes are found by trial division, the rest by Pollard-Brent rho with Montgomery
 //multiplication modulo the (up to 128-bit) cofactor.
+//The same arithmetic gives a fast primality test for the cofactors of the batch check.
 
 #include "Smooth_factor.h"
 #include <intrin.h>
@@ -115,6 +116,18 @@ static u64 montgomery_inverse(u64 n)
 	return 0 - inverse;
 }
 
+//r + carry * 2^128 mod n, for r + carry * 2^128 < 2n. Without branches, since whether n is subtracted is unpredictable.
+static inline u128 reduce_once(const u128& r, u64 carry, const u128& n)
+{
+	u128 s;
+	unsigned char borrow = _subborrow_u64(0, r.lo, n.lo, &s.lo);
+	borrow = _subborrow_u64(borrow, r.hi, n.hi, &s.hi);
+	u64 keep = 0 - (u64)(borrow & (carry == 0)); //all ones if r < n.
+	s.lo ^= (s.lo ^ r.lo) & keep;
+	s.hi ^= (s.hi ^ r.hi) & keep;
+	return s;
+}
+
 //Montgomery product a * b / 2^128 mod n, for a, b < n and odd n. The result is less than n.
 static inline u128 montgomery_multiply(const u128& a, const u128& b, const u128& n, u64 ninv)
 {
@@ -157,31 +170,77 @@ static inline u128 montgomery_multiply(const u128& a, const u128& b, const u128&
 	}
 
 	u128 r = { t0, t1 };
-	if (t2 != 0 || !less(r, n))
-	{
-		r = subtract(r, n);
-	}
-	return r;
+	return reduce_once(r, t2, n);
+}
+
+//Montgomery square a^2 / 2^128 mod n, for a < n and odd n. The same as montgomery_multiply(a, a, n, ninv), unrolled,
+//and with the cross product computed once.
+static inline u128 montgomery_square(const u128& a, const u128& n, u64 ninv)
+{
+	u64 t0, t1, t2, t3, hi, lo, h, c4 = 0;
+	unsigned char c;
+
+	//t = a^2 = a.lo^2 + 2 a.lo a.hi 2^64 + a.hi^2 2^128. It is less than 2^256, so the last carry is 0.
+	t0 = _umul128(a.lo, a.lo, &t1);
+	t2 = _umul128(a.hi, a.hi, &t3);
+	lo = _umul128(a.lo, a.hi, &hi);
+	u64 top = hi >> 63;
+	hi = (hi << 1) | (lo >> 63);
+	lo <<= 1;
+	c = _addcarry_u64(0, t1, lo, &t1);
+	c = _addcarry_u64(c, t2, hi, &t2);
+	_addcarry_u64(c, t3, top, &t3);
+
+	//Two Montgomery reduction steps, each clearing the lowest limb. c4 is the carry out of t3.
+	u64 m = t0 * ninv;
+	lo = _umul128(m, n.lo, &hi);
+	c = _addcarry_u64(0, t0, lo, &t0);
+	h = hi;
+	lo = _umul128(m, n.hi, &hi);
+	c = _addcarry_u64(c, t1, h, &t1);
+	hi += c;
+	c = _addcarry_u64(0, t1, lo, &t1);
+	c = _addcarry_u64(c, t2, hi, &t2);
+	c = _addcarry_u64(c, t3, 0, &t3);
+	c4 += c;
+
+	m = t1 * ninv;
+	lo = _umul128(m, n.lo, &hi);
+	c = _addcarry_u64(0, t1, lo, &t1);
+	h = hi;
+	lo = _umul128(m, n.hi, &hi);
+	c = _addcarry_u64(c, t2, h, &t2);
+	hi += c;
+	c = _addcarry_u64(0, t2, lo, &t2);
+	c = _addcarry_u64(c, t3, hi, &t3);
+	c4 += c;
+
+	u128 r = { t2, t3 };
+	return reduce_once(r, c4, n);
 }
 
 //The rho map y -> y^2 + c mod n. Working on Montgomery representations is fine, since the result mod any prime p
 //dividing n only depends on y mod p.
 static inline u128 rho_step(const u128& y, const u128& c, const u128& n, u64 ninv)
 {
-	u128 r = montgomery_multiply(y, y, n, ninv);
+	u128 r = montgomery_square(y, n, ninv);
 	u128 sum;
 	unsigned char carry = _addcarry_u64(0, r.lo, c.lo, &sum.lo);
 	carry = _addcarry_u64(carry, r.hi, c.hi, &sum.hi);
-	if (carry || !less(sum, n))
-	{
-		sum = subtract(sum, n);
-	}
-	return sum;
+	return reduce_once(sum, carry, n);
 }
 
+//|a - b|, without branches.
 static inline u128 difference(const u128& a, const u128& b)
 {
-	return less(a, b) ? subtract(b, a) : subtract(a, b);
+	u128 d, e;
+	unsigned char borrow = _subborrow_u64(0, a.lo, b.lo, &d.lo);
+	borrow = _subborrow_u64(borrow, a.hi, b.hi, &d.hi);
+	u64 negative = 0 - (u64)borrow;
+	_subborrow_u64(_subborrow_u64(0, 0, d.lo, &e.lo), 0, d.hi, &e.hi); //e = -d
+	d.lo ^= (d.lo ^ e.lo) & negative;
+	d.hi ^= (d.hi ^ e.hi) & negative;
+	return d;
 }
 
 //Find a nontrivial factor of the odd composite n with Pollard-Brent rho. Returns false if none was found.
@@ -495,4 +554,151 @@ int factor_smooth(unsigned int* factors, mpz_srcptr value, int max_factors)
 bool split_composite64(unsigned long long n, unsigned long long* factor)
 {
 	return rho64(n, factor);
+}
+
+//Strong probable prime test to base 2 for odd n, 2^32 <= n < 2^64. one is 2^64 mod n, the Montgomery form of 1.
+static bool sprp2_64(u64 n)
+{
+	u64 ninv = montgomery_inverse(n);
+	u64 one = (0 - n) % n;
+	u64 minus_one = n - one;
+
+	unsigned long s;
+	_BitScanForward64(&s, n - 1);
+	u64 d = (n - 1) >> s;
+	unsigned long top;
+	_BitScanReverse64(&top, d);
+
+	//2^d mod n, left to right. Multiplying by the base 2 is a doubling.
+	u64 x = one;
+	for (int i = (int)top; i >= 0; i--)
+	{
+		x = montgomery_multiply64(x, x, n, ninv);
+
+		//Double x mod n if the bit is set, without branches.
+		u64 doubled, reduced;
+		unsigned char carry = _addcarry_u64(0, x, x, &doubled);
+		unsigned char borrow = _subborrow_u64(0, doubled, n, &reduced);
+		u64 keep = 0 - (u64)(borrow & (carry == 0)); //all ones if 2x < n.
+		reduced ^= (reduced ^ doubled) & keep;
+		u64 take = 0 - ((d >> i) & 1);
+		x ^= (x ^ reduced) & take;
+	}
+
+	if (x == one || x == minus_one)
+	{
+		return true;
+	}
+	for (unsigned long i = 1; i < s; i++)
+	{
+		x = montgomery_multiply64(x, x, n, ninv);
+		if (x == minus_one)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+//x = 2 * x mod n, for x < n.
+static inline u128 double_mod(const u128& x, const u128& n)
+{
+	u128 r;
+	unsigned char carry = _addcarry_u64(0, x.lo, x.lo, &r.lo);
+	carry = _addcarry_u64(carry, x.hi, x.hi, &r.hi);
+	return reduce_once(r, carry, n);
+}
+
+//Strong probable prime test to base 2 for odd n, 2^64 <= n < 2^128.
+static bool sprp2_128(const u128& n)
+{
+	u64 ninv = montgomery_inverse(n.lo);
+
+	//one = 2^128 mod n, the Montgomery form of 1, by doubling 2^(bits - 1) < n up to 2^128.
+	unsigned long top;
+	_BitScanReverse64(&top, n.hi);
+	u128 one = { 0, (u64)1 << top };
+	for (unsigned long i = top + 64; i < 128; i++)
+	{
+		one = double_mod(one, n);
+	}
+	u128 minus_one = subtract(n, one);
+
+	u128 d = { n.lo - 1, n.hi }; //n is odd, so no borrow.
+	unsigned long s;
+	if (d.lo != 0)
+	{
+		_BitScanForward64(&s, d.lo);
+	}
+	else
+	{
+		_BitScanForward64(&s, d.hi);
+		s += 64;
+	}
+	d = shift_right(d, s);
+
+	int d_top;
+	if (d.hi != 0)
+	{
+		_BitScanReverse64(&top, d.hi);
+		d_top = (int)top + 64;
+	}
+	else
+	{
+		_BitScanReverse64(&top, d.lo);
+		d_top = (int)top;
+	}
+
+	u128 x = one;
+	for (int i = d_top; i >= 0; i--)
+	{
+		x = montgomery_square(x, n, ninv);
+		u64 bit = (i >= 64) ? (d.hi >> (i - 64)) : (d.lo >> i);
+		u64 take = 0 - (bit & 1);
+		u128 doubled = double_mod(x, n);
+		x.lo ^= (x.lo ^ doubled.lo) & take;
+		x.hi ^= (x.hi ^ doubled.hi) & take;
+	}
+
+	if (equal(x, one) || equal(x, minus_one))
+	{
+		return true;
+	}
+	for (unsigned long i = 1; i < s; i++)
+	{
+		x = montgomery_square(x, n, ninv);
+		if (equal(x, minus_one))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool is_probable_prime(mpz_srcptr value)
+{
+	int size = value->_mp_size;
+	if (size > 2)
+	{
+		return mpz_probab_prime_p(value, 1) != 0;
+	}
+	if (size <= 0)
+	{
+		return false;
+	}
+
+	u128 n = { value->_mp_d[0], (size > 1) ? value->_mp_d[1] : 0 };
+	if ((n.lo & 1) == 0)
+	{
+		return n.hi == 0 && n.lo == 2;
+	}
+	if (n.hi != 0)
+	{
+		return sprp2_128(n);
+	}
+	if (n.lo < ((u64)1 << 32))
+	{
+		return is_prime32(n.lo);
+	}
+	return sprp2_64(n.lo);
 }

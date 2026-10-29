@@ -25,7 +25,7 @@ NFS_factory <polynomial file name> <saved relation file name> <output file name>
 
 The polynomial file describes the polynomial used for the current factorization, in GGNFS format with a few extra options, detailed below. The relation file contains the NFS relations stored by the sieving procedure, and accepts either the GGNFS/msieve relation format, or a binary format I have used to save some space. The program will run until all relations in the file have been processed. All found relations are appended to the output file specified.
 
-The polynomial file contains the polynomial pair and factorization parameters in a GGNFS format, and NFS_factory needs the polynomial pair, rlim/alim, lbpr/lbpa and mfbr/mfba to run. The batch smoothness checking will test the relations for all primes up to rlim/alim, and any remiainder is checked if it is a single large prime if it is less than lbpr/lbpa, or double-large prime if it is less than mfbr/mfba. One more parameter is required to control which polynomial should be checked for smoothness. Batch smoothness checking is done on the rational side if “side: 0” is specified in the polynomial file, and on the algebraic side if “side: 1” is specified.
+The polynomial file contains the polynomial pair and factorization parameters in a GGNFS format, and NFS_factory needs the polynomial pair, rlim/alim, lbpr/lbpa and mfbr/mfba to run. The batch smoothness checking will test the relations for all primes up to rlim/alim, and any remiainder is checked if it is a single large prime if it is less than lbpr/lbpa, or double-large prime if it is less than mfbr/mfba (or 2 lbpr/lbpa, if mfbr/mfba is larger, see "Three large primes" below). One more parameter is required to control which polynomial should be checked for smoothness. Batch smoothness checking is done on the rational side if “side: 0” is specified in the polynomial file, and on the algebraic side if “side: 1” is specified.
 
 A few optional parameters can also be given in the polynomial file:
 - format: msieve (default) or cado. With "format: cado" all primes are printed on both sides of each relation, with multiplicity, as CADO-NFS requires. The factor list of the side that is not batch checked is then rebuilt from its norm, and relations where the stored factors do not match the norm are skipped. With "format: msieve" that factor list is printed as it was read, and small primes are left out, since msieve finds them itself.
@@ -33,6 +33,34 @@ A few optional parameters can also be given in the polynomial file:
 - maxa, maxb: relations with |a| larger than maxa, or b larger than maxb, are skipped. There is no limit by default.
 - maxrels: stop after this many relations have been read from the relation file. Useful for testing and timing.
 - treelevels: the maximum number of levels in the remainder tree (default 20). The number of levels is otherwise chosen from the size of the prime product and the relation values. Each level less halves the memory use of the tree, at some cost in speed.
+- 3lp: auto (default) or save. Only used when mfbr/mfba is more than 2 lbpr/lbpa, see "Three large primes" below.
+- 3lpfile: the file that "3lp: save" appends the 3LP candidates to. The default is the output file name, followed by a dot, the name of the relation file and ".3lp".
+- 3lptreelevels: the maximum number of levels in the remainder tree when running on a 3LP candidate file (default 22). treelevels is not used for such runs.
+
+Three large primes
+------------------
+
+With mfbr/mfba larger than 2 lbpr/lbpa (at most 3 lbpr/lbpa), relations with three large primes on the batch checked side are also found. After the batch check against the primes up to rlim/alim, a remainder that is too large for two large primes, but at most mfbr/mfba bits, at least rlim^3/alim^3 and composite, can be the product of three large primes. These remainders are the 3LP candidates. Typically less than 1 % of them are relations, so instead of factoring each of them, they are batch checked in a second stage against the product of all primes below 2^lbpr/2^lbpa. Since that prime product is large (290 Mbit for 2^29 and a degree 4 polynomial, which takes 10 to 20 seconds to set up), the second stage is run when enough candidates have been collected to fill its remainder tree, which with treelevels 20 is about 500000 candidates.
+
+- "3lp: auto" (the default): the second stage runs during the run whenever its tree is full, and on the remaining candidates at the end, so that each run finishes its relation file on its own, and many runs can be started in parallel on different relation files. This needs memory for the second remainder tree (about 550 MB more for lpba 29).
+- "3lp: save": the candidates are appended to a candidate file (see 3lpfile) and not checked. Candidate files from many runs can be concatenated, and are checked by running NFS_factory with a candidate file, which must have the extension .3lp, instead of a relation file. Only the second stage is then run, and the found relations are appended to the output file. Use the same polynomial file, so that lpbr/lpba is the same.
+
+The second stage costs less per candidate when its tree is full, and a run on a small relation file may end with a small, and therefore expensive, last batch of candidates. Saving the candidates and checking them together avoids that. A run on a candidate file can also use a larger tree, since such runs are few and do not run in parallel with many others: up to 3lptreelevels (default 22) levels. For lpba 29, 22 levels hold about 2 million candidates, needs about 2 GB of memory, and was about 20 % faster on the second stage than 20 levels.
+
+The candidate file has the binary relation format, with the remainder added to each relation as two 64-bit numbers (low 64 bits first).
+
+The largest candidates are the least likely to be products of three primes below 2^lbpr/2^lbpa, so mfbr/mfba a few bits less than 3 lbpr/lbpa keeps most of the 3LP relations for a much smaller cost. For an SNFS-240 polynomial with lpba 29 and alim 2^29/20, a sample of 8.4 million relations gave:
+
+  mfba   candidates   3LP relations   cost of 3LP (first and second stage)
+   87     508350       2543            20.1 Gcycles
+   86     452407       2533            18.5 Gcycles
+   85     399754       2493            15.1 Gcycles
+   84     350156       2377            14.2 Gcycles
+   83     303519       2151            12.1 Gcycles
+   82     260064       1847
+   81     219025       1428
+
+For comparison, the whole run without 3LP took about 160 Gcycles and found 19587 relations, about 8 Mcycles per relation. The last few bits cost much more than that per relation found: going from 86 to 87 bits costs more than 100 Mcycles per extra relation, and from 84 to 85 about 10 to 15 Mcycles. mfba = 3 lpba - 3 (84 for lpba 29) is a reasonable choice, or 3 lpba - 2 when more relations are worth more CPU time. Without 3LP, use mfbr/mfba = 2 lbpr/lbpa as before.
 
 At the end of a run, the program prints how the time was spent on the different steps, and the peak memory use.
 

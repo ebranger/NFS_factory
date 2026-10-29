@@ -5,6 +5,7 @@
 #include <math.h>
 #include <cerrno>
 #include <time.h>
+#include <limits.h>
 #include "cofactorize.h"
 
 #include "smintfact.h"
@@ -27,8 +28,6 @@ using namespace std;
 
 #define MAX_FACTORS_IN_RELATION 512 //Each factor is at least 2, so this is enough for any relation value of up to 512 bits.
 
-#define LP_PRIMALITY_REPS 10 //Miller-Rabin rounds used before accepting a cofactor as a large prime in a relation.
-
 #define WRAPAROUND_MIN_LIMBS 512 //Use wraparound products in the remainder tree for nodes of at least this many limbs. Tuned on an i7-14700F.
 #define FFT_MULMOD_2EXPP1_CUTOFF 256 //From the MPIR build (gmp-mparam.h). Below this, MPIR does not use the FFT for products mod B^n + 1.
 
@@ -42,16 +41,25 @@ extern "C"
 }
 
 //Initialize the batch smoothness class
-Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, int max_tree_levels)
+Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, int max_tree_levels, bool three_lp_stage)
 {
 	//init.
 	temp_number = new mpz_class;
 
 	long long max_prime_limit = 1LL << lbp;
 
+	this->three_lp_stage = three_lp_stage;
+	if (three_lp_stage)
+	{
+		//The cofactors have no prime factors up to the fblim of the first stage, but the primes below that are cheap to include,
+		//and then the candidates do not depend on the fblim used to find them.
+		fblim = max_prime_limit - 1;
+		mfb = 3 * lbp;
+	}
+
 	//if fblim and 2^lbp match, then we batch-check all numbers against the full primorial and do no cofactorization of any remaining numbers.
 	// fblim > 2^lbp makes little sense? so assume equal, otherwise we will end up printing relations with some factors too large. Maybe check this in input file and warn user?
-	if (max_prime_limit >= fblim)
+	if (max_prime_limit >= fblim && !three_lp_stage)
 	{
 		do_cofactorization = true;
 	}
@@ -81,11 +89,19 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	Setup_prime_product(fblim);
 	max_batch_prime = fblim;
 
-	//For handling 2lp cofactorization. 
+	//For handling 2lp cofactorization.
 	one_lp_bit_limit = lbp;
 	two_lp_min_limit = 2 * (long long)floor(log2((double)fblim));
-	max_cofactor_bit_size = mfb;
-	
+	max_cofactor_bit_size = min(mfb, 2 * lbp);
+
+	//Larger cofactors, up to mfb bits, can have three large primes. They must be composite and at least fblim^3.
+	three_lp_max_bits = (mfb > 2 * lbp && !three_lp_stage) ? mfb : 0;
+	mpz_ui_pow_ui(three_lp_min.get_mpz_t(), (mpir_ui)fblim, 3);
+	second_stage = NULL;
+	candidate_file = NULL;
+	num_candidates = 0;
+	num_candidates_skipped = 0;
+
 	entries = 0;
 
 	//Estiamte a good tree size for the remainder tree
@@ -125,6 +141,12 @@ Batch_smooth::~Batch_smooth(void)
 	if (num_other_side_failures > 0)
 	{
 		cout << num_other_side_failures << " smooth relations had a factor list for the other side that did not match its norm, they were not saved." << endl;
+	}
+
+	delete second_stage;
+	if (candidate_file != NULL)
+	{
+		fclose(candidate_file);
 	}
 
 	for (int i = 0; i < 2 * num_relations_per_batch - 1; i++)
@@ -273,6 +295,106 @@ bool Batch_smooth::Add_number_binary(long long a_val, long long b_val, const uns
 	return true;
 }
 
+//Add one 3LP candidate to the second stage: a relation with the factor list of the other side, and the cofactor of the batch checked side
+//that is left after dividing out the primes up to fblim of the first stage. Returns false if there are too many primes to be saved.
+bool Batch_smooth::Add_candidate(long long a_val, long long b_val, const unsigned int* primes, unsigned int num_primes, mpz_srcptr cofactor)
+{
+	if (num_primes > MAX_SAVED_PRIMES)
+	{
+		return false;
+	}
+
+	//The cofactor is checked instead of the polynomial value.
+	mpz_set(inputs[start_entry + entries]->get_mpz_t(), cofactor);
+	return Add_number_binary(a_val, b_val, primes, num_primes);
+}
+
+bool Batch_smooth::Set_three_lp_handling(Batch_smooth* second_stage, string candidate_filename)
+{
+	this->second_stage = second_stage;
+
+	if (!candidate_filename.empty())
+	{
+		candidate_file = fopen(candidate_filename.c_str(), "ab");
+		if (candidate_file == NULL)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+//Pass on the 3LP candidates of the batch that was just checked, to the second stage and/or the candidate file.
+//The candidate file has the binary relation format with the cofactor added: (int)a, (uint)b, (uint)num_primes, (uint)prime1 ... (uint)prime_num_primes,
+//(uint64)low and (uint64)high 64 bits of the cofactor.
+void Batch_smooth::Send_candidates()
+{
+	vector<unsigned long long> primes;
+	unsigned int saved[MAX_SAVED_PRIMES];
+
+	for (size_t n = 0; n < candidate_index.size(); n++)
+	{
+		int index = candidate_index[n];
+		Get_saved_primes(index, primes);
+
+		bool fits = primes.size() <= MAX_SAVED_PRIMES && a_vals[index] >= INT_MIN && a_vals[index] <= INT_MAX && b_vals[index] <= UINT_MAX;
+		for (size_t j = 0; j < primes.size() && fits; j++)
+		{
+			fits = primes[j] <= UINT_MAX;
+			saved[j] = (unsigned int)primes[j];
+		}
+
+		if (!fits)
+		{
+			num_candidates_skipped++;
+			continue;
+		}
+
+		num_candidates++;
+		unsigned int num_primes = (unsigned int)primes.size();
+
+		if (candidate_file != NULL)
+		{
+			int a = (int)a_vals[index];
+			unsigned int b = (unsigned int)b_vals[index];
+			unsigned long long cofactor[2] = { mpz_getlimbn(candidate_cofactor[n].get_mpz_t(), 0), mpz_getlimbn(candidate_cofactor[n].get_mpz_t(), 1) };
+			fwrite(&a, sizeof(int), 1, candidate_file);
+			fwrite(&b, sizeof(unsigned int), 1, candidate_file);
+			fwrite(&num_primes, sizeof(unsigned int), 1, candidate_file);
+			fwrite(saved, sizeof(unsigned int), num_primes, candidate_file);
+			fwrite(cofactor, sizeof(unsigned long long), 2, candidate_file);
+		}
+
+		if (second_stage != NULL)
+		{
+			second_stage->Add_candidate(a_vals[index], b_vals[index], saved, num_primes, candidate_cofactor[n].get_mpz_t());
+		}
+	}
+
+	candidate_index.clear();
+}
+
+void Batch_smooth::Finish()
+{
+	Do_batch_check();
+
+	if (three_lp_max_bits > 0)
+	{
+		cout << "Found " << num_candidates << " 3LP candidates";
+		if (num_candidates_skipped > 0)
+		{
+			cout << " (and skipped " << num_candidates_skipped << " with a, b or saved primes too large for the candidate format)";
+		}
+		cout << "." << endl;
+	}
+
+	if (second_stage != NULL)
+	{
+		second_stage->Finish();
+		cout << "The 3LP second stage found " << second_stage->Get_num_relations_found() << " relations." << endl;
+	}
+}
+
 //The saved factor list of the other side of a relation, as text.
 void Batch_smooth::Get_saved_list(int index, string& list)
 {
@@ -322,14 +444,23 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class& number, unsigned int index)
 
 	if (cofactor_bits > max_cofactor_bit_size)
 	{
-		//Too big to be split into two primes both less than lp_limit
+		//Too big to be split into two primes both less than lp_limit. It can still have three, if it is composite and at least fblim^3.
+		if (cofactor_bits <= three_lp_max_bits && number >= three_lp_min && !is_probable_prime(number.get_mpz_t()))
+		{
+			if (candidate_cofactor.size() <= candidate_index.size())
+			{
+				candidate_cofactor.emplace_back();
+			}
+			candidate_cofactor[candidate_index.size()] = number;
+			candidate_index.push_back(index);
+		}
 		return false;
 	}
 
 	if (cofactor_bits > two_lp_min_limit)
 	{
 		//Can potentially split into two large primes, small enough to be useful
-		if (mpz_probab_prime_p(number.get_mpz_t(), 1))
+		if (is_probable_prime(number.get_mpz_t()))
 		{
 			return false;
 		}
@@ -373,11 +504,11 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class& number, unsigned int index)
 
 		//check that the factors are actual large primes. If it turns out to be a small prime that occured to a high
 		//power, it can cause problems later when it is assumed to be a prime larger than the rlim/alim.
-		if (!mpz_probab_prime_p(factor1->get_mpz_t(), LP_PRIMALITY_REPS))
+		if (!is_probable_prime(factor1->get_mpz_t()))
 		{
 			return false;
 		}
-		if (!mpz_probab_prime_p(factor2->get_mpz_t(), LP_PRIMALITY_REPS))
+		if (!is_probable_prime(factor2->get_mpz_t()))
 		{
 			return false;
 		}
@@ -402,7 +533,7 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class& number, unsigned int index)
 	}
 
 	//should be one large prime by now. Make sure it is actually a large prime as well.
-	if (number > max_batch_prime && mpz_probab_prime_p(number.get_mpz_t(), LP_PRIMALITY_REPS))
+	if (number > max_batch_prime && is_probable_prime(number.get_mpz_t()))
 	{
 		lp1[index] = mpz_get_ui(number.get_mpz_t());
 		lp2[index] = 0;
@@ -435,10 +566,33 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class& number, unsigned int index)
 	return true;
 }
 
+//Check the relations added so far. The time of the 3LP second stage is counted as one phase of the profile, with its phases kept separately.
+void Batch_smooth::Do_batch_check()
+{
+	if (!three_lp_stage)
+	{
+		Run_batch_check();
+		return;
+	}
+
+	unsigned long long outer_cycles[PROF_NUM_PHASES];
+	memcpy(outer_cycles, profile_cycles, sizeof(outer_cycles));
+	unsigned long long t = profile_now();
+
+	Run_batch_check();
+
+	for (int i = 0; i < PROF_NUM_PHASES; i++)
+	{
+		profile_cycles_3lp[i] += profile_cycles[i] - outer_cycles[i];
+	}
+	memcpy(profile_cycles, outer_cycles, sizeof(outer_cycles));
+	profile_add(PROF_3LP, t);
+}
+
 //Perform the remainder tree calculations.
 //Core parts of this function was taken from the CADO-NFS package.
 //Use a scaled remainder tree for speed.
-void Batch_smooth::Do_batch_check()
+void Batch_smooth::Run_batch_check()
 {
 	int limit;
 
@@ -450,8 +604,8 @@ void Batch_smooth::Do_batch_check()
 
 	unsigned long long t = profile_now();
 
-	//set up polynomial values
-	for (int index = 0; index < entries; index++)
+	//set up polynomial values. The second stage checks the cofactors that were added.
+	for (int index = 0; index < entries && !three_lp_stage; index++)
 	{
 		//use different poly evaluation if polynomial has form k*x^4+l which is faster.
 		if (using_snfs_deg4_binomial)
@@ -641,6 +795,7 @@ void Batch_smooth::Do_batch_check()
 	profile_add(PROF_LEAVES, t);
 	profile_cycles[PROF_LEAVES] -= profile_cycles[PROF_COFACTOR] - cofactor_start; //cofactorization is counted separately.
 
+	Send_candidates();
 	Output_solutions();
 
 	delete[] product_bits;
@@ -884,21 +1039,46 @@ void Batch_smooth::Output_solutions()
 				*relation_value = *relation_value * -1;
 			}
 
-			//factor the relation. First, divide out already factored large primes.
+			//factor the relation. First, divide out the large primes, which are printed first.
 			num_factors = 0;
+			num_large_primes = 0;
 
-			if (lp1[index] > 1)
+			if (three_lp_stage)
 			{
-				mpz_divexact_ui(relation_value->get_mpz_t(), relation_value->get_mpz_t(), lp1[index]);
+				//The value is the cofactor from the first stage, and all its primes are below 2^lbp. Those are the large primes,
+				//and the rest of the polynomial value is factored as for other relations.
+				unsigned long long tf = profile_now();
+				num_large_primes = factor_smooth(large_primes, relation_value->get_mpz_t(), MAX_COFACTOR_PRIMES);
+				poly->evaluate_polynomial_homogenous(temp_number, a_vals[index], b_vals[index]);
+				mpz_abs(temp_number->get_mpz_t(), temp_number->get_mpz_t());
+
+				if (num_large_primes < 0 || *temp_number == 0 || !mpz_divisible_p(temp_number->get_mpz_t(), relation_value->get_mpz_t()))
+				{
+					num_factors = -1;
+				}
+				else
+				{
+					mpz_divexact(relation_value->get_mpz_t(), temp_number->get_mpz_t(), relation_value->get_mpz_t());
+				}
+				profile_add(PROF_FACTOR, tf);
 			}
-
-			if (lp2[index] > 1)
+			else
 			{
-				mpz_divexact_ui(relation_value->get_mpz_t(), relation_value->get_mpz_t(), lp2[index]);
+				if (lp1[index] > 1)
+				{
+					large_primes[num_large_primes++] = (unsigned int)lp1[index];
+					mpz_divexact_ui(relation_value->get_mpz_t(), relation_value->get_mpz_t(), lp1[index]);
+				}
+
+				if (lp2[index] > 1)
+				{
+					large_primes[num_large_primes++] = (unsigned int)lp2[index];
+					mpz_divexact_ui(relation_value->get_mpz_t(), relation_value->get_mpz_t(), lp2[index]);
+				}
 			}
 
 			//run Pollard rho factoring on the remaining part of the relation. Since it is smooth Pollard rho should be a decent choice.
-			if (*relation_value > 1)
+			if (num_factors == 0 && *relation_value > 1)
 			{
 				unsigned long long tf = profile_now();
 				num_factors = factor_smooth(relation_factor_list, relation_value->get_mpz_t(), MAX_FACTORS_IN_RELATION);
@@ -930,14 +1110,12 @@ void Batch_smooth::Output_solutions()
 				//The factor list for the batch checked side: large primes first, then the other factors.
 				checked_side_list.clear();
 
-				if (lp1[index] > 1)
+				for (int j = 0; j < num_large_primes; j++)
 				{
-					append_prime(checked_side_list, lp1[index]);
-				}
-
-				if (lp2[index] > 1)
-				{
-					append_prime(checked_side_list, lp2[index]);
+					if (large_primes[j] >= (unsigned int)min_saved_prime_limit)
+					{
+						append_prime(checked_side_list, large_primes[j]);
+					}
 				}
 
 				for (int j = 0; j < num_factors; j++)
@@ -990,12 +1168,19 @@ void Batch_smooth::Output_solutions()
 	profile_add(PROF_WRITE, t_start);
 	profile_cycles[PROF_WRITE] -= profile_cycles[PROF_FACTOR] + profile_cycles[PROF_OTHER_SIDE] - factor_start; //factoring is counted separately.
 
-	cout << "Ran a batch, found " << num_good << " smooth numbers" << endl;
+	if (three_lp_stage)
+	{
+		cout << "Ran a 3LP batch of " << entries << " candidates, found " << num_good << " relations" << endl;
+	}
+	else
+	{
+		cout << "Ran a batch, found " << num_good << " smooth numbers" << endl;
+	}
 	num_relations_found += num_good;
 	entries = 0;
 }
 
-int Batch_smooth::Get_num_relations_found()
+long long Batch_smooth::Get_num_relations_found()
 {
-	return num_relations_found;
+	return num_relations_found + ((second_stage != NULL) ? second_stage->Get_num_relations_found() : 0);
 }

@@ -16,10 +16,12 @@ enum profile_phase {
 	PROF_FACTOR,          //factoring the smooth relations for output
 	PROF_OTHER_SIDE,      //rebuilding the factor list of the other side (format: cado)
 	PROF_WRITE,           //formatting and writing the relations
+	PROF_3LP,             //the 3LP second stage, all of its phases
 	PROF_NUM_PHASES
 };
 
 extern unsigned long long profile_cycles[PROF_NUM_PHASES];
+extern unsigned long long profile_cycles_3lp[PROF_NUM_PHASES]; //the phases of the 3LP second stage, which are counted as one phase in profile_cycles.
 
 inline unsigned long long profile_now()
 {
