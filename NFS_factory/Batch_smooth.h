@@ -5,7 +5,7 @@
 #include <string.h>
 #include <vector>
 #include "Polynomial.h"
-#include "Fft_product.h"
+#include "Tree_backend.h"
 using namespace std;
 
 #define MAX_SAVED_PRIMES 64 //Most primes in the saved factor list of a relation from a binary relation file.
@@ -16,8 +16,9 @@ class Batch_smooth
 public:
 	//other_side_poly: if not NULL, the factor list of the side that is not batch checked is rebuilt from its norm, with all primes and their multiplicities (as CADO-NFS requires).
 	//If NULL, that factor list is printed as it was read.
+	//backend: the implementation of the tree computations.
 	//three_lp_stage: if true, this is the 3LP second stage. Its inputs are the cofactors given with Add_candidate, which are checked against all primes below 2^lbp (fblim and mfb are not used).
-	Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, int max_tree_levels, bool three_lp_stage = false);
+	Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, int max_tree_levels, tree_backend_kind backend, bool three_lp_stage = false);
 	~Batch_smooth(void);
 	void Do_batch_check();
 	void Finish(); //Check the remaining relations, and any 3LP candidates in the second stage. Call once, after the last relation.
@@ -34,7 +35,7 @@ public:
 
 private:
 	mpz_class* prime_product;
-	mpz_class** inputs;
+	Tree_backend* tree; //the product and remainder trees, with the relation values as leaves.
 	long long * a_vals, * b_vals;
 	bool* is_smooth; // set by the batch check for relations that are smooth.
 	char** list_of_factors; // holds the already known smooth side factor list, as text or (binary_lists) as the number of primes followed by the primes.
@@ -53,7 +54,7 @@ private:
 	int num_large_primes;
 
 	void Setup_prime_product(long long smooth_bound);
-	void Setup_memory(int tree_levels, int max_bits_in_input);
+	void Setup_memory(int tree_levels, int max_bits_in_input, tree_backend_kind backend);
 
 	void Output_solutions();
 	bool Complete_other_side(int index, string& list);
@@ -62,7 +63,6 @@ private:
 	string save_filename;
 	int tree_size;
 	int entries;
-	int start_entry;
 	int max_entries_before_check;
 	long long num_relations_found;
 	long long num_factoring_failures;
@@ -98,11 +98,5 @@ private:
 	long long num_candidates_skipped; //could not be saved (a, b or saved primes too large for the candidate format).
 	void Run_batch_check();
 	void Send_candidates();
-
-	void Scaled_root_value(mpz_ptr root, mp_bitcnt_t precision);
-	void Barrett_reduce(mpz_ptr r, mpz_srcptr a, mpz_srcptr x, mp_bitcnt_t e, mp_bitcnt_t bits);
-	mpz_class root_shifted, root_inverse, root_remainder, root_quotient, root_temp, root_part; //temporaries for Scaled_root_value.
-	Cyclic_product cyclic; //wraparound products of the remainder tree.
-	mpz_class wrap_result[2];
 };
 

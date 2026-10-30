@@ -19,12 +19,7 @@ public:
 	//result = y * x modulo 2^L - 1, from 0 to 2^L - 2, with L at least min_L. Both numbers must be less than 2^L. Returns L.
 	mp_bitcnt_t Product_mod(mpz_ptr result, mpz_srcptr y, mpz_srcptr x, mp_bitcnt_t min_L);
 
-	//An approximation of B^(2n) / a, where a has n limbs and its top bit set, with B = 2^64. The result is at most
-	//INVERSE_MAX_ERROR less than floor((B^(2n) - 1) / a), and never more.
-	void Inverse(mpz_ptr result, mpz_srcptr a);
-
 private:
-	void Newton_inverse(mpz_ptr result, mpz_srcptr a, mp_size_t a_limbs);
 	void Setup(mp_size_t y_limbs, mp_size_t x_limbs, mp_bitcnt_t min_L);
 	void Transform_columns(mp_ptr* c, mp_srcptr a, mp_size_t a_limbs);
 	void Transform_rows(mp_ptr* c);
@@ -46,5 +41,3 @@ private:
 	mp_size_t product_limbs;
 	mpz_class high_part;
 };
-
-#define INVERSE_MAX_ERROR (1 << 16)

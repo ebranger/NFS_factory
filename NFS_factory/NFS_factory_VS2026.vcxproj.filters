@@ -39,8 +39,29 @@
     <ClCompile Include="Fft_product.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Tree_backend.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\int_ntt\int_ntt.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\int_ntt\ntt_core.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Tree_backend.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\int_ntt\arith32.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\int_ntt\int_ntt.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\int_ntt\ntt_core.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="Batch_smooth.h">
       <Filter>Header Files</Filter>
     </ClInclude>

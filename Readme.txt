@@ -36,6 +36,7 @@ A few optional parameters can also be given in the polynomial file:
 - 3lp: auto (default) or save. Only used when mfbr/mfba is more than 2 lbpr/lbpa, see "Three large primes" below.
 - 3lpfile: the file that "3lp: save" appends the 3LP candidates to. The default is the output file name, followed by a dot, the name of the relation file and ".3lp".
 - 3lptreelevels: the maximum number of levels in the remainder tree when running on a 3LP candidate file (default 22). treelevels is not used for such runs.
+- backend: mpir (default) or ntt. How the large products of the product and remainder trees are computed: with MPIR, or with the integer number-theoretic transform in the int_ntt folder. Both give exactly the same relations. The NTT on the CPU makes a run about 2.6 times slower than MPIR, and uses more memory (it keeps the transforms of the product tree for the remainder tree); it is the reference for the GPU version.
 
 Three large primes
 ------------------

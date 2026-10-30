@@ -19,6 +19,9 @@
     <ClCompile Include="Prime_product.cpp" />
     <ClCompile Include="Profile.cpp" />
     <ClCompile Include="Smooth_factor.cpp" />
+    <ClCompile Include="Tree_backend.cpp" />
+    <ClCompile Include="..\int_ntt\int_ntt.cpp" />
+    <ClCompile Include="..\int_ntt\ntt_core.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Batch_smooth.h" />
@@ -28,6 +31,10 @@
     <ClInclude Include="Prime_product.h" />
     <ClInclude Include="Profile.h" />
     <ClInclude Include="Smooth_factor.h" />
+    <ClInclude Include="Tree_backend.h" />
+    <ClInclude Include="..\int_ntt\arith32.h" />
+    <ClInclude Include="..\int_ntt\int_ntt.h" />
+    <ClInclude Include="..\int_ntt\ntt_core.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>18.0</VCProjectVersion>
@@ -72,12 +79,12 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
-    <IncludePath>$(MpirDir)include;$(IncludePath)</IncludePath>
+    <IncludePath>$(MpirDir)include;$(ProjectDir)..\int_ntt;$(IncludePath)</IncludePath>
     <LibraryPath>$(MpirDir)lib\x64\Debug;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
-    <IncludePath>$(MpirDir)include;$(IncludePath)</IncludePath>
+    <IncludePath>$(MpirDir)include;$(ProjectDir)..\int_ntt;$(IncludePath)</IncludePath>
     <LibraryPath>$(MpirDir)lib\x64\Release;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">

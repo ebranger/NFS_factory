@@ -1,4 +1,5 @@
-//Taken from Msieve, from a branch containing code by Robert Silverman.
+//Taken from Msieve by Jason Papadopoulos, branch RDS (https://sourceforge.net/p/msieve/code/HEAD/tree/branches/RDS/),
+//a branch that also contains code by Robert Silverman. Msieve is released into the public domain.
 
 #ifndef _COFACTORIZE_H_
 #define _COFACTORIZE_H_

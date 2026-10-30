@@ -18,21 +18,14 @@ using namespace std;
 //max 22 requires ~3GB of RAM. However, for SNFS-220 I seem to get the same speed for lower size, which saves a lot of RAM. 20 is ~7% slower, but saved 2GB of RAM, so worth it.
 //For larger factorizations, consider increasing this a little, but for every +1 the memory requirement for the tree roughly doubles.
 
-#define MAX_SQUARINGS_IN_CHECK 1 //Bernsteins algorithm does squaring at the bottom nodes, to handle powers of primes. This is the largest power checked.
-//may want to do a small-prime check spearately, so that only the larger primes are still present when checking.
-// Note: max squarings 2 means max power is 2^2=4.
-//Currently: do only 1 squaring, it misses a few very rare relations but increase speed slightly.
-
 #define MAX_CHARS_IN_RELATION_LIST 320 //Longest saved factor list. Relations with longer lists are rejected. Typical lists are less than 100 characters.
 
 #define MAX_FACTORS_IN_RELATION 512 //Each factor is at least 2, so this is enough for any relation value of up to 512 bits.
 
-#define WRAPAROUND_MIN_LIMBS 512 //Use wraparound products in the remainder tree for nodes of at least this many limbs. Tuned on an i7-14700F.
-
 static void append_prime(string& list, unsigned long long prime);
 
 //Initialize the batch smoothness class
-Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, int max_tree_levels, bool three_lp_stage)
+Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, int max_tree_levels, tree_backend_kind backend, bool three_lp_stage)
 {
 	//init.
 	temp_number = new mpz_class;
@@ -109,7 +102,6 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	tree_size = min((max_tree_levels > 0) ? max_tree_levels : MAX_TREE_LEVELS, tree_size);  // Force the remainder tree to not be too big to save memory.
 	tree_size = max(2, tree_size); // The remainder tree needs at least one level above the relations.
 
-	start_entry = (1 << (tree_size - 1)) - 1;
 	max_entries_before_check = 1 << (tree_size - 1);
 	save_filename = filename;
 	num_relations_found = 0;
@@ -117,7 +109,7 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	num_other_side_failures = 0;
 	min_saved_prime_limit = print_limit; //Do not print primes less than this. Msieve reconstructs primes less than 1000, CADO needs all primes (so set this to 1 to print everything).
 
-	Setup_memory(tree_size, max_bits_in_input);
+	Setup_memory(tree_size, max_bits_in_input, backend);
 
 	relation_factor_list = new unsigned int[MAX_FACTORS_IN_RELATION]; //Small primes are stored with multiplicity, so this needs room for many factors.
 	other_side_factor_list = new unsigned int[MAX_FACTORS_IN_RELATION];
@@ -145,11 +137,7 @@ Batch_smooth::~Batch_smooth(void)
 		fclose(candidate_file);
 	}
 
-	for (int i = 0; i < 2 * num_relations_per_batch - 1; i++)
-	{
-		delete inputs[i];
-	}
-	delete[] inputs;
+	delete tree;
 	delete prime_product;
 	delete temp_number;
 
@@ -190,16 +178,14 @@ void Batch_smooth::Setup_prime_product(long long smooth_bound)
 	return;
 }
 
-//allocate sufficient memory to hold the remainder trees. Since their size may change from run to run, allocate enough space that no realloc needs to be done. 
-//to check: is the MPIR mpz_class memory mangement efficient enough that this can be skipped?
-void Batch_smooth::Setup_memory(int tree_levels, int max_bits_in_input)
+//Allocate the memory for the relations of a batch, and the trees, which allocate all their memory up front.
+void Batch_smooth::Setup_memory(int tree_levels, int max_bits_in_input, tree_backend_kind backend)
 {
-	//allocate enough memory to hold all the numbers in the product tree without having to increase any mpz size
+	tree = create_tree_backend(backend, tree_levels, max_bits_in_input);
+
 	int temp = 1 << tree_levels;
-	inputs = new mpz_class*[temp - 1];
 	lp1 = new unsigned long long[temp];
 	lp2 = new unsigned long long[temp];
-	int limit;
 
 	temp = temp / 2;
 	num_relations_per_batch = temp;
@@ -218,22 +204,6 @@ void Batch_smooth::Setup_memory(int tree_levels, int max_bits_in_input)
 		lp1[i] = 0;
 		lp2[i] = 0;
 		is_smooth[i] = false;
-	}
-
-	temp = max_bits_in_input;
-
-	for (int level = tree_levels; level >= 1; level--)
-	{
-		limit = (1 << (level - 1)) - 1;
-
-		for (int i = limit; i <= 2 * limit; i++)
-		{
-			//allocate an appropriate amount of memory, to aviod having to grow the mpz.
-			inputs[i] = new mpz_class();
-			mpz_init2(inputs[i]->get_mpz_t(), temp);
-			*inputs[i] = 1; //multiplicative unity.
-		}
-		temp = temp * 2;
 	}
 }
 
@@ -301,7 +271,7 @@ bool Batch_smooth::Add_candidate(long long a_val, long long b_val, const unsigne
 	}
 
 	//The cofactor is checked instead of the polynomial value.
-	mpz_set(inputs[start_entry + entries]->get_mpz_t(), cofactor);
+	mpz_set(tree->Leaf(entries)->get_mpz_t(), cofactor);
 	return Add_number_binary(a_val, b_val, primes, num_primes);
 }
 
@@ -652,13 +622,10 @@ void Batch_smooth::Do_batch_check()
 	profile_add(PROF_3LP, t);
 }
 
-//Perform the remainder tree calculations.
-//Core parts of this function was taken from the CADO-NFS package.
-//Use a scaled remainder tree for speed.
+//Check the relations of a batch: a product tree of their values, the scaled remainder tree of the prime product P down to the
+//leaves, and P mod each value, which is checked for the large primes.
 void Batch_smooth::Run_batch_check()
 {
-	int limit;
-
 	if (entries == 0)
 	{
 		//Nothing to check.
@@ -670,190 +637,71 @@ void Batch_smooth::Run_batch_check()
 	//set up polynomial values. The second stage checks the cofactors that were added.
 	for (int index = 0; index < entries && !three_lp_stage; index++)
 	{
+		mpz_class* value = tree->Leaf(index);
+
 		//use different poly evaluation if polynomial has form k*x^4+l which is faster.
 		if (using_snfs_deg4_binomial)
 		{
-			if (!Binomial_value_native(inputs[start_entry + index]->get_mpz_t(), a_vals[index], b_vals[index]))
+			if (!Binomial_value_native(value->get_mpz_t(), a_vals[index], b_vals[index]))
 			{
-				poly->evaluate_binomial_polynomial_homogeneous_SNFS_deg4(inputs[start_entry + index], a_vals[index], b_vals[index], temp_number);
+				poly->evaluate_binomial_polynomial_homogeneous_SNFS_deg4(value, a_vals[index], b_vals[index], temp_number);
 			}
 		}
 		else
 		{
-			poly->evaluate_polynomial_homogenous(inputs[start_entry + index], a_vals[index], b_vals[index]);
+			poly->evaluate_polynomial_homogenous(value, a_vals[index], b_vals[index]);
 		}
 
-		if (*inputs[start_entry + index] < 0)
+		if (*value < 0)
 		{
-			*inputs[start_entry + index] *= -1;
+			*value *= -1;
 		}
 	}
 
 	t = profile_add(PROF_POLY_EVAL, t);
 
-	//set up product tree.
-	for (int level = tree_size; level > 1; level--)
-	{
-		limit = (1 << (level - 2)) - 1;
-
-		for (int i = limit; i <= 2 * limit; i++)
-		{
-			*inputs[i] = *inputs[2 * i + 1] * *inputs[2 * i + 2];
-		}
-	}
+	size_t size = tree->Build_product_tree();
 
 	t = profile_add(PROF_PRODUCT_TREE, t);
 
-	size_t size = mpz_sizeinbase(inputs[0]->get_mpz_t(), 2);
 	cout << "Size of top node of product tree: " << size << " bits." << endl;
 
-
-	//The core remainder tree calculations are based on the CADO-nfs batch function
-
-	long h = tree_size + 2; // extra fudge bits.
-	unsigned long i, guard, *product_bits;
-	product_bits = new unsigned long[2 * num_relations_per_batch];
-
-	guard = h;
-
-	//Get the size of all products, they are needed for shifts later.
-	for (i = 0; i < (unsigned long)(2 * num_relations_per_batch - 1); i++)
-	{
-		product_bits[i] = (unsigned long)mpz_sizeinbase(inputs[i]->get_mpz_t(), 2);
-	}
-
-	mpz_class Q;
-
-	// now the root of the tree is prime_product / product_of_input_numbers * 2^(bits in product of input number + a few guard bits)
-	Scaled_root_value(inputs[0]->get_mpz_t(), product_bits[0] + guard);
+	tree->Scaled_root(prime_product->get_mpz_t());
 	t = profile_add(PROF_ROOT, t);
 
-	for (int level = 2; level <= tree_size - 1; level++)
-	{
-		limit = (1 << (level - 1)) - 1;
-
-		for (int i = limit; i <= 2 * limit; i = i + 2)
-		{
-			//calculate the next level of the tree.
-			// so if the parent node is Num / (leaf1 * leaf2), multiply by the leaves and right-shift since the fraction is now smaller, requiring fewer bits of storage.
-			unsigned long parent_bits = product_bits[(i - 1) / 2];
-
-			if ((parent_bits + guard) / GMP_LIMB_BITS >= WRAPAROUND_MIN_LIMBS)
-			{
-				//Large numbers: only the middle part of the products is needed, which is faster to get with a wraparound product.
-				cyclic.Middle_product_pair(wrap_result[0].get_mpz_t(), wrap_result[1].get_mpz_t(), inputs[(i - 1) / 2]->get_mpz_t(), inputs[i + 1]->get_mpz_t(), inputs[i]->get_mpz_t(),
-					parent_bits - product_bits[i], parent_bits - product_bits[i + 1], parent_bits + guard);
-				mpz_swap(inputs[i]->get_mpz_t(), wrap_result[0].get_mpz_t());
-				mpz_swap(inputs[i + 1]->get_mpz_t(), wrap_result[1].get_mpz_t());
-				continue;
-			}
-
-			*inputs[i] = *inputs[(i - 1) / 2] * *inputs[i];
-			*inputs[i + 1] = *inputs[(i - 1) / 2] * *inputs[i + 1];
-			mpz_swap(inputs[i]->get_mpz_t(), inputs[i + 1]->get_mpz_t());
-
-			mpz_tdiv_r_2exp(inputs[i]->get_mpz_t(), inputs[i]->get_mpz_t(), product_bits[(i - 1) / 2] + guard);
-			mpz_div_2exp(inputs[i]->get_mpz_t(), inputs[i]->get_mpz_t(), product_bits[(i - 1) / 2] - product_bits[i]);
-
-			mpz_tdiv_r_2exp(inputs[i + 1]->get_mpz_t(), inputs[i + 1]->get_mpz_t(), product_bits[(i - 1) / 2] + guard);
-			mpz_div_2exp(inputs[i + 1]->get_mpz_t(), inputs[i + 1]->get_mpz_t(), product_bits[(i - 1) / 2] - product_bits[i + 1]);
-		}
-	}
-
+	tree->Remainder_tree();
 	t = profile_add(PROF_REMAINDER_TREE, t);
 	unsigned long long cofactor_start = profile_cycles[PROF_COFACTOR];
 
-	//for the bottom node, i.e. the relation numbers, store the Prime_product % number in Q, to keep the number (in input_number[]). Then it can be used later for squaring tests mod the number.
-	for (i = num_relations_per_batch - 1; i < (unsigned long)(2 * num_relations_per_batch - 1); i = i + 2)
+	//Q = (P mod N)^2 mod N for each relation value N. Without cofactorization, N is smooth if Q is 0. With it, the part of N
+	//without the primes of P is N / gcd(N, Q), which is then checked for large primes.
+	tree->Leaf_remainders();
+	for (int index = 0; index < num_relations_per_batch; index++)
 	{
-		//One bottom node
-		Q = *inputs[(i - 1) / 2] * *inputs[i + 1];
-
-		mpz_tdiv_r_2exp(Q.get_mpz_t(), Q.get_mpz_t(), product_bits[(i - 1) / 2] + guard);
-		mpz_div_2exp(Q.get_mpz_t(), Q.get_mpz_t(), product_bits[(i - 1) / 2] - product_bits[i]);
-
-		Q = Q * *inputs[i];
-		mpz_div_2exp(Q.get_mpz_t(), Q.get_mpz_t(), product_bits[i]);
-		Q = Q + (1UL << guard) - 1UL;
-		mpz_div_2exp(Q.get_mpz_t(), Q.get_mpz_t(), guard);
-
-		//Q = Q % *inputs[i]; // should not be needed, but valid relations are lost if this is not here... Except when i test it again later, in which case it is magically not needed again...
-
-		for (int j = 0; j < MAX_SQUARINGS_IN_CHECK; j++)
-		{
-			Q = (Q * Q) % *inputs[i];
-		}
+		mpz_class& Q = *tree->Leaf_remainder(index);
 
 		if (do_cofactorization == true)
 		{
-			//divide out all factors from the tree from the relation and put the result in Q. 
-			mpz_gcd(temp_number->get_mpz_t(), inputs[i]->get_mpz_t(), Q.get_mpz_t());
-			mpz_divexact(Q.get_mpz_t(), inputs[i]->get_mpz_t(), temp_number->get_mpz_t());
+			mpz_srcptr value = tree->Leaf(index)->get_mpz_t();
+			mpz_gcd(temp_number->get_mpz_t(), value, Q.get_mpz_t());
+			mpz_divexact(Q.get_mpz_t(), value, temp_number->get_mpz_t());
 
 			//Check if Q is 2lp smooth
 			unsigned long long tc = profile_now();
-			bool smooth = check_two_lp_smooth(Q, i - num_relations_per_batch + 1);
+			bool smooth = check_two_lp_smooth(Q, index);
 			profile_add(PROF_COFACTOR, tc);
 			if (!smooth)
 			{
 				//not smooth.
-				is_smooth[i - num_relations_per_batch + 1] = false;
+				is_smooth[index] = false;
 			}
 		}
 		else
 		{
 			if (Q > 0)
 			{
-				//Do not do 2lp testing. If Q = 0 then the number is smooth
-
 				//not smooth.
-				is_smooth[i - num_relations_per_batch + 1] = false;
-			}
-		}
-
-		//The same for the other bottom node with the same parent node.
-		Q = *inputs[(i - 1) / 2] * *inputs[i];
-
-		mpz_tdiv_r_2exp(Q.get_mpz_t(), Q.get_mpz_t(), product_bits[(i - 1) / 2] + guard);
-		mpz_div_2exp(Q.get_mpz_t(), Q.get_mpz_t(), product_bits[(i - 1) / 2] - product_bits[i + 1]);
-
-		Q = Q * *inputs[i + 1];
-		mpz_div_2exp(Q.get_mpz_t(), Q.get_mpz_t(), product_bits[i + 1]);
-		Q = Q + (1UL << guard) - 1UL;
-		mpz_div_2exp(Q.get_mpz_t(), Q.get_mpz_t(), guard);
-
-		//Q = Q % *inputs[i+1]; // should not be needed, but valid relations are lost if this is not here... Except when i test it again later, in which case it is magically not needed again...
-
-
-		for (int j = 0; j < MAX_SQUARINGS_IN_CHECK; j++)
-		{
-			Q = (Q * Q) % *inputs[i + 1];
-		}
-
-		if (do_cofactorization == true)
-		{
-			//divide out all factors from the tree from the relation and put the result in Q. 
-			mpz_gcd(temp_number->get_mpz_t(), inputs[i + 1]->get_mpz_t(), Q.get_mpz_t());
-			mpz_divexact(Q.get_mpz_t(), inputs[i + 1]->get_mpz_t(), temp_number->get_mpz_t());
-
-			//Check if Q is 2lp smooth
-			unsigned long long tc = profile_now();
-			bool smooth = check_two_lp_smooth(Q, i - num_relations_per_batch + 2);
-			profile_add(PROF_COFACTOR, tc);
-			if (!smooth)
-			{
-				//not smooth.
-				is_smooth[i - num_relations_per_batch + 2] = false;
-			}
-		}
-		else
-		{
-			if (Q > 0)
-			{
-				//Do not do 2lp testing. If Q = 0 then the relation is smooth
-
-				//not smooth.
-				is_smooth[i - num_relations_per_batch + 2] = false;
+				is_smooth[index] = false;
 			}
 		}
 	}
@@ -863,157 +711,6 @@ void Batch_smooth::Run_batch_check()
 
 	Send_candidates();
 	Output_solutions();
-
-	delete[] product_bits;
-	return;
-}
-
-//result = the bits of a from position up to position + count, as a number.
-static void bits_of(mpz_ptr result, mpz_srcptr a, mp_bitcnt_t position, mp_bitcnt_t count)
-{
-	mp_size_t a_limbs = abs(a->_mp_size);
-	mp_size_t first = (mp_size_t)(position / GMP_LIMB_BITS);
-	if (count == 0 || first >= a_limbs)
-	{
-		mpz_set_ui(result, 0);
-		return;
-	}
-
-	mp_size_t out_limbs = (mp_size_t)((count + GMP_LIMB_BITS - 1) / GMP_LIMB_BITS);
-	mp_size_t source_limbs = min(out_limbs + 1, a_limbs - first);
-	if (result->_mp_alloc < source_limbs)
-	{
-		mpz_realloc2(result, source_limbs * GMP_LIMB_BITS);
-	}
-
-	if (position % GMP_LIMB_BITS != 0)
-	{
-		mpn_rshift(result->_mp_d, a->_mp_d + first, source_limbs, (unsigned int)(position % GMP_LIMB_BITS));
-	}
-	else
-	{
-		mpn_copyi(result->_mp_d, a->_mp_d + first, source_limbs);
-	}
-
-	out_limbs = min(out_limbs, source_limbs);
-	if (count % GMP_LIMB_BITS != 0 && out_limbs == (mp_size_t)((count + GMP_LIMB_BITS - 1) / GMP_LIMB_BITS))
-	{
-		result->_mp_d[out_limbs - 1] &= (((mp_limb_t)1) << (count % GMP_LIMB_BITS)) - 1;
-	}
-	while (out_limbs > 0 && result->_mp_d[out_limbs - 1] == 0)
-	{
-		out_limbs--;
-	}
-	result->_mp_size = (int)out_limbs;
-}
-
-//result = a modulo 2^L - 1, from 0 to 2^L - 2. temp is used as scratch space.
-static void mod_2expm1(mpz_ptr result, mpz_srcptr a, mp_bitcnt_t L, mpz_ptr temp)
-{
-	mpz_set(result, a);
-	while (mpz_sizeinbase(result, 2) > L)
-	{
-		mpz_tdiv_q_2exp(temp, result, L);
-		mpz_tdiv_r_2exp(result, result, L);
-		mpz_add(result, result, temp);
-	}
-	mpz_add_ui(result, result, 1);
-	if (mpz_sizeinbase(result, 2) > L)
-	{
-		mpz_set_ui(result, 0);
-	}
-	else
-	{
-		mpz_sub_ui(result, result, 1);
-	}
-}
-
-//Replace the root of the product tree X by the root of the scaled remainder tree, floor((P mod X) * 2^precision / X),
-//where P is the prime product. One inverse of X is computed and used both for P mod X (Barrett reduction) and for the
-//scaling, which is faster than two divisions that each compute an inverse. The result can be one too small, which the
-//guard bits absorb, just as they absorb the truncation errors further down in the tree.
-void Batch_smooth::Scaled_root_value(mpz_ptr root, mp_bitcnt_t precision)
-{
-	mp_bitcnt_t bits = mpz_sizeinbase(root, 2);
-	mp_size_t limbs = abs(root->_mp_size);
-	mp_bitcnt_t normalize = limbs * GMP_LIMB_BITS - bits;
-
-	//V is the inverse of the root shifted to fill limbs + 1 limbs, root * V < 2^e, and at most INVERSE_MAX_ERROR less than
-	//2^e / root, with e = 128 * limbs + 64 - normalize. The extra limb makes the scaling below accurate to less than one unit.
-	mpz_mul_2exp(root_shifted.get_mpz_t(), root, normalize + GMP_LIMB_BITS);
-	mpz_ptr v = root_inverse.get_mpz_t();
-	cyclic.Inverse(v, root_shifted.get_mpz_t());
-	mp_bitcnt_t e = 128 * limbs + GMP_LIMB_BITS - normalize;
-
-	//r = P mod X. Barrett reduction works for numbers less than 2^(2 * bits), which the choice of tree size gives. A larger prime
-	//product, as in the second stage when its tree is not full, is reduced one part at a time from the top: the remainder so far,
-	//followed by the next bits - 1 bits of P, is less than 2^(2 * bits - 1).
-	mpz_ptr r = root_remainder.get_mpz_t();
-	mpz_srcptr p = prime_product->get_mpz_t();
-	mp_bitcnt_t product_size = mpz_sizeinbase(p, 2);
-
-	if (product_size <= 2 * bits)
-	{
-		Barrett_reduce(r, p, root, e, bits);
-	}
-	else
-	{
-		mp_bitcnt_t position = product_size;
-		mpz_set_ui(r, 0);
-		while (position > 0)
-		{
-			mp_bitcnt_t part = (position > bits - 1) ? bits - 1 : position;
-			position -= part;
-			bits_of(root_part.get_mpz_t(), p, position, part);
-			mpz_mul_2exp(r, r, part);
-			mpz_add(r, r, root_part.get_mpz_t());
-			Barrett_reduce(r, r, root, e, bits);
-		}
-	}
-
-	//floor(r * 2^precision / X) = floor(r * V / 2^(e - precision)), or one less.
-	mpz_mul(root, r, v);
-	mpz_tdiv_q_2exp(root, root, e - precision);
-}
-
-//r = a mod x, for a less than 2^(2 * bits), with x of bits bits and its inverse V from Scaled_root_value (root_inverse), so that
-//x * V < 2^e. r can be a.
-void Batch_smooth::Barrett_reduce(mpz_ptr r, mpz_srcptr a, mpz_srcptr x, mp_bitcnt_t e, mp_bitcnt_t bits)
-{
-	mp_bitcnt_t a_size = mpz_sizeinbase(a, 2);
-	if (a_size < bits)
-	{
-		mpz_set(r, a);
-		return;
-	}
-
-	//mu = floor(2^(2 * bits) / x), or up to two less, without the bits that do not matter for the quotient. The quotient has
-	//at most quotient_bits bits, and the bits of mu more than 64 below that change the estimate by less than one.
-	//The quotient estimate is then at most 5 too small.
-	mpz_ptr q = root_quotient.get_mpz_t();
-	mpz_ptr t = root_temp.get_mpz_t();
-	mp_bitcnt_t quotient_bits = a_size - bits + 1;
-	mp_bitcnt_t cut = (bits > quotient_bits + GMP_LIMB_BITS) ? bits - quotient_bits - GMP_LIMB_BITS : 0;
-	mpz_tdiv_q_2exp(q, root_inverse.get_mpz_t(), e - 2 * bits + cut);
-	mpz_tdiv_q_2exp(t, a, bits - 1);
-	mpz_mul(q, q, t);
-	mpz_tdiv_q_2exp(q, q, bits + 1 - cut);
-
-	//r = a - q x is less than 6 x, so it can be computed modulo 2^L - 1 > 6 x, which only needs q x modulo 2^L - 1.
-	mp_bitcnt_t L = cyclic.Product_mod(q, q, x, bits + 3);
-	mod_2expm1(t, a, L, root_part.get_mpz_t());
-	mpz_sub(r, t, q);
-	if (mpz_sgn(r) < 0)
-	{
-		mpz_set_ui(q, 0);
-		mpz_setbit(q, L);
-		mpz_sub_ui(q, q, 1);
-		mpz_add(r, r, q);
-	}
-	while (mpz_cmp(r, x) >= 0)
-	{
-		mpz_sub(r, r, x);
-	}
 }
 
 //Append a prime to a comma separated list of hexadecimal primes.
@@ -1126,7 +823,7 @@ void Batch_smooth::Output_solutions()
 		//If the relation passed the smoothness test, and has been checked.
 		if (index < entries && is_smooth[index])
 		{
-			relation_value = inputs[i];
+			relation_value = tree->Leaf(index);
 
 			//negative values are handled by msieve, ignore here.
 			if (*relation_value < 0)
@@ -1245,7 +942,7 @@ void Batch_smooth::Output_solutions()
 		}
 
 		//reset for next iteration.
-		*inputs[i] = 1;
+		*tree->Leaf(index) = 1;
 		a_vals[index] = 0;
 		b_vals[index] = 0;
 		is_smooth[index] = false;

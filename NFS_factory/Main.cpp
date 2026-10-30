@@ -55,6 +55,7 @@ struct nfs_parameters {
 	int tree_levels_3lp; // Maximum number of levels in the remainder tree of a run on a 3LP candidate file.
 	bool save_3lp; // 3LP candidates (mfb more than 2 lpb) are saved to a file instead of checked in a second stage during the run.
 	string file_3lp; // File for the saved 3LP candidates. Empty means the default name.
+	tree_backend_kind backend; // How the products of the trees are computed.
 };
 
 //Remove leading and trailing whitespace.
@@ -251,6 +252,23 @@ bool read_polynomial(string filename, nfs_parameters* params)
 			else if (data == "3lpfile")
 			{
 				params->file_3lp = line;
+			}
+			//How the products of the trees are computed: mpir (default) or ntt.
+			else if (data == "backend")
+			{
+				if (line == "mpir")
+				{
+					params->backend = TREE_BACKEND_MPIR;
+				}
+				else if (line == "ntt")
+				{
+					params->backend = TREE_BACKEND_NTT;
+				}
+				else
+				{
+					cout << "Unknown backend " << line << " on line " << line_number << " of the polynomial file. Use mpir or ntt." << endl;
+					return false;
+				}
 			}
 		}
 		catch (const exception&)
@@ -629,6 +647,7 @@ int main(int argc, char* argv[])
 	param->tree_levels = 0;
 	param->tree_levels_3lp = STAGE2_ONLY_TREE_LEVELS;
 	param->save_3lp = false;
+	param->backend = TREE_BACKEND_MPIR;
 
 	param->algebraic_polynomial = new Polynomial();
 	param->rational_polynomial = new Polynomial();
@@ -725,11 +744,11 @@ int main(int argc, char* argv[])
 	{
 		//The cofactors are less than 2^(3 lbp). The tree size is limited by 3lptreelevels instead of treelevels.
 		cout << "Checking 3LP candidates against all primes up to 2^" << lbp << "." << endl;
-		batch = new Batch_smooth(lim, lbp, mfb, 3 * lbp, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels_3lp, true);
+		batch = new Batch_smooth(lim, lbp, mfb, 3 * lbp, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels_3lp, param->backend, true);
 	}
 	else
 	{
-		batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels);
+		batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels, param->backend);
 	}
 
 	if (three_lp)
@@ -751,7 +770,7 @@ int main(int argc, char* argv[])
 		else
 		{
 			cout << "Checking 3LP candidates of up to " << mfb << " bits against all primes up to 2^" << lbp << " during the run." << endl;
-			second_stage = new Batch_smooth(lim, lbp, mfb, 3 * lbp, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels, true);
+			second_stage = new Batch_smooth(lim, lbp, mfb, 3 * lbp, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels, param->backend, true);
 		}
 
 		if (!batch->Set_three_lp_handling(second_stage, candidate_filename))

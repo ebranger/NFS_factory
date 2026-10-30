@@ -11,8 +11,6 @@
 
 #define FFT_MAX_COEFFICIENT_LIMBS 256 //Larger coefficients would need the sizes that MPIR's pointwise products modulo B^n + 1 accept.
 #define FFT_MIN_DEPTH 4
-#define INVERSE_EXACT_LIMBS 2000 //Inverses of up to this many limbs are computed exactly by MPIR.
-#define INVERSE_MARGIN (1 << 12) //Subtracted from the Newton inverse, which can be a few units too large.
 
 //MPIR functions for the FFT. They are declared in gmp-impl.h, which is not part of the installed headers.
 extern "C"
@@ -335,66 +333,4 @@ mp_bitcnt_t Cyclic_product::Product_mod(mpz_ptr result, mpz_srcptr y, mpz_srcptr
 		mpz_sub_ui(result, result, 1);
 	}
 	return L;
-}
-
-//An approximation of B^(2n) / a, where a has n limbs and its top bit set, as B^n plus n limbs. It is within a few units of
-//floor((B^(2n) - 1) / a), but can be on either side of it.
-//One Newton step from the inverse v_h of the top h limbs of a, about half of them: with D = a v_h - B^(n + h), which is less
-//than a few B^n in size, the inverse is v_h B^(n - h) - v_h D / B^(2h). Only D modulo 2^L - 1 with L a little more than n limbs
-//is needed, and the error of v_h is squared, so the result is as accurate as the truncations of the last step allow.
-void Cyclic_product::Newton_inverse(mpz_ptr result, mpz_srcptr a, mp_size_t a_limbs)
-{
-	if (a_limbs <= INVERSE_EXACT_LIMBS)
-	{
-		if (result->_mp_alloc < a_limbs + 1)
-		{
-			mpz_realloc2(result, (a_limbs + 1) * GMP_LIMB_BITS);
-		}
-		mpn_invert(result->_mp_d, a->_mp_d, a_limbs);
-		result->_mp_d[a_limbs] = 1;
-		result->_mp_size = (int)(a_limbs + 1);
-		return;
-	}
-
-	mp_size_t h = a_limbs / 2 + 2;
-	mpz_class a_h, v_h, d, power;
-
-	mpz_tdiv_q_2exp(a_h.get_mpz_t(), a, GMP_LIMB_BITS * (a_limbs - h));
-	Newton_inverse(v_h.get_mpz_t(), a_h.get_mpz_t(), h);
-
-	//D modulo 2^L - 1, from -2^(L - 1) to 2^(L - 1).
-	mp_bitcnt_t mod_bits = Product_mod(d.get_mpz_t(), a, v_h.get_mpz_t(), GMP_LIMB_BITS * (a_limbs + 2));
-	mpz_setbit(power.get_mpz_t(), (GMP_LIMB_BITS * (a_limbs + h)) % mod_bits); //B^(n + h) modulo 2^L - 1
-	d -= power;
-	mpz_set_ui(power.get_mpz_t(), 0);
-	mpz_setbit(power.get_mpz_t(), mod_bits);
-	power -= 1;
-	if (mpz_sgn(d.get_mpz_t()) < 0)
-	{
-		d += power;
-	}
-	if (mpz_sizeinbase(d.get_mpz_t(), 2) >= mod_bits)
-	{
-		d -= power;
-	}
-
-	//v_h D / B^(2h), with only the top part of D, which is enough for an error of less than one.
-	mpz_fdiv_q_2exp(d.get_mpz_t(), d.get_mpz_t(), GMP_LIMB_BITS * (h - 1));
-	d *= v_h;
-	mpz_fdiv_q_2exp(d.get_mpz_t(), d.get_mpz_t(), GMP_LIMB_BITS * (h + 1));
-
-	mpz_mul_2exp(result, v_h.get_mpz_t(), GMP_LIMB_BITS * (a_limbs - h));
-	mpz_sub(result, result, d.get_mpz_t());
-}
-
-//An approximation of B^(2n) / a, where a has n limbs and its top bit set, at most INVERSE_MAX_ERROR less than
-//floor((B^(2n) - 1) / a), and never more.
-void Cyclic_product::Inverse(mpz_ptr result, mpz_srcptr a)
-{
-	mp_size_t a_limbs = abs(a->_mp_size);
-	Newton_inverse(result, a, a_limbs);
-	if (a_limbs > INVERSE_EXACT_LIMBS)
-	{
-		mpz_sub_ui(result, result, INVERSE_MARGIN);
-	}
 }
