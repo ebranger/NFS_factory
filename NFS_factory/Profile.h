@@ -12,7 +12,7 @@ enum profile_phase {
 	PROF_ROOT,            //root of the remainder tree, (P mod root) * 2^k / root
 	PROF_REMAINDER_TREE,  //scaled remainder tree down to the parents of the leaves
 	PROF_LEAVES,          //remainders of the leaves, squarings and gcd
-	PROF_COFACTOR,        //checking the cofactors for large primes (squfof, tinyqs)
+	PROF_COFACTOR,        //checking the cofactors for large primes (rho, tinyqs)
 	PROF_FACTOR,          //factoring the smooth relations for output
 	PROF_OTHER_SIDE,      //rebuilding the factor list of the other side (format: cado)
 	PROF_WRITE,           //formatting and writing the relations

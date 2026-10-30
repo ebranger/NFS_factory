@@ -15,9 +15,6 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="smintfact.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="Batch_smooth.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -25,9 +22,6 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="Polynomial.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="squfof.c">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="cofactorize_siqs.c">
@@ -47,16 +41,10 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="smintfact.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="Batch_smooth.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="Polynomial.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="squfof.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="cofactorize.h">

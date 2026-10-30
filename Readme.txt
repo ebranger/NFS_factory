@@ -95,13 +95,13 @@ Implementation details
 
 The core of NFS_factory is an implementation of Bernstein’s batch smoothness checking algorithm using remainder trees. It also uses scaled remainder trees, to replace divisions/modulo operations with multiplies, which should further increase the speed. The large integer arithmetic is done using MPIR, which should be the only dependency of the code to external libraries. To calculate the homogeneous polynomial values/norms for the relations, I have recycled some polynomial code I wrote earlier. I’m sure that there are faster alternatives out there for bigint polynomial calculations, but the code works and is not the main speed bottleneck. 
 
-Once the remainder tree has been calculated, any values that are less than mfbr/mfba is checked to see if it is a 1lp or a 2lp relation. The 2lp numbers are split using a fast tiny quadratic sieve implementation, originally coming from msieve, from a branch with code from Robert Silverman (cofactorize-siqs.c). For any valid relation that is found by NFS_factory, code from gnfs-lasieve is used to fully factor the relation, using Pollard rho and a squfof implementation from msieve (smintfact.c)
+Once the remainder tree has been calculated, any values that are less than mfbr/mfba is checked to see if it is a 1lp or a 2lp relation. The 2lp numbers are split with Pollard rho in native 64-bit arithmetic, and those that rho does not split, or that have more than 63 bits, with a fast tiny quadratic sieve implementation, originally coming from msieve, from a branch with code from Robert Silverman (cofactorize_siqs.c). Every valid relation that is found by NFS_factory is then fully factored with trial division and Pollard rho in native arithmetic up to 128 bits, and Pollard rho with MPIR above that (Smooth_factor.cpp).
 
 
 Credits
 -------
 
-The implementation of the batch smoothness checking has been inspired by the same algorithms used in msieve and CADO-NFS. Some code has also been used coming from gnfs-lasieve and msieve, which may have originated from other codes. 
+The implementation of the batch smoothness checking has been inspired by the same algorithms used in msieve and CADO-NFS. Some code has also been used coming from msieve, which may have originated from other codes.
 
 
 A big thanks to all the people of mersenneforum, surprisingly much of what I know about integer factorization comes from your discussions, and the patient explanations you have provided to various questions over the years.

@@ -8,11 +8,13 @@
 #include "Smooth_factor.h"
 #include <intrin.h>
 #include <algorithm>
+#include <vector>
 
 typedef unsigned long long u64;
 typedef unsigned int u32;
 
 #define RHO_MAX_ITERATIONS (1 << 20) //sqrt(2^32) = 65536 iterations are expected for the largest primes, so this is plenty.
+#define RHO_MPZ_MAX_ITERATIONS (1 << 19) //The same for rho in MPIR arithmetic on values of more than 128 bits, which is slower, so it gives up sooner.
 #define RHO_GCD_INTERVAL 64 //Iterations between the gcd computations in rho.
 #define MAX_PENDING 128 //Most cofactors waiting to be split.
 
@@ -536,16 +538,203 @@ int factor_smooth(unsigned int* factors, mpz_srcptr value, int max_factors)
 				return -1;
 			}
 		}
-		else if (!rho(c, &d) || d.hi != 0)
+		else if (!rho(c, &d))
 		{
 			return -1;
 		}
 
-		u64 remainder;
+		u128 e = { 0, 0 };
+		if (d.hi != 0)
+		{
+			//d is a product of several primes, of 2^64 or more, so the cofactor e = c / d is less than 2^64. Since d is odd and
+			//c = d e, e is c times the inverse of d modulo 2^64.
+			e.lo = c.lo * (0 - montgomery_inverse(d.lo));
+		}
+		else
+		{
+			u64 remainder;
+			e = divide(c, d.lo, &remainder);
+		}
 		pending[num_pending++] = d;
-		pending[num_pending++] = divide(c, d.lo, &remainder);
+		pending[num_pending++] = e;
 	}
 
+	std::sort(factors, factors + count);
+	return count;
+}
+
+//Find a nontrivial factor of the odd composite n, of more than 128 bits, with Pollard-Brent rho in MPIR arithmetic.
+//Returns false if none was found.
+static bool rho_mpz(mpz_srcptr n, mpz_ptr factor)
+{
+	mpz_t x, y, saved_y, q, t;
+	mpz_inits(x, y, saved_y, q, t, NULL);
+	bool found = false;
+
+	for (unsigned long c = 1; c <= 3 && !found; c++)
+	{
+		mpz_set_ui(y, 2);
+		mpz_set_ui(q, 1);
+		mpz_set_ui(factor, 1);
+		u64 r = 1;
+
+		while (mpz_cmp_ui(factor, 1) == 0 && r <= RHO_MPZ_MAX_ITERATIONS)
+		{
+			mpz_set(x, y);
+			for (u64 i = 0; i < r; i++)
+			{
+				mpz_mul(y, y, y);
+				mpz_add_ui(y, y, c);
+				mpz_mod(y, y, n);
+			}
+
+			for (u64 k = 0; k < r && mpz_cmp_ui(factor, 1) == 0; k += RHO_GCD_INTERVAL)
+			{
+				mpz_set(saved_y, y);
+				u64 steps = std::min((u64)RHO_GCD_INTERVAL, r - k);
+				for (u64 i = 0; i < steps; i++)
+				{
+					mpz_mul(y, y, y);
+					mpz_add_ui(y, y, c);
+					mpz_mod(y, y, n);
+					mpz_sub(t, x, y);
+					mpz_mul(q, q, t);
+					mpz_mod(q, q, n);
+				}
+				mpz_gcd(factor, q, n);
+			}
+			r *= 2;
+		}
+
+		if (mpz_cmp(factor, n) == 0 || mpz_sgn(factor) == 0)
+		{
+			//Several factors were found at once, go back and take one step at a time.
+			do
+			{
+				mpz_mul(saved_y, saved_y, saved_y);
+				mpz_add_ui(saved_y, saved_y, c);
+				mpz_mod(saved_y, saved_y, n);
+				mpz_sub(t, x, saved_y);
+				mpz_gcd(factor, t, n);
+			} while (mpz_cmp_ui(factor, 1) == 0);
+		}
+
+		found = mpz_cmp_ui(factor, 1) != 0 && mpz_cmp(factor, n) != 0;
+	}
+
+	mpz_clears(x, y, saved_y, q, t, NULL);
+	return found;
+}
+
+//The odd primes below 2^16, for trial division of values of more than 128 bits.
+static const std::vector<u32>& trial_division_primes()
+{
+	static const std::vector<u32> primes = []
+	{
+		const u32 limit = 1 << 16;
+		std::vector<bool> composite(limit, false);
+		std::vector<u32> list;
+		for (u32 i = 3; i < limit; i += 2)
+		{
+			if (composite[i])
+			{
+				continue;
+			}
+			list.push_back(i);
+			for (u32 j = i * i; j < limit; j += 2 * i)
+			{
+				composite[j] = true;
+			}
+		}
+		return list;
+	}();
+	return primes;
+}
+
+int factor_general(unsigned int* factors, mpz_srcptr value, int max_factors)
+{
+	if (abs(value->_mp_size) <= 2)
+	{
+		int count = factor_smooth(factors, value, max_factors);
+		if (count >= 0 || value->_mp_size == 0)
+		{
+			return count;
+		}
+		//Rho can fail on values with many small primes; trial division below takes most of them out first.
+	}
+
+	mpz_t n;
+	mpz_init(n);
+	mpz_abs(n, value);
+	int count = 0;
+	bool failed = false;
+
+	//Factors of 2, and trial division by the odd primes below 2^16. Rho alone does badly on values with many small primes: their
+	//cycles are short, and they tend to be found all at once, which gives no factor.
+	unsigned long twos = (unsigned long)mpz_scan1(n, 0);
+	for (unsigned long i = 0; i < twos && !failed; i++)
+	{
+		failed = count >= max_factors;
+		if (!failed)
+		{
+			factors[count++] = 2;
+		}
+	}
+	mpz_tdiv_q_2exp(n, n, twos);
+	for (u32 p : trial_division_primes())
+	{
+		while (!failed && mpz_divisible_ui_p(n, p))
+		{
+			failed = count >= max_factors;
+			if (!failed)
+			{
+				factors[count++] = p;
+				mpz_divexact_ui(n, n, p);
+			}
+		}
+	}
+
+	//Split the rest until each part has at most 128 bits, and factor those natively.
+	mpz_t pending[MAX_PENDING], d;
+	int num_pending = 0;
+	mpz_init(d);
+	if (mpz_cmp_ui(n, 1) != 0)
+	{
+		mpz_init_set(pending[num_pending++], n);
+	}
+
+	while (num_pending > 0 && !failed)
+	{
+		mpz_ptr c = pending[num_pending - 1];
+
+		if (abs(c->_mp_size) <= 2)
+		{
+			int found = factor_smooth(factors + count, c, max_factors - count);
+			failed = found < 0;
+			count += failed ? 0 : found;
+			mpz_clear(pending[--num_pending]);
+			continue;
+		}
+
+		//More than 128 bits: a prime that large cannot be a factor below 2^32.
+		failed = num_pending + 1 > MAX_PENDING || mpz_probab_prime_p(c, 1) != 0 || !rho_mpz(c, d);
+		if (!failed)
+		{
+			mpz_divexact(c, c, d);
+			mpz_init_set(pending[num_pending++], d);
+		}
+	}
+
+	while (num_pending > 0)
+	{
+		mpz_clear(pending[--num_pending]);
+	}
+	mpz_clears(n, d, NULL);
+
+	if (failed)
+	{
+		return -1;
+	}
 	std::sort(factors, factors + count);
 	return count;
 }

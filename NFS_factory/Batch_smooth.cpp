@@ -8,7 +8,6 @@
 #include <limits.h>
 #include "cofactorize.h"
 
-#include "smintfact.h"
 #include "Profile.h"
 #include "Prime_product.h"
 #include "Smooth_factor.h"
@@ -478,7 +477,7 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class& number, unsigned int index)
 
 		if (*factor1 == 0)
 		{
-			//either squfof failed or it is too big for squfof, so do qs.
+			//either rho failed or the cofactor is too big for 64-bit rho, so do qs.
 			int qs_sucess = tinyqs(number.get_mpz_t(), factor1->get_mpz_t(), factor2->get_mpz_t());
 
 			if (qs_sucess == 0)
@@ -541,7 +540,7 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class& number, unsigned int index)
 		//and the small prime was not found by the batch code due to the high power.
 		//Since this seems to happend very rarely, for now just do a basic check if the sizes of the two factors makes the relation valid,
 		//and let the relation factoring code handle it later, without any lp hints from here.
-		num_factors = factor(relation_factor_list, number.get_mpz_t(), 0);
+		num_factors = factor_general(relation_factor_list, number.get_mpz_t(), MAX_FACTORS_IN_RELATION);
 
 		if (num_factors < 0)
 		{
@@ -1060,11 +1059,7 @@ bool Batch_smooth::Complete_other_side(int index, string& list)
 	//Factor whatever is left, which also finds any higher multiplicities of the listed primes.
 	if (norm > 1)
 	{
-		int num_other_factors = factor_smooth(other_side_factor_list, norm.get_mpz_t(), MAX_FACTORS_IN_RELATION);
-		if (num_other_factors < 0)
-		{
-			num_other_factors = factor(other_side_factor_list, norm.get_mpz_t(), 1);
-		}
+		int num_other_factors = factor_general(other_side_factor_list, norm.get_mpz_t(), MAX_FACTORS_IN_RELATION);
 
 		if (num_other_factors < 0)
 		{
@@ -1181,12 +1176,7 @@ void Batch_smooth::Output_solutions()
 			if (num_factors == 0 && *relation_value > 1)
 			{
 				unsigned long long tf = profile_now();
-				num_factors = factor_smooth(relation_factor_list, relation_value->get_mpz_t(), MAX_FACTORS_IN_RELATION);
-				if (num_factors < 0)
-				{
-					//Too large for the fast method, use the general one.
-					num_factors = factor(relation_factor_list, relation_value->get_mpz_t(), 1);
-				}
+				num_factors = factor_general(relation_factor_list, relation_value->get_mpz_t(), MAX_FACTORS_IN_RELATION);
 				profile_add(PROF_FACTOR, tf);
 			}
 

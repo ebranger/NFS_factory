@@ -23,15 +23,11 @@
     <ClCompile Include="cofactorize_siqs.c" />
     <ClCompile Include="Main.cpp" />
     <ClCompile Include="Polynomial.cpp" />
-    <ClCompile Include="smintfact.c" />
-    <ClCompile Include="squfof.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Batch_smooth.h" />
     <ClInclude Include="cofactorize.h" />
     <ClInclude Include="Polynomial.h" />
-    <ClInclude Include="smintfact.h" />
-    <ClInclude Include="squfof.h" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>15.0</VCProjectVersion>

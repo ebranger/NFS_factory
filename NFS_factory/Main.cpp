@@ -12,8 +12,7 @@ benefit from your work.
 Some parts of the code (and also this header), included in this
 distribution have been reused from other sources. In particular I
 have benefitted greatly from the work of Jason Papadopoulos's msieve,
-the batch factorization code in CADO-NFS, and relation factoring code
-found in gnfs-lasieve by Franke and Kleinjung.
+and the batch factorization code in CADO-NFS.
 ----------------------------------------------------------------------*/
 
 
@@ -169,12 +168,12 @@ bool read_polynomial(string filename, nfs_parameters* params)
 			{
 				params->lbpr = stoi(line);
 			}
-			//Maximum bits for the remainder on the algebraic side after batch smoothness checking, to be factored by QS/squfof
+			//Maximum bits for the remainder on the algebraic side after batch smoothness checking, to be factored by rho/QS
 			else if (data == "mfba")
 			{
 				params->mfba = stoi(line);
 			}
-			//Maximum bits for the remainder on the rational side after batch smoothness checking, to be factored by QS/squfof
+			//Maximum bits for the remainder on the rational side after batch smoothness checking, to be factored by rho/QS
 			else if (data == "mfbr")
 			{
 				params->mfbr = stoi(line);
