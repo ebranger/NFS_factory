@@ -105,6 +105,7 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	max_entries_before_check = 1 << (tree_size - 1);
 	save_filename = filename;
 	num_relations_found = 0;
+	num_batches_checked = 0;
 	num_factoring_failures = 0;
 	num_other_side_failures = 0;
 	min_saved_prime_limit = print_limit; //Do not print primes less than this. Msieve reconstructs primes less than 1000, CADO needs all primes (so set this to 1 to print everything).
@@ -404,7 +405,10 @@ void Batch_smooth::Get_saved_primes(int index, vector<unsigned long long>& prime
 
 //Check whether a remainder factors into two numbers less than the lp limit.
 //If it does, it is a valid relation!
-bool Batch_smooth::check_two_lp_smooth(mpz_class& number, unsigned int index)
+//The large primes of the cofactor of a leaf, which is what is left of the relation value after dividing out the primes of the batch
+//check: 1 (smooth), one large prime, two large primes (split with Pollard rho), or a 3LP candidate. Sets lp1 and lp2 of the
+//relation. Thread safe: cofactors that 64-bit rho cannot split are left for Split_with_tinyqs.
+Batch_smooth::cofactor_result Batch_smooth::Classify_cofactor(mpz_class& number, unsigned int index)
 {
 	int cofactor_bits = (int)mpz_sizeinbase(number.get_mpz_t(), 2);
 
@@ -413,14 +417,9 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class& number, unsigned int index)
 		//Too big to be split into two primes both less than lp_limit. It can still have three, if it is composite and at least fblim^3.
 		if (cofactor_bits <= three_lp_max_bits && number >= three_lp_min && !is_probable_prime(number.get_mpz_t()))
 		{
-			if (candidate_cofactor.size() <= candidate_index.size())
-			{
-				candidate_cofactor.emplace_back();
-			}
-			candidate_cofactor[candidate_index.size()] = number;
-			candidate_index.push_back(index);
+			return COFACTOR_CANDIDATE;
 		}
-		return false;
+		return COFACTOR_NOT_SMOOTH;
 	}
 
 	if (cofactor_bits > two_lp_min_limit)
@@ -428,74 +427,33 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class& number, unsigned int index)
 		//Can potentially split into two large primes, small enough to be useful
 		if (is_probable_prime(number.get_mpz_t()))
 		{
-			return false;
+			return COFACTOR_NOT_SMOOTH;
 		}
-
-		*factor1 = 0;
-		*factor2 = 0;
 
 		if (cofactor_bits <= 63 && mpz_odd_p(number.get_mpz_t()))
 		{
 			//Pollard rho with 64-bit arithmetic.
-			unsigned long long factor;
-			if (split_composite64(mpz_get_ui(number.get_mpz_t()), &factor))
+			unsigned long long n = mpz_get_ui(number.get_mpz_t()), factor;
+			if (split_composite64(n, &factor))
 			{
-				mpz_set_ui(factor1->get_mpz_t(), factor);
-				mpz_divexact_ui(factor2->get_mpz_t(), number.get_mpz_t(), factor);
+				return Check_two_primes(factor, n / factor, index);
 			}
 		}
 
-		if (*factor1 == 0)
-		{
-			//either rho failed or the cofactor is too big for 64-bit rho, so do qs.
-			int qs_sucess = tinyqs(number.get_mpz_t(), factor1->get_mpz_t(), factor2->get_mpz_t());
-
-			if (qs_sucess == 0)
-			{
-				//unsuccesful
-				return false;
-			}
-
-		}
-
-		//check if the factors are too big.
-		if (mpz_sizeinbase(factor1->get_mpz_t(), 2) > one_lp_bit_limit)
-		{
-			return false;
-		}
-		if (mpz_sizeinbase(factor2->get_mpz_t(), 2) > one_lp_bit_limit)
-		{
-			return false;
-		}
-
-		//check that the factors are actual large primes. If it turns out to be a small prime that occured to a high
-		//power, it can cause problems later when it is assumed to be a prime larger than the rlim/alim.
-		if (!is_probable_prime(factor1->get_mpz_t()))
-		{
-			return false;
-		}
-		if (!is_probable_prime(factor2->get_mpz_t()))
-		{
-			return false;
-		}
-
-		//save the two found factors, the smaller first. I do not expect three factors to ever happen, though that may cause problems here...
-		lp1[index] = min(factor1->get_ui(), factor2->get_ui());
-		lp2[index] = max(factor1->get_ui(), factor2->get_ui());
-
-		return true;
+		//either rho failed or the cofactor is too big for 64-bit rho, so do qs.
+		return COFACTOR_TINYQS;
 	}
 
 	if (cofactor_bits > one_lp_bit_limit)
 	{
 		//Should be a prime and too big.
-		return false;
+		return COFACTOR_NOT_SMOOTH;
 	}
 
 	if (number == 1)
 	{
 		//no large primes found, finished!
-		return true;
+		return COFACTOR_SMOOTH;
 	}
 
 	//should be one large prime by now. Make sure it is actually a large prime as well.
@@ -510,26 +468,69 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class& number, unsigned int index)
 		//and the small prime was not found by the batch code due to the high power.
 		//Since this seems to happend very rarely, for now just do a basic check if the sizes of the two factors makes the relation valid,
 		//and let the relation factoring code handle it later, without any lp hints from here.
-		num_factors = factor_general(relation_factor_list, number.get_mpz_t(), MAX_FACTORS_IN_RELATION);
+		unsigned int factors[MAX_FACTORS_IN_RELATION];
+		int count = factor_general(factors, number.get_mpz_t(), MAX_FACTORS_IN_RELATION);
 
-		if (num_factors < 0)
+		if (count < 0)
 		{
-			return false;
+			return COFACTOR_NOT_SMOOTH;
 		}
 
-		for (int i = 0; i < num_factors; i++)
+		for (int i = 0; i < count; i++)
 		{
-			if ((unsigned long long)relation_factor_list[i] >> one_lp_bit_limit != 0)
+			if ((unsigned long long)factors[i] >> one_lp_bit_limit != 0)
 			{
 				//factor is 2^lbp or larger.
-				return false;
+				return COFACTOR_NOT_SMOOTH;
 			}
 		}
-
 	}
 
 	//if the remainder after dividing out all small primes is less than the limit, it is prime and smooth (or possibly composite with high-power primes in relation, but still OK.)
-	return true;
+	return COFACTOR_SMOOTH;
+}
+
+//The two factors of a 2LP cofactor must be large primes: below the large prime bound, and prime. If it turns out to be a small prime
+//that occured to a high power, it can cause problems later when it is assumed to be a prime larger than the rlim/alim.
+Batch_smooth::cofactor_result Batch_smooth::Check_two_primes(unsigned long long p, unsigned long long q, unsigned int index)
+{
+	mpz_class f1, f2;
+	mpz_set_ui(f1.get_mpz_t(), (mpir_ui)p);
+	mpz_set_ui(f2.get_mpz_t(), (mpir_ui)q);
+	if ((int)mpz_sizeinbase(f1.get_mpz_t(), 2) > one_lp_bit_limit || (int)mpz_sizeinbase(f2.get_mpz_t(), 2) > one_lp_bit_limit)
+	{
+		return COFACTOR_NOT_SMOOTH;
+	}
+	if (!is_probable_prime(f1.get_mpz_t()) || !is_probable_prime(f2.get_mpz_t()))
+	{
+		return COFACTOR_NOT_SMOOTH;
+	}
+
+	//save the two found factors, the smaller first.
+	lp1[index] = min(p, q);
+	lp2[index] = max(p, q);
+	return COFACTOR_SMOOTH;
+}
+
+//Split a 2LP cofactor that 64-bit rho could not with tinyqs, and check the two factors. Not thread safe.
+bool Batch_smooth::Split_with_tinyqs(mpz_class& number, unsigned int index)
+{
+	*factor1 = 0;
+	*factor2 = 0;
+	int qs_sucess = tinyqs(number.get_mpz_t(), factor1->get_mpz_t(), factor2->get_mpz_t());
+
+	if (qs_sucess == 0)
+	{
+		//unsuccesful
+		return false;
+	}
+
+	//check if the factors are too big.
+	if (mpz_sizeinbase(factor1->get_mpz_t(), 2) > one_lp_bit_limit || mpz_sizeinbase(factor2->get_mpz_t(), 2) > one_lp_bit_limit)
+	{
+		return false;
+	}
+	return Check_two_primes(factor1->get_ui(), factor2->get_ui(), index) == COFACTOR_SMOOTH;
 }
 
 //|c| x^4 for |x| < 2^32 and |c| < 2^63, which is less than 2^191, as three limbs.
@@ -671,11 +672,13 @@ void Batch_smooth::Run_batch_check()
 
 	tree->Remainder_tree();
 	t = profile_add(PROF_REMAINDER_TREE, t);
-	unsigned long long cofactor_start = profile_cycles[PROF_COFACTOR];
 
 	//Q = (P mod N)^2 mod N for each relation value N. Without cofactorization, N is smooth if Q is 0. With it, the part of N
-	//without the primes of P is N / gcd(N, Q), which is then checked for large primes.
+	//without the primes of P is N / gcd(N, Q), which is then checked for large primes. The leaves are done in parallel (with the
+	//threads option), and the steps that are not thread safe afterwards, in leaf order.
 	tree->Leaf_remainders();
+	leaf_result.resize(num_relations_per_batch);
+#pragma omp parallel for schedule(dynamic, 256)
 	for (int index = 0; index < num_relations_per_batch; index++)
 	{
 		mpz_class& Q = *tree->Leaf_remainder(index);
@@ -683,31 +686,46 @@ void Batch_smooth::Run_batch_check()
 		if (do_cofactorization == true)
 		{
 			mpz_srcptr value = tree->Leaf(index)->get_mpz_t();
-			mpz_gcd(temp_number->get_mpz_t(), value, Q.get_mpz_t());
-			mpz_divexact(Q.get_mpz_t(), value, temp_number->get_mpz_t());
-
-			//Check if Q is 2lp smooth
-			unsigned long long tc = profile_now();
-			bool smooth = check_two_lp_smooth(Q, index);
-			profile_add(PROF_COFACTOR, tc);
-			if (!smooth)
-			{
-				//not smooth.
-				is_smooth[index] = false;
-			}
+			mpz_class common;
+			mpz_gcd(common.get_mpz_t(), value, Q.get_mpz_t());
+			mpz_divexact(Q.get_mpz_t(), value, common.get_mpz_t());
+			leaf_result[index] = (unsigned char)Classify_cofactor(Q, index);
 		}
 		else
 		{
-			if (Q > 0)
-			{
-				//not smooth.
-				is_smooth[index] = false;
-			}
+			//Do not do 2lp testing. If Q = 0 then the relation is smooth
+			leaf_result[index] = (unsigned char)((Q > 0) ? COFACTOR_NOT_SMOOTH : COFACTOR_SMOOTH);
 		}
 	}
+	t = profile_add(PROF_LEAVES, t);
 
-	profile_add(PROF_LEAVES, t);
-	profile_cycles[PROF_LEAVES] -= profile_cycles[PROF_COFACTOR] - cofactor_start; //cofactorization is counted separately.
+	for (int index = 0; index < num_relations_per_batch; index++)
+	{
+		switch (leaf_result[index])
+		{
+		case COFACTOR_SMOOTH:
+			break;
+		case COFACTOR_CANDIDATE:
+			if (candidate_cofactor.size() <= candidate_index.size())
+			{
+				candidate_cofactor.emplace_back();
+			}
+			candidate_cofactor[candidate_index.size()] = *tree->Leaf_remainder(index);
+			candidate_index.push_back(index);
+			is_smooth[index] = false;
+			break;
+		case COFACTOR_TINYQS:
+			if (!Split_with_tinyqs(*tree->Leaf_remainder(index), index))
+			{
+				is_smooth[index] = false;
+			}
+			break;
+		default:
+			is_smooth[index] = false;
+			break;
+		}
+	}
+	profile_add(PROF_COFACTOR, t);
 
 	Send_candidates();
 	Output_solutions();
@@ -964,7 +982,13 @@ void Batch_smooth::Output_solutions()
 		cout << "Ran a batch, found " << num_good << " smooth numbers" << endl;
 	}
 	num_relations_found += num_good;
+	num_batches_checked++;
 	entries = 0;
+}
+
+long long Batch_smooth::Get_num_batches_checked()
+{
+	return num_batches_checked;
 }
 
 long long Batch_smooth::Get_num_relations_found()

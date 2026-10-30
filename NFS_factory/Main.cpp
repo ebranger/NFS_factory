@@ -30,6 +30,13 @@ and the batch factorization code in CADO-NFS.
 #include <stdlib.h>
 #include <ctype.h>
 #include <limits.h>
+#include <omp.h>
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#else
+#include <unistd.h>
+#endif
 
 using namespace std;
 
@@ -253,7 +260,7 @@ bool read_polynomial(string filename, nfs_parameters* params)
 			{
 				params->file_3lp = line;
 			}
-			//How the products of the trees are computed: mpir (default) or ntt.
+			//How the products of the trees are computed: mpir (default of the CPU build), ntt, or gpu (default of the GPU build).
 			else if (data == "backend")
 			{
 				if (line == "mpir")
@@ -264,9 +271,18 @@ bool read_polynomial(string filename, nfs_parameters* params)
 				{
 					params->backend = TREE_BACKEND_NTT;
 				}
+				else if (line == "gpu")
+				{
+#ifdef NFS_GPU
+					params->backend = TREE_BACKEND_GPU;
+#else
+					cout << "This build has no GPU support, so backend gpu on line " << line_number << " of the polynomial file cannot be used. Use the GPU build (NFS_factory_gpu)." << endl;
+					return false;
+#endif
+				}
 				else
 				{
-					cout << "Unknown backend " << line << " on line " << line_number << " of the polynomial file. Use mpir or ntt." << endl;
+					cout << "Unknown backend " << line << " on line " << line_number << " of the polynomial file. Use mpir, ntt or gpu." << endl;
 					return false;
 				}
 			}
@@ -346,8 +362,167 @@ bool relation_in_range(long long a, long long b, nfs_parameters* param)
 	return llabs(a) <= param->maxa && b <= param->maxb;
 }
 
-//Function for reading relations to be processed.
-long long read_batch_from_file(string filename, Batch_smooth* batch, nfs_parameters* param)
+//The size of a file in bytes, or -1 if it cannot be opened.
+long long file_size(const string& name)
+{
+	FILE* f = fopen(name.c_str(), "rb");
+	if (f == NULL)
+	{
+		return -1;
+	}
+#ifdef _WIN32
+	_fseeki64(f, 0, SEEK_END);
+	long long size = _ftelli64(f);
+#else
+	fseeko(f, 0, SEEK_END);
+	long long size = (long long)ftello(f);
+#endif
+	fclose(f);
+	return size;
+}
+
+//Cut a file to size bytes. Returns false if that failed.
+bool truncate_file(const string& name, long long size)
+{
+#ifdef _WIN32
+	int fd = _open(name.c_str(), _O_RDWR | _O_BINARY);
+	if (fd < 0)
+	{
+		return false;
+	}
+	bool ok = _chsize_s(fd, size) == 0;
+	_close(fd);
+	return ok;
+#else
+	return truncate(name.c_str(), (off_t)size) == 0;
+#endif
+}
+
+//The progress of a run over its relation files, for resuming an interrupted run and for stopping at a number of relations.
+//After each batch, when all relations read so far are checked and written to the output file, the position is saved to the
+//resume file: the input (the relation file, or the list of relation files), the file reached, and how many records (lines of a
+//text file, relations of a binary file) of it are done, with the number of relations found so far.
+//The size of the output file is saved too: relations written after that point by an interrupted run are removed when it resumes,
+//since their batch is checked again. 3LP candidates that wait for the second stage when a run is interrupted are not saved, and
+//their relations are lost.
+struct run_progress
+{
+	Batch_smooth* batch;
+	string resume_filename;
+	string output_filename;
+	string input; //"file <name>" or "list <name>"
+	vector<string> files;
+	size_t file_index; //the file being read
+	long long done_records; //records of that file that are done
+	long long read_records; //records of that file read up to the last relation added
+	long long found_before; //relations found before this run (when resuming)
+	long long target; //stop when this many relations have been found (0: no target)
+	long long relations_added; //by this run, for maxrels
+	long long batches_seen;
+	bool target_reached;
+	bool complete; //all files were read
+
+	long long Found()
+	{
+		return found_before + batch->Get_num_relations_found();
+	}
+
+	void Save()
+	{
+		string temp = resume_filename + ".tmp";
+		FILE* f = fopen(temp.c_str(), "w");
+		if (f == NULL)
+		{
+			cout << "Could not write the resume file " << temp << endl;
+			return;
+		}
+		long long bytes = file_size(output_filename);
+		fprintf(f, "input %s\nfile %zu\nname %s\nrecords %lld\nfound %lld\noutput %lld\ncomplete %d\n", input.c_str(), file_index,
+			(file_index < files.size()) ? files[file_index].c_str() : "-", done_records, Found(), (bytes > 0) ? bytes : 0, complete ? 1 : 0);
+		fclose(f);
+		remove(resume_filename.c_str());
+		rename(temp.c_str(), resume_filename.c_str());
+	}
+
+	//Read a resume file of the same input. Returns false if there is none.
+	bool Load()
+	{
+		ifstream f(resume_filename);
+		string key, value, saved_input;
+		size_t index = 0;
+		long long records = 0, found = 0, bytes = 0;
+		int done = 0;
+		int keys = 0;
+		while (f >> key && getline(f, value))
+		{
+			value = trim(value);
+			try
+			{
+				if (key == "input") { saved_input = value; keys++; }
+				else if (key == "file") { index = stoull(value); keys++; }
+				else if (key == "records") { records = stoll(value); keys++; }
+				else if (key == "found") { found = stoll(value); keys++; }
+				else if (key == "output") { bytes = stoll(value); keys++; }
+				else if (key == "complete") { done = stoi(value); keys++; }
+			}
+			catch (const exception&)
+			{
+				return false;
+			}
+		}
+		if (keys != 6 || saved_input != input)
+		{
+			return false;
+		}
+		file_index = index;
+		done_records = records;
+		found_before = found;
+		complete = (done != 0) || index >= files.size();
+
+		//Relations written after the saved position are written again.
+		long long size = file_size(output_filename);
+		if (size > bytes && !truncate_file(output_filename, bytes))
+		{
+			cout << "Could not remove the relations written after the saved position from " << output_filename << endl;
+		}
+		if (size >= 0 && size < bytes)
+		{
+			cout << "The output file " << output_filename << " is shorter than when the resume file was written." << endl;
+		}
+		return true;
+	}
+
+	//Called after each relation added to the batch, with the records of the current file read so far. Returns true if
+	//reading should stop.
+	bool Relation_added(long long records_read, nfs_parameters* param)
+	{
+		relations_added++;
+		read_records = records_read;
+		if (batch->Get_num_batches_checked() != batches_seen)
+		{
+			batches_seen = batch->Get_num_batches_checked();
+			done_records = records_read;
+			Save();
+			if (target > 0 && Found() >= target)
+			{
+				target_reached = true;
+				cout << "Found " << Found() << " relations, at least the " << target << " that were asked for." << endl;
+				return true;
+			}
+		}
+		if (param->maxrels > 0 && relations_added >= param->maxrels)
+		{
+			cout << "Stopping after " << relations_added << " relations (maxrels)." << endl;
+			return true;
+		}
+		return false;
+	}
+};
+
+enum read_result { READ_END, READ_STOPPED, READ_FAILED };
+
+//Read the relations of a text relation file, from record skip_records on.
+read_result read_batch_from_file(string filename, Batch_smooth* batch, nfs_parameters* param, run_progress& progress, long long skip_records)
 {
 	FILE* infile;
 
@@ -355,8 +530,8 @@ long long read_batch_from_file(string filename, Batch_smooth* batch, nfs_paramet
 
 	if (infile == NULL)
 	{
-		cout << "Could not open input file." << endl;
-		return -1;
+		cout << "Could not open input file " << filename << endl;
+		return READ_FAILED;
 	}
 	setvbuf(infile, NULL, _IOFBF, 1 << 20);
 
@@ -368,7 +543,9 @@ long long read_batch_from_file(string filename, Batch_smooth* batch, nfs_paramet
 	long long relation_num = 0;
 	long long failed_relations = 0;
 	long long skipped_relations = 0;
+	long long records = 0; //lines read
 	bool incomplete_last_line = false;
+	bool stopped = false;
 
 	//fgets and char checking is so much faster than stringstream...
 	while (fgets(buffer, sizeof(buffer), infile) != NULL)
@@ -388,7 +565,16 @@ long long read_batch_from_file(string filename, Batch_smooth* batch, nfs_paramet
 			//Line too long. Skip the rest of it.
 			int c;
 			while ((c = _fgetc_nolock(infile)) != EOF && c != '\n');
-			failed_relations++;
+			if (++records > skip_records)
+			{
+				failed_relations++;
+			}
+			continue;
+		}
+
+		//Lines done by an earlier run.
+		if (++records <= skip_records)
+		{
 			continue;
 		}
 
@@ -454,17 +640,19 @@ long long read_batch_from_file(string filename, Batch_smooth* batch, nfs_paramet
 
 		relation_num++;
 
-		if (param->maxrels > 0 && relation_num >= param->maxrels)
+		if (progress.Relation_added(records, param))
 		{
-			cout << "Stopping after " << relation_num << " relations (maxrels)." << endl;
+			stopped = true;
 			break;
 		}
 	}
 
 	fclose(infile);
 
-	//Finish any remaining relations, even if the tree is not filled.
-	batch->Finish();
+	if (!stopped)
+	{
+		progress.done_records = records;
+	}
 
 	if (incomplete_last_line)
 	{
@@ -481,7 +669,7 @@ long long read_batch_from_file(string filename, Batch_smooth* batch, nfs_paramet
 		cout << "Skipped " << skipped_relations << " relations with a or b larger than maxa or maxb." << endl;
 	}
 
-	return batch->Get_num_relations_found();
+	return stopped ? READ_STOPPED : READ_END;
 }
 
 //A buffer for reading a binary file in large blocks.
@@ -513,8 +701,9 @@ struct read_buffer
 	}
 };
 
-//Read relations from a binary format file. With candidates, the file holds 3LP candidates, for a batch that is the 3LP second stage.
-long long read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_parameters* param, bool candidates)
+//Read relations from a binary format file, from record skip_records on. With candidates, the file holds 3LP candidates, for a batch
+//that is the 3LP second stage.
+read_result read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_parameters* param, bool candidates, run_progress& progress, long long skip_records)
 {
 	//The binary format is (int)a, (uint)b, (uint)num_primes, (uint)prime1 ... (uint)prime_num_primes
 	//3LP candidates are followed by (uint64)low and (uint64)high 64 bits of the cofactor.
@@ -529,6 +718,7 @@ long long read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_
 
 	long long relation_num = 0;
 	long long skipped_relations = 0;
+	long long records = 0; //relations read
 	bool corrupt = false;
 	bool stopped = false;
 
@@ -537,8 +727,8 @@ long long read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_
 
 	if (input.file == NULL)
 	{
-		cout << "Failed to open input saved relations file." << endl;
-		return -1;
+		cout << "Failed to open input saved relations file " << filename << endl;
+		return READ_FAILED;
 	}
 
 	input.data.resize(READ_BUFFER_SIZE);
@@ -568,6 +758,12 @@ long long read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_
 		}
 		input.position += (3 + num_primes) * sizeof(unsigned int) + extra_bytes;
 
+		//Relations done by an earlier run.
+		if (++records <= skip_records)
+		{
+			continue;
+		}
+
 		if (!relation_in_range(a, b, param))
 		{
 			skipped_relations++;
@@ -588,9 +784,8 @@ long long read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_
 		}
 		relation_num++;
 
-		if (param->maxrels > 0 && relation_num >= param->maxrels)
+		if (progress.Relation_added(records, param))
 		{
-			cout << "Stopping after " << relation_num << " relations (maxrels)." << endl;
 			stopped = true;
 			break;
 		}
@@ -603,12 +798,14 @@ long long read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_
 	}
 	fclose(input.file);
 
-	//Check final relations, even if the tree is not filled.
-	batch->Finish();
+	if (!stopped)
+	{
+		progress.done_records = records;
+	}
 
 	if (corrupt)
 	{
-		cout << "The binary relation file is truncated or corrupt after " << relation_num + skipped_relations << " relations. The rest of the file was skipped." << endl;
+		cout << "The binary relation file is truncated or corrupt after " << records << " relations. The rest of the file was skipped." << endl;
 	}
 
 	if (skipped_relations > 0)
@@ -616,21 +813,113 @@ long long read_batch_from_binary_file(string filename, Batch_smooth* batch, nfs_
 		cout << "Skipped " << skipped_relations << " relations with a or b larger than maxa or maxb." << endl;
 	}
 
-	return batch->Get_num_relations_found();
+	return stopped ? READ_STOPPED : READ_END;
 }
 
 int main(int argc, char* argv[])
 {
-	if (argc != 4)
+	//NFS_factory <polynomial file> <relation file> <output file> [-rels N]
+	//NFS_factory <polynomial file> -list <list file> <output file> [-rels N]
+	string inputfile, outputfile, polyfile, listfile;
+	long long target_relations = 0;
+#ifdef NFS_GPU
+	int threads = 8; //The GPU build runs as one process.
+#else
+	int threads = 1; //The CPU build is typically run as several processes.
+#endif
+	vector<string> positional;
+	bool arguments_ok = true;
+	for (int i = 1; i < argc; i++)
 	{
-		cout << "Usage: NFS_factory <polynomial file name> <saved relation file name> <output file name>" << endl;
+		string arg = argv[i];
+		if (arg == "-list" && i + 1 < argc)
+		{
+			listfile = argv[++i];
+		}
+		else if (arg == "-rels" && i + 1 < argc)
+		{
+			try
+			{
+				target_relations = stoll(argv[++i]);
+			}
+			catch (const exception&)
+			{
+				arguments_ok = false;
+			}
+		}
+		else if (arg == "-threads" && i + 1 < argc)
+		{
+			try
+			{
+				threads = stoi(argv[++i]);
+			}
+			catch (const exception&)
+			{
+				arguments_ok = false;
+			}
+			arguments_ok = arguments_ok && threads >= 1;
+		}
+		else
+		{
+			positional.push_back(arg);
+		}
+	}
+	if (!arguments_ok || positional.size() != (listfile.empty() ? 3u : 2u))
+	{
+		cout << "Usage: NFS_factory <polynomial file> <relation file> <output file> [-rels N] [-threads N]" << endl;
+		cout << "   or: NFS_factory <polynomial file> -list <list file> <output file> [-rels N] [-threads N]" << endl;
+		cout << "The list file names relation files, one per line, which are read in order. With -rels, the run stops when N relations" << endl;
+		cout << "have been found. An interrupted run continues where it was, from <output file>.resume, when it is run again with the" << endl;
+		cout << "same relation file or list. A summary is written to <output file>.status at the end. -threads sets the number of" << endl;
+		cout << "threads for the leaves of the remainder tree (default 1 in the CPU build, 8 in the GPU build)." << endl;
 		return 0;
 	}
+	omp_set_num_threads(threads);
 
-	string inputfile, outputfile, polyfile;
-	polyfile = argv[1];
-	inputfile = argv[2];
-	outputfile = argv[3];
+	polyfile = positional[0];
+	inputfile = listfile.empty() ? positional[1] : listfile;
+	outputfile = positional.back();
+
+	run_progress progress;
+	progress.input = (listfile.empty() ? "file " : "list ") + inputfile;
+	if (listfile.empty())
+	{
+		progress.files.push_back(inputfile);
+	}
+	else
+	{
+		ifstream list(listfile);
+		if (!list)
+		{
+			cout << "Could not open the list file " << listfile << endl;
+			return -1;
+		}
+		string line;
+		while (getline(list, line))
+		{
+			line = trim(line);
+			if (!line.empty() && line[0] != '#')
+			{
+				progress.files.push_back(line);
+			}
+		}
+		if (progress.files.empty())
+		{
+			cout << "The list file " << listfile << " names no relation files." << endl;
+			return -1;
+		}
+	}
+	progress.resume_filename = outputfile + ".resume";
+	progress.output_filename = outputfile;
+	progress.file_index = 0;
+	progress.done_records = 0;
+	progress.read_records = 0;
+	progress.found_before = 0;
+	progress.target = target_relations;
+	progress.relations_added = 0;
+	progress.batches_seen = 0;
+	progress.target_reached = false;
+	progress.complete = false;
 
 	Batch_smooth* batch;
 
@@ -647,7 +936,11 @@ int main(int argc, char* argv[])
 	param->tree_levels = 0;
 	param->tree_levels_3lp = STAGE2_ONLY_TREE_LEVELS;
 	param->save_3lp = false;
+#ifdef NFS_GPU
+	param->backend = TREE_BACKEND_GPU;
+#else
 	param->backend = TREE_BACKEND_MPIR;
+#endif
 
 	param->algebraic_polynomial = new Polynomial();
 	param->rational_polynomial = new Polynomial();
@@ -710,7 +1003,7 @@ int main(int argc, char* argv[])
 	}
 
 	//A file of 3LP candidates is checked in the 3LP second stage only.
-	bool candidate_input = inputfile.size() > 4 && inputfile.compare(inputfile.size() - 4, 4, ".3lp") == 0;
+	bool candidate_input = listfile.empty() && inputfile.size() > 4 && inputfile.compare(inputfile.size() - 4, 4, ".3lp") == 0;
 	bool three_lp = mfb > 2 * lbp && !candidate_input;
 
 	//Estimate size needed to hold the value of the algebraic/rational polynomial values.
@@ -795,21 +1088,81 @@ int main(int argc, char* argv[])
 	}
 	t = profile_now();
 
-	if (candidate_input)
+	progress.batch = batch;
+	if (progress.Load())
 	{
-		//3LP candidates saved by an earlier run, with a .3lp extension.
-		total_num_relations = read_batch_from_binary_file(inputfile, batch, param, true);
-	}
-	else if (inputfile.find(".bin") == string::npos)
-	{
-		//for reading gnfs-lasieve output.
-		total_num_relations = read_batch_from_file(inputfile, batch, param);
+		if (progress.complete)
+		{
+			cout << "The resume file " << progress.resume_filename << " shows that all relation files were done, with " << progress.found_before << " relations found. Remove it to run again." << endl;
+		}
+		else
+		{
+			cout << "Resuming from " << progress.resume_filename << ": file " << progress.file_index + 1 << " of " << progress.files.size() << " (" << progress.files[progress.file_index]
+				<< ") after " << progress.done_records << " records, with " << progress.found_before << " relations found before." << endl;
+		}
 	}
 	else
 	{
-		//for reading binary formated files, assumed to have a .bin extension.
-		total_num_relations = read_batch_from_binary_file(inputfile, batch, param, false);
+		progress.Save();
 	}
+
+	bool read_failed = false;
+	bool stopped = progress.complete || (progress.target > 0 && progress.found_before >= progress.target);
+	long long skip_records = progress.done_records;
+	for (; !stopped && progress.file_index < progress.files.size(); progress.file_index++)
+	{
+		const string& file = progress.files[progress.file_index];
+		read_result result;
+		if (progress.files.size() > 1)
+		{
+			cout << "Reading relation file " << progress.file_index + 1 << " of " << progress.files.size() << ": " << file << endl;
+		}
+		if (candidate_input)
+		{
+			//3LP candidates saved by an earlier run, with a .3lp extension.
+			result = read_batch_from_binary_file(file, batch, param, true, progress, skip_records);
+		}
+		else if (file.find(".bin") == string::npos)
+		{
+			//for reading gnfs-lasieve output.
+			result = read_batch_from_file(file, batch, param, progress, skip_records);
+		}
+		else
+		{
+			//for reading binary formated files, assumed to have a .bin extension.
+			result = read_batch_from_binary_file(file, batch, param, false, progress, skip_records);
+		}
+		skip_records = 0;
+
+		if (result == READ_FAILED)
+		{
+			read_failed = true;
+			break;
+		}
+		if (result == READ_STOPPED)
+		{
+			//After Finish below, the relations read so far are done.
+			progress.done_records = progress.read_records;
+			stopped = true;
+			break;
+		}
+		//The relations of the next file continue the same batch.
+		progress.done_records = 0;
+	}
+
+	//Check the remaining relations, even if the tree is not filled, and the 3LP candidates. Then all relations read are done.
+	if (!read_failed)
+	{
+		batch->Finish();
+		progress.complete = progress.complete || !stopped;
+		if (progress.complete)
+		{
+			progress.file_index = progress.files.size();
+			progress.done_records = 0;
+		}
+		progress.Save();
+	}
+	total_num_relations = batch->Get_num_relations_found();
 
 	unsigned long long reader_cycles = profile_now() - t;
 	for (int i = PROF_POLY_EVAL; i < PROF_NUM_PHASES; i++)
@@ -818,9 +1171,17 @@ int main(int argc, char* argv[])
 	}
 	profile_cycles[PROF_READ] += reader_cycles - batch_cycles;
 
-	if (total_num_relations >= 0)
+	cout << "Batch-checking all numbers took " << (clock() - time) / CLOCKS_PER_SEC << " seconds. Found a total of " << total_num_relations << " relations." << endl;
+
+	//A summary for a driver script: relations found by this run and in total, whether the target was reached, and whether all files are done.
+	string status_filename = outputfile + ".status";
+	FILE* status = fopen(status_filename.c_str(), "w");
+	if (status != NULL)
 	{
-		cout << "Batch-checking all numbers took " << (clock() - time) / CLOCKS_PER_SEC << " seconds. Found a total of " << total_num_relations << " relations." << endl;
+		fprintf(status, "found %lld\ntotal %lld\ntarget %lld\ntarget_reached %d\nfiles_done %zu\nfiles %zu\ncomplete %d\nerror %d\n", total_num_relations,
+			progress.Found(), progress.target, (progress.target > 0 && progress.Found() >= progress.target) ? 1 : 0,
+			progress.complete ? progress.files.size() : progress.file_index, progress.files.size(), progress.complete ? 1 : 0, read_failed ? 1 : 0);
+		fclose(status);
 	}
 
 	delete batch;
@@ -828,9 +1189,9 @@ int main(int argc, char* argv[])
 	delete param->rational_polynomial;
 	delete param;
 
-	if (total_num_relations < 0)
+	if (read_failed)
 	{
-		//The relation file could not be read.
+		//A relation file could not be read. The resume file shows where the run stopped.
 		return -1;
 	}
 

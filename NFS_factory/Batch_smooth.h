@@ -25,7 +25,8 @@ public:
 	bool Add_number(long long a_val, long long b_val, const char* relation_factor_list);
 	bool Add_number_binary(long long a_val, long long b_val, const unsigned int* primes, unsigned int num_primes);
 	bool Add_candidate(long long a_val, long long b_val, const unsigned int* primes, unsigned int num_primes, mpz_srcptr cofactor);
-	long long Get_num_relations_found();
+	long long Get_num_relations_found(); //including the 3LP second stage
+	long long Get_num_batches_checked(); //all relations added before the last batch check are checked, and their relations written
 
 	//3LP candidates, cofactors from 2 lbp + 1 to mfb bits, are passed to a second stage that this object then owns (NULL: not used),
 	//and/or appended to a candidate file. Returns false if the file could not be opened.
@@ -65,6 +66,7 @@ private:
 	int entries;
 	int max_entries_before_check;
 	long long num_relations_found;
+	long long num_batches_checked;
 	long long num_factoring_failures;
 	long long num_other_side_failures;
 	int num_relations_per_batch;
@@ -83,7 +85,13 @@ private:
 	long long two_lp_min_limit;
 	int max_cofactor_bit_size;
 	bool do_cofactorization;
-	bool check_two_lp_smooth(mpz_class& number, unsigned int index);
+	//The cofactor checks of the leaves: Classify_cofactor is thread safe and does all but tinyqs, which is not (it keeps state
+	//between calls), so the cofactors that need it are split afterwards in leaf order, as before.
+	enum cofactor_result { COFACTOR_NOT_SMOOTH, COFACTOR_SMOOTH, COFACTOR_CANDIDATE, COFACTOR_TINYQS };
+	cofactor_result Classify_cofactor(mpz_class& number, unsigned int index);
+	cofactor_result Check_two_primes(unsigned long long p, unsigned long long q, unsigned int index);
+	bool Split_with_tinyqs(mpz_class& number, unsigned int index);
+	vector<unsigned char> leaf_result;
 	mpz_class *factor1, *factor2;
 
 	//3LP handling.

@@ -125,30 +125,39 @@ private:
 	Ntt_product ntt;
 };
 
-//The NTT backend: the tree computations of Cpu_tree_backend with the products of the integer NTT, where the forward transforms of
-//the nodes from the product tree are kept for the middle products of the remainder tree, as the GPU version will do. A pair of
-//nodes then costs 3 transforms in the remainder tree instead of 5. Each pair of nodes has one plan for both trees.
+//The NTT backend: the tree computations of Cpu_tree_backend with the products of the integer NTT, with one plan for each depth
+//of the tree (tree_level_plan), and the forward transforms of the nodes from the product tree kept for the middle products of the
+//remainder tree. A pair of nodes then costs 3 transforms in the remainder tree instead of 5. The GPU backend computes the same
+//numbers in every node.
 class Ntt_tree_backend : public Cpu_tree_backend
 {
 public:
 	Ntt_tree_backend(int levels, int max_bits_in_input);
 
 protected:
-	void Product_node(int i);
-	void Remainder_pair(int i);
+	void Product_level(int depth);
+	void Remainder_level(int depth);
 
 private:
-	bool Pair_plan(Ntt_plan& plan, int i);
-
 	Ntt_product ntt;
 	std::vector<std::vector<uint32_t>> transform; //the forward transforms of the nodes, where kept
-	std::vector<Ntt_plan> plan; //of the pair of nodes i, i + 1, for odd i
-	std::vector<char> kept; //whether the transforms of the pair of nodes i, i + 1 are kept
-	std::vector<uint32_t> y_transform, work;
+	std::vector<Ntt_plan> plan; //of each depth, for the products of its pairs
+	std::vector<char> uses_ntt; //of each depth
+	std::vector<uint32_t> y_transform, work, work2;
 };
+
+#ifdef NFS_GPU
+Tree_backend* create_gpu_tree_backend(int levels, int max_bits_in_input); //Gpu_tree_backend.cu
+#endif
 
 Tree_backend* create_tree_backend(tree_backend_kind kind, int levels, int max_bits_in_input)
 {
+#ifdef NFS_GPU
+	if (kind == TREE_BACKEND_GPU)
+	{
+		return create_gpu_tree_backend(levels, max_bits_in_input);
+	}
+#endif
 	if (kind == TREE_BACKEND_NTT)
 	{
 		return new Ntt_tree_backend(levels, max_bits_in_input);
@@ -206,13 +215,18 @@ mp_bitcnt_t Cpu_tree_backend::Build_product_tree()
 	}
 	for (int depth = levels - 2; depth >= 0; depth--)
 	{
-		for (int i = (1 << depth) - 1; i <= 2 * ((1 << depth) - 1); i++)
-		{
-			Product_node(i);
-			node_bits[i] = mpz_sizeinbase(node[i].get_mpz_t(), 2);
-		}
+		Product_level(depth);
 	}
 	return node_bits[0];
+}
+
+void Cpu_tree_backend::Product_level(int depth)
+{
+	for (int i = (1 << depth) - 1; i <= 2 * ((1 << depth) - 1); i++)
+	{
+		Product_node(i);
+		node_bits[i] = mpz_sizeinbase(node[i].get_mpz_t(), 2);
+	}
 }
 
 void Cpu_tree_backend::Product_node(int i)
@@ -384,10 +398,15 @@ void Cpu_tree_backend::Remainder_tree()
 {
 	for (int depth = 1; depth <= levels - 2; depth++)
 	{
-		for (int i = (1 << depth) - 1; i <= 2 * ((1 << depth) - 1); i += 2)
-		{
-			Remainder_pair(i);
-		}
+		Remainder_level(depth);
+	}
+}
+
+void Cpu_tree_backend::Remainder_level(int depth)
+{
+	for (int i = (1 << depth) - 1; i <= 2 * ((1 << depth) - 1); i += 2)
+	{
+		Remainder_pair(i);
 	}
 }
 
@@ -415,6 +434,7 @@ void Cpu_tree_backend::Remainder_pair(int i)
 //made y smaller, by less than the guard bits allow, so rounding up gives P mod N_i. It is then squared modulo N_i.
 void Cpu_tree_backend::Leaf_remainders()
 {
+#pragma omp parallel for schedule(dynamic, 256)
 	for (int i = first_leaf; i < first_leaf + num_leaves; i++)
 	{
 		const int parent = (i - 1) / 2;
@@ -436,65 +456,84 @@ void Cpu_tree_backend::Leaf_remainders()
 	}
 }
 
-Ntt_tree_backend::Ntt_tree_backend(int levels, int max_bits_in_input) : Cpu_tree_backend(new Ntt_tree_products, levels, max_bits_in_input)
+bool tree_level_plan(Ntt_plan& plan, const mp_bitcnt_t* bits, size_t count, mp_bitcnt_t guard)
 {
-	transform.resize(node.size());
-	plan.resize(node.size());
-	kept.assign(node.size(), 0);
-}
-
-//The plan of the pair of nodes i, i + 1 (i odd), if their parent is large enough for the NTT: one that is valid for their product,
-//and for the middle products of the remainder tree. Those need L at least max(precision + bits of x - shift, precision) + 64 (see
-//Ntt_product::Middle_from), with precision = parent bits + guard and shift = parent bits - node bits, which is at most
-//bits_i + bits_(i+1) + guard + 64, as the parent has at most bits_i + bits_(i+1) bits.
-bool Ntt_tree_backend::Pair_plan(Ntt_plan& plan, int i)
-{
-	const mp_bitcnt_t a = node_bits[i], b = node_bits[i + 1];
-	if ((a + b + guard) / GMP_LIMB_BITS < WRAPAROUND_MIN_LIMBS)
+	mp_bitcnt_t max_pair = 0, max_node = 0;
+	for (size_t i = 0; i + 1 < count; i += 2)
+	{
+		max_pair = (bits[i] + bits[i + 1] > max_pair) ? bits[i] + bits[i + 1] : max_pair;
+		max_node = (bits[i] > max_node) ? bits[i] : max_node;
+		max_node = (bits[i + 1] > max_node) ? bits[i + 1] : max_node;
+	}
+	if (max_node < TREE_NTT_MIN_CHILD_BITS)
 	{
 		return false;
 	}
-	return ntt_plan_cyclic(plan, a + b + guard + GMP_LIMB_BITS, a + b + guard, (a > b) ? a : b) && ntt_plan_valid(plan, a, b, false);
+	return ntt_plan_cyclic(plan, max_pair + guard + GMP_LIMB_BITS, max_pair + guard, max_node);
 }
 
-void Ntt_tree_backend::Product_node(int p)
+Ntt_tree_backend::Ntt_tree_backend(int levels, int max_bits_in_input) : Cpu_tree_backend(new Ntt_tree_products, levels, max_bits_in_input)
 {
-	const int i = 2 * p + 1;
-	kept[i] = i < first_leaf && Pair_plan(plan[i], i); //The leaves are not needed in the remainder tree.
-	if (!kept[i])
-	{
-		Cpu_tree_backend::Product_node(p);
-		return;
-	}
-	ntt.Forward(transform[i], plan[i], node[i].get_mpz_t());
-	ntt.Forward(transform[i + 1], plan[i], node[i + 1].get_mpz_t());
-	work = transform[i];
-	ntt.Pointwise(work, transform[i + 1], plan[i]);
-	ntt.Product_from(node[p].get_mpz_t(), work, plan[i]);
+	transform.resize(node.size());
+	plan.resize(levels);
+	uses_ntt.assign(levels, 0);
 }
 
-void Ntt_tree_backend::Remainder_pair(int i)
+void Ntt_tree_backend::Product_level(int depth)
 {
-	const int p = (i - 1) / 2;
-	if (!kept[i])
+	const int child_depth = depth + 1;
+	const int first_child = (1 << child_depth) - 1, count = 1 << child_depth;
+	uses_ntt[child_depth] = tree_level_plan(plan[child_depth], &node_bits[first_child], count, guard);
+	if (!uses_ntt[child_depth])
 	{
-		Cpu_tree_backend::Remainder_pair(i);
+		Cpu_tree_backend::Product_level(depth);
 		return;
 	}
-	const mp_bitcnt_t precision = node_bits[p] + guard;
-	if (mpz_sgn(node[p].get_mpz_t()) == 0)
+	const Ntt_plan& p = plan[child_depth];
+	const bool keep = child_depth <= levels - 2; //The leaves are not needed in the remainder tree.
+	for (int i = first_child; i < first_child + count; i += 2)
 	{
-		node[i] = 0;
-		node[i + 1] = 0;
-		return;
+		std::vector<uint32_t>& left = keep ? transform[i] : work2;
+		std::vector<uint32_t>& right = keep ? transform[i + 1] : y_transform;
+		ntt.Forward(left, p, node[i].get_mpz_t());
+		ntt.Forward(right, p, node[i + 1].get_mpz_t());
+		work = left;
+		ntt.Pointwise(work, right, p);
+		const int parent = (i - 1) / 2;
+		ntt.Product_from(node[parent].get_mpz_t(), work, p);
+		node_bits[parent] = mpz_sizeinbase(node[parent].get_mpz_t(), 2);
 	}
-	ntt.Forward(y_transform, plan[i], node[p].get_mpz_t());
-	work = transform[i + 1];
-	ntt.Pointwise(work, y_transform, plan[i]);
-	ntt.Middle_from(pair_result[0].get_mpz_t(), work, plan[i], node_bits[p] - node_bits[i], precision);
-	work = transform[i];
-	ntt.Pointwise(work, y_transform, plan[i]);
-	ntt.Middle_from(pair_result[1].get_mpz_t(), work, plan[i], node_bits[p] - node_bits[i + 1], precision);
-	mpz_swap(node[i].get_mpz_t(), pair_result[0].get_mpz_t());
-	mpz_swap(node[i + 1].get_mpz_t(), pair_result[1].get_mpz_t());
+}
+
+void Ntt_tree_backend::Remainder_level(int depth)
+{
+	const int first = (1 << depth) - 1, count = 1 << depth;
+	for (int i = first; i < first + count; i += 2)
+	{
+		const int parent = (i - 1) / 2;
+		const mp_bitcnt_t precision = node_bits[parent] + guard;
+		if (!uses_ntt[depth])
+		{
+			Truncated_product(pair_result[0].get_mpz_t(), node[parent].get_mpz_t(), node[i + 1].get_mpz_t(), node_bits[parent] - node_bits[i], precision);
+			Truncated_product(pair_result[1].get_mpz_t(), node[parent].get_mpz_t(), node[i].get_mpz_t(), node_bits[parent] - node_bits[i + 1], precision);
+		}
+		else if (mpz_sgn(node[parent].get_mpz_t()) == 0)
+		{
+			pair_result[0] = 0;
+			pair_result[1] = 0;
+		}
+		else
+		{
+			const Ntt_plan& p = plan[depth];
+			ntt.Forward(y_transform, p, node[parent].get_mpz_t());
+			work = transform[i + 1];
+			ntt.Pointwise(work, y_transform, p);
+			ntt.Middle_from(pair_result[0].get_mpz_t(), work, p, node_bits[parent] - node_bits[i], precision);
+			work = transform[i];
+			ntt.Pointwise(work, y_transform, p);
+			ntt.Middle_from(pair_result[1].get_mpz_t(), work, p, node_bits[parent] - node_bits[i + 1], precision);
+		}
+		mpz_swap(node[i].get_mpz_t(), pair_result[0].get_mpz_t());
+		mpz_swap(node[i + 1].get_mpz_t(), pair_result[1].get_mpz_t());
+	}
 }

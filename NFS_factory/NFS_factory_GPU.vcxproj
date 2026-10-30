@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Batch_smooth.cpp" />
+    <ClCompile Include="cofactorize_siqs.c" />
+    <ClCompile Include="Fft_product.cpp" />
+    <ClCompile Include="Main.cpp" />
+    <ClCompile Include="Polynomial.cpp" />
+    <ClCompile Include="Prime_product.cpp" />
+    <ClCompile Include="Profile.cpp" />
+    <ClCompile Include="Smooth_factor.cpp" />
+    <ClCompile Include="Tree_backend.cpp" />
+    <ClCompile Include="..\int_ntt\int_ntt.cpp" />
+    <ClCompile Include="..\int_ntt\ntt_core.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="Batch_smooth.h" />
+    <ClInclude Include="cofactorize.h" />
+    <ClInclude Include="Fft_product.h" />
+    <ClInclude Include="Polynomial.h" />
+    <ClInclude Include="Prime_product.h" />
+    <ClInclude Include="Profile.h" />
+    <ClInclude Include="Smooth_factor.h" />
+    <ClInclude Include="Tree_backend.h" />
+    <ClInclude Include="..\int_ntt\arith32.h" />
+    <ClInclude Include="..\int_ntt\int_ntt.h" />
+    <ClInclude Include="..\int_ntt\ntt_core.h" />
+    <ClInclude Include="..\int_ntt\ntt_gpu.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <CudaCompile Include="Gpu_tree_backend.cu" />
+    <CudaCompile Include="..\int_ntt\ntt_gpu.cu" />
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>18.0</VCProjectVersion>
+    <ProjectGuid>{5D2F8A31-0C47-4E9B-B1A6-9E3C7F2D4B18}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>NFSfactory</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA 13.4.props" />
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros">
+    <!-- MPIR headers and libraries, see "Compiling the code.txt" -->
+    <MpirDir>$(SolutionDir)third_party\mpir\</MpirDir>
+  </PropertyGroup>
+  <PropertyGroup>
+    <TargetName>NFS_factory_gpu</TargetName>
+    <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(Platform)\$(Configuration)\GPU\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <LinkIncremental>true</LinkIncremental>
+    <IncludePath>$(MpirDir)include;$(ProjectDir)..\int_ntt;$(IncludePath)</IncludePath>
+    <LibraryPath>$(MpirDir)lib\x64\Debug;$(CudaToolkitLibDir);$(LibraryPath)</LibraryPath>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <LinkIncremental>false</LinkIncremental>
+    <IncludePath>$(MpirDir)include;$(ProjectDir)..\int_ntt;$(IncludePath)</IncludePath>
+    <LibraryPath>$(MpirDir)lib\x64\Release;$(CudaToolkitLibDir);$(LibraryPath)</LibraryPath>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>Disabled</Optimization>
+      <SDLCheck>true</SDLCheck>
+      <OpenMPSupport>true</OpenMPSupport>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;NFS_GPU</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+    </ClCompile>
+    <CudaCompile>
+      <CodeGeneration>compute_89,sm_89</CodeGeneration>
+      <Defines>_CRT_SECURE_NO_WARNINGS;NFS_GPU</Defines>
+      <Runtime>MTd</Runtime>
+      <CudaRuntime>Static</CudaRuntime>
+      <AdditionalOptions>-std=c++17 %(AdditionalOptions)</AdditionalOptions>
+    </CudaCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>mpir.lib;mpirxx.lib;cudart_static.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <OpenMPSupport>true</OpenMPSupport>
+      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;NFS_GPU</PreprocessorDefinitions>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
+    </ClCompile>
+    <CudaCompile>
+      <CodeGeneration>compute_89,sm_89</CodeGeneration>
+      <Defines>_CRT_SECURE_NO_WARNINGS;NFS_GPU</Defines>
+      <Runtime>MT</Runtime>
+      <CudaRuntime>Static</CudaRuntime>
+      <AdditionalOptions>-std=c++17 %(AdditionalOptions)</AdditionalOptions>
+    </CudaCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>mpir.lib;mpirxx.lib;cudart_static.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\CUDA 13.4.targets" />
+  </ImportGroup>
+</Project>

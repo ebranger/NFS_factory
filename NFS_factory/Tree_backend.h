@@ -11,8 +11,19 @@
 enum tree_backend_kind
 {
 	TREE_BACKEND_MPIR, //MPIR's products, with the products modulo 2^L - 1 of Fft_product.
-	TREE_BACKEND_NTT   //The integer NTT of int_ntt on the CPU, the reference for the GPU version.
+	TREE_BACKEND_NTT,  //The integer NTT of int_ntt on the CPU, the reference for the GPU version: the same numbers in every node.
+	TREE_BACKEND_GPU   //The integer NTT on the GPU (only in the GPU build).
 };
+
+#define TREE_NTT_MIN_CHILD_BITS 1024 //The NTT and GPU backends multiply the pairs of a depth of the tree with the NTT if the largest
+//node there has at least this many bits, and exactly (schoolbook on the GPU) below.
+
+//The plan of the NTT and GPU backends for the count nodes (pairs) of a depth of the tree with the given sizes. It is valid for the
+//product of each pair, and for the middle products of the remainder tree there, which need L at least
+//max(precision + bits of x - shift, precision) + 64 (see Ntt_product::Middle_from), with precision = parent bits + guard and
+//shift = parent bits - node bits: at most the bits of the pair + guard + 64, as the parent has at most the bits of the pair.
+//False if the depth uses exact products.
+bool tree_level_plan(Ntt_plan& plan, const mp_bitcnt_t* bits, size_t count, mp_bitcnt_t guard);
 
 //The batch smoothness check of the numbers N_i of a batch against a prime product P, with Bernstein's scaled remainder tree.
 //The product tree has the N_i as leaves and their product X at the root. Each node of the remainder tree then holds the
@@ -84,9 +95,12 @@ public:
 	mpz_class* Leaf_remainder(int index);
 
 protected:
-	//The product of the children of node i, and the fractions of the pair of nodes i, i + 1 from their parent's.
-	virtual void Product_node(int i);
-	virtual void Remainder_pair(int i);
+	//The products of the nodes at a depth from their children, and the fractions of the nodes at a depth from their parents'.
+	//Product_level sets the sizes in node_bits.
+	virtual void Product_level(int depth);
+	virtual void Remainder_level(int depth);
+	void Product_node(int i);
+	void Remainder_pair(int i);
 	void Barrett_reduce(mpz_ptr r, mpz_srcptr a, mpz_srcptr x, mp_bitcnt_t e, mp_bitcnt_t bits);
 	void Truncated_product(mpz_ptr result, mpz_srcptr y, mpz_srcptr x, mp_bitcnt_t shift, mp_bitcnt_t precision);
 

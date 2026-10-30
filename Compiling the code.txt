@@ -76,3 +76,16 @@ Open NFS_factory_VS2026.sln, select Release and x64, and build. The program ends
 
 Run it as:
   NFS_factory <polynomial file name> <saved relation file name> <output file name>
+
+
+5. The GPU build (optional)
+---------------------------
+
+NFS_factory_GPU.sln builds NFS_factory_gpu.exe, which does the product and remainder trees on an NVIDIA GPU. It
+needs the CUDA Toolkit 13.4 (with its Visual Studio integration, which the CUDA installer adds) and builds the same
+source files as the CPU build, plus the .cu files, with NFS_GPU defined. The project builds code for compute
+capability 8.9 (RTX 40 series); for another GPU, change CodeGeneration (compute_89,sm_89) in
+NFS_factory\NFS_factory_GPU.vcxproj. Another CUDA version needs the "CUDA 13.4" props and targets imports there
+changed to that version.
+
+The CPU build needs no CUDA. Both builds take the same polynomial and relation files and write the same relations.

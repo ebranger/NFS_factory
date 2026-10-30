@@ -21,9 +21,23 @@ The first step in using Coppersmiths factorization factory is to sieve for relat
 
 Once enough relations have been stored, it is time for NFS_factory to start working. The program is invoked from the command line taking three arguments:
 
-NFS_factory <polynomial file name> <saved relation file name> <output file name>
+NFS_factory <polynomial file name> <saved relation file name> <output file name> [-rels N]
 
 The polynomial file describes the polynomial used for the current factorization, in GGNFS format with a few extra options, detailed below. The relation file contains the NFS relations stored by the sieving procedure, and accepts either the GGNFS/msieve relation format, or a binary format I have used to save some space. The program will run until all relations in the file have been processed. All found relations are appended to the output file specified.
+
+Several relation files can be processed in one run, which sets up the prime products only once and keeps filling the same remainder tree across the files:
+
+NFS_factory <polynomial file name> -list <list file name> <output file name> [-rels N]
+
+The list file names one relation file per line (empty lines and lines starting with # are skipped), and the files are read in that order. With -rels N, the run stops once N relations have been found: it finishes the batch it is checking and the 3LP candidates found so far, so it usually finds a few more than N. Relations found by an earlier, interrupted run of the same input count towards N.
+
+After each batch, when all relations read so far are checked and written, the position is saved in <output file name>.resume: the relation file or list, the file reached, how many lines or binary relations of it are done, the relations found so far, and the size of the output file. If the run is interrupted, running it again with the same relation file or list (and output file) continues from there; relations written after the saved position are removed from the output file first, since their batch is checked again. A run that has done all its files leaves a resume file that says so; remove it to run the same input again. 3LP candidates waiting for the second stage when a run is interrupted are not saved, so their relations (about 1 % of the relations of that part of the input) are lost.
+
+At the end of a run, <output file name>.status holds a summary for scripts, one "key value" per line: found (relations found by this run), total (including earlier runs of the same input), target and target_reached, files_done and files, complete (all files done), and error (a relation file could not be read; the exit code is then -1).
+
+A typical use is a driver script that runs NFS_factory on a list of relation files with -rels set to the number of relations still needed, and then runs the filtering, linear algebra and square root. With one relation file per run instead, the driver adds up the relations found from the status files.
+
+The GPU build (NFS_factory_gpu, see "Compiling the code.txt") does the product and remainder trees on an NVIDIA GPU and is meant to be run as one process, on a list of relation files. The CPU build runs one relation file per process as before, typically as several processes in parallel.
 
 The polynomial file contains the polynomial pair and factorization parameters in a GGNFS format, and NFS_factory needs the polynomial pair, rlim/alim, lbpr/lbpa and mfbr/mfba to run. The batch smoothness checking will test the relations for all primes up to rlim/alim, and any remiainder is checked if it is a single large prime if it is less than lbpr/lbpa, or double-large prime if it is less than mfbr/mfba (or 2 lbpr/lbpa, if mfbr/mfba is larger, see "Three large primes" below). One more parameter is required to control which polynomial should be checked for smoothness. Batch smoothness checking is done on the rational side if “side: 0” is specified in the polynomial file, and on the algebraic side if “side: 1” is specified.
 
@@ -36,7 +50,7 @@ A few optional parameters can also be given in the polynomial file:
 - 3lp: auto (default) or save. Only used when mfbr/mfba is more than 2 lbpr/lbpa, see "Three large primes" below.
 - 3lpfile: the file that "3lp: save" appends the 3LP candidates to. The default is the output file name, followed by a dot, the name of the relation file and ".3lp".
 - 3lptreelevels: the maximum number of levels in the remainder tree when running on a 3LP candidate file (default 22). treelevels is not used for such runs.
-- backend: mpir (default) or ntt. How the large products of the product and remainder trees are computed: with MPIR, or with the integer number-theoretic transform in the int_ntt folder. Both give exactly the same relations. The NTT on the CPU makes a run about 2.6 times slower than MPIR, and uses more memory (it keeps the transforms of the product tree for the remainder tree); it is the reference for the GPU version.
+- backend: how the product and remainder trees are computed. mpir (the default of the CPU build) uses MPIR's products. gpu (the default of the GPU build, and only available there) uses an integer number-theoretic transform on the GPU, from the int_ntt folder. ntt uses the same transform on the CPU, and computes the same numbers as the GPU in every node of the trees; it is much slower than MPIR, and is the reference for testing the GPU version. All of them give exactly the same relations.
 
 Three large primes
 ------------------
