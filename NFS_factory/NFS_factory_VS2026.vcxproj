@@ -13,6 +13,7 @@
   <ItemGroup>
     <ClCompile Include="Batch_smooth.cpp" />
     <ClCompile Include="cofactorize_siqs.c" />
+    <ClCompile Include="Fft_product.cpp" />
     <ClCompile Include="Main.cpp" />
     <ClCompile Include="Polynomial.cpp" />
     <ClCompile Include="Prime_product.cpp" />
@@ -24,6 +25,7 @@
   <ItemGroup>
     <ClInclude Include="Batch_smooth.h" />
     <ClInclude Include="cofactorize.h" />
+    <ClInclude Include="Fft_product.h" />
     <ClInclude Include="Polynomial.h" />
     <ClInclude Include="Prime_product.h" />
     <ClInclude Include="Profile.h" />

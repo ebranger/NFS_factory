@@ -5,6 +5,7 @@
 #include <string.h>
 #include <vector>
 #include "Polynomial.h"
+#include "Fft_product.h"
 using namespace std;
 
 #define MAX_SAVED_PRIMES 64 //Most primes in the saved factor list of a relation from a binary relation file.
@@ -73,6 +74,9 @@ private:
 	Polynomial* other_poly; // NULL unless the other side's factor list should be rebuilt.
 
 	bool using_snfs_deg4_binomial;
+	bool binomial_fits; //the coefficients of the binomial fit in 63 bits, for Binomial_value_native.
+	long long binomial_c4, binomial_c0;
+	bool Binomial_value_native(mpz_ptr result, long long a, long long b);
 	long long max_batch_prime;
 
 	int one_lp_bit_limit;
@@ -95,10 +99,10 @@ private:
 	void Run_batch_check();
 	void Send_candidates();
 
-	void Middle_product(mpz_ptr result, mpz_srcptr y, mpz_srcptr x, mp_bitcnt_t shift, mp_bitcnt_t precision);
 	void Scaled_root_value(mpz_ptr root, mp_bitcnt_t precision);
-	mpz_class root_shifted, root_inverse, root_remainder, root_quotient; //temporaries for Scaled_root_value.
-	vector<mp_limb_t> wrap_buffer; //scratch space for the wraparound products.
+	void Barrett_reduce(mpz_ptr r, mpz_srcptr a, mpz_srcptr x, mp_bitcnt_t e, mp_bitcnt_t bits);
+	mpz_class root_shifted, root_inverse, root_remainder, root_quotient, root_temp, root_part; //temporaries for Scaled_root_value.
+	Cyclic_product cyclic; //wraparound products of the remainder tree.
 	mpz_class wrap_result[2];
 };
 

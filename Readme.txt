@@ -52,15 +52,15 @@ The candidate file has the binary relation format, with the remainder added to e
 The largest candidates are the least likely to be products of three primes below 2^lbpr/2^lbpa, so mfbr/mfba a few bits less than 3 lbpr/lbpa keeps most of the 3LP relations for a much smaller cost. For an SNFS-240 polynomial with lpba 29 and alim 2^29/20, a sample of 8.4 million relations gave:
 
   mfba   candidates   3LP relations   cost of 3LP (first and second stage)
-   87     508350       2543            20.1 Gcycles
-   86     452407       2533            18.5 Gcycles
-   85     399754       2493            15.1 Gcycles
-   84     350156       2377            14.2 Gcycles
-   83     303519       2151            12.1 Gcycles
+   87     508350       2543            13.1 Gcycles
+   86     452407       2533            12.5 Gcycles
+   85     399754       2493            10.3 Gcycles
+   84     350156       2377             9.4 Gcycles
+   83     303519       2151             8.6 Gcycles
    82     260064       1847
    81     219025       1428
 
-For comparison, the whole run without 3LP took about 160 Gcycles and found 19587 relations, about 8 Mcycles per relation. The last few bits cost much more than that per relation found: going from 86 to 87 bits costs more than 100 Mcycles per extra relation, and from 84 to 85 about 10 to 15 Mcycles. mfba = 3 lpba - 3 (84 for lpba 29) is a reasonable choice, or 3 lpba - 2 when more relations are worth more CPU time. Without 3LP, use mfbr/mfba = 2 lbpr/lbpa as before.
+The cost does not include setting up the prime product of the second stage, about 20 Gcycles per run whatever mfba is. For comparison, the whole run without 3LP took about 97 Gcycles and found 19587 relations, about 5 Mcycles per relation. The last few bits cost much more than that per relation found: going from 85 to 87 bits costs more than 50 Mcycles per extra relation, and from 84 to 85 about 8 Mcycles. mfba = 3 lpba - 3 (84 for lpba 29) is a reasonable choice, or 3 lpba - 2 when more relations are worth more CPU time. Without 3LP, use mfbr/mfba = 2 lbpr/lbpa as before.
 
 At the end of a run, the program prints how the time was spent on the different steps, and the peak memory use.
 

@@ -29,16 +29,8 @@ using namespace std;
 #define MAX_FACTORS_IN_RELATION 512 //Each factor is at least 2, so this is enough for any relation value of up to 512 bits.
 
 #define WRAPAROUND_MIN_LIMBS 512 //Use wraparound products in the remainder tree for nodes of at least this many limbs. Tuned on an i7-14700F.
-#define FFT_MULMOD_2EXPP1_CUTOFF 256 //From the MPIR build (gmp-mparam.h). Below this, MPIR does not use the FFT for products mod B^n + 1.
 
 static void append_prime(string& list, unsigned long long prime);
-
-//MPIR functions for multiplication modulo B^n + 1 with the FFT. They are declared in gmp-impl.h, which is not part of the installed headers.
-extern "C"
-{
-	int __gmpn_mulmod_Bexpp1_fft(mp_ptr op, mp_size_t pl, mp_srcptr n, mp_size_t nl, mp_srcptr m, mp_size_t ml);
-	mpir_si __mpir_fft_adjust_limbs(mp_size_t limbs);
-}
 
 //Initialize the batch smoothness class
 Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, int max_tree_levels, bool three_lp_stage)
@@ -80,6 +72,11 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	{
 		using_snfs_deg4_binomial = false;
 	}
+
+	//The coefficients of a binomial, for the native evaluation, if they fit in 63 bits.
+	binomial_fits = using_snfs_deg4_binomial && mpz_cmpabs_ui(poly->get_coefficient(4).get_mpz_t(), (1ULL << 63) - 1) <= 0 && mpz_cmpabs_ui(poly->get_coefficient(0).get_mpz_t(), (1ULL << 63) - 1) <= 0;
+	binomial_c4 = binomial_fits ? mpz_get_si(poly->get_coefficient(4).get_mpz_t()) : 0;
+	binomial_c0 = binomial_fits ? mpz_get_si(poly->get_coefficient(0).get_mpz_t()) : 0;
 
 	side = batch_checking_side;
 
@@ -566,6 +563,73 @@ bool Batch_smooth::check_two_lp_smooth(mpz_class& number, unsigned int index)
 	return true;
 }
 
+//|c| x^4 for |x| < 2^32 and |c| < 2^63, which is less than 2^191, as three limbs.
+static void binomial_term(unsigned long long term[3], long long c, long long x)
+{
+	unsigned long long abs_x = (unsigned long long)(x < 0 ? -x : x);
+	unsigned long long abs_c = (unsigned long long)(c < 0 ? -c : c);
+	unsigned long long square = abs_x * abs_x;
+	unsigned long long power_high;
+	unsigned long long power_low = _umul128(square, square, &power_high);
+	unsigned long long high0, high1;
+	term[0] = _umul128(power_low, abs_c, &high0);
+	unsigned long long middle = _umul128(power_high, abs_c, &high1);
+	unsigned char carry = _addcarry_u64(0, middle, high0, &term[1]);
+	_addcarry_u64(carry, high1, 0, &term[2]);
+}
+
+//The absolute value of the binomial c4 a^4 + c0 b^4 with native arithmetic. Returns false, and leaves the result alone, if the
+//coefficients or a and b are too large for it.
+bool Batch_smooth::Binomial_value_native(mpz_ptr result, long long a, long long b)
+{
+	const long long limit = 1LL << 32;
+	if (!binomial_fits || a <= -limit || a >= limit || b <= -limit || b >= limit)
+	{
+		return false;
+	}
+
+	unsigned long long term4[3], term0[3], value[3];
+	binomial_term(term4, binomial_c4, a);
+	binomial_term(term0, binomial_c0, b);
+
+	if ((binomial_c4 < 0) == (binomial_c0 < 0))
+	{
+		unsigned char carry = _addcarry_u64(0, term4[0], term0[0], &value[0]);
+		carry = _addcarry_u64(carry, term4[1], term0[1], &value[1]);
+		_addcarry_u64(carry, term4[2], term0[2], &value[2]);
+	}
+	else
+	{
+		//The difference of the terms, the smaller from the larger.
+		unsigned long long* larger = term4;
+		unsigned long long* smaller = term0;
+		if (term0[2] > term4[2] || (term0[2] == term4[2] && (term0[1] > term4[1] || (term0[1] == term4[1] && term0[0] > term4[0]))))
+		{
+			larger = term0;
+			smaller = term4;
+		}
+		unsigned char borrow = _subborrow_u64(0, larger[0], smaller[0], &value[0]);
+		borrow = _subborrow_u64(borrow, larger[1], smaller[1], &value[1]);
+		_subborrow_u64(borrow, larger[2], smaller[2], &value[2]);
+	}
+
+	if (result->_mp_alloc < 3)
+	{
+		mpz_realloc2(result, 3 * GMP_LIMB_BITS);
+	}
+	int size = 3;
+	while (size > 0 && value[size - 1] == 0)
+	{
+		size--;
+	}
+	for (int i = 0; i < size; i++)
+	{
+		result->_mp_d[i] = value[i];
+	}
+	result->_mp_size = size;
+	return true;
+}
+
 //Check the relations added so far. The time of the 3LP second stage is counted as one phase of the profile, with its phases kept separately.
 void Batch_smooth::Do_batch_check()
 {
@@ -610,7 +674,10 @@ void Batch_smooth::Run_batch_check()
 		//use different poly evaluation if polynomial has form k*x^4+l which is faster.
 		if (using_snfs_deg4_binomial)
 		{
-			poly->evaluate_binomial_polynomial_homogeneous_SNFS_deg4(inputs[start_entry + index], a_vals[index], b_vals[index], temp_number);
+			if (!Binomial_value_native(inputs[start_entry + index]->get_mpz_t(), a_vals[index], b_vals[index]))
+			{
+				poly->evaluate_binomial_polynomial_homogeneous_SNFS_deg4(inputs[start_entry + index], a_vals[index], b_vals[index], temp_number);
+			}
 		}
 		else
 		{
@@ -675,8 +742,8 @@ void Batch_smooth::Run_batch_check()
 			if ((parent_bits + guard) / GMP_LIMB_BITS >= WRAPAROUND_MIN_LIMBS)
 			{
 				//Large numbers: only the middle part of the products is needed, which is faster to get with a wraparound product.
-				Middle_product(wrap_result[0].get_mpz_t(), inputs[(i - 1) / 2]->get_mpz_t(), inputs[i + 1]->get_mpz_t(), parent_bits - product_bits[i], parent_bits + guard);
-				Middle_product(wrap_result[1].get_mpz_t(), inputs[(i - 1) / 2]->get_mpz_t(), inputs[i]->get_mpz_t(), parent_bits - product_bits[i + 1], parent_bits + guard);
+				cyclic.Middle_product_pair(wrap_result[0].get_mpz_t(), wrap_result[1].get_mpz_t(), inputs[(i - 1) / 2]->get_mpz_t(), inputs[i + 1]->get_mpz_t(), inputs[i]->get_mpz_t(),
+					parent_bits - product_bits[i], parent_bits - product_bits[i + 1], parent_bits + guard);
 				mpz_swap(inputs[i]->get_mpz_t(), wrap_result[0].get_mpz_t());
 				mpz_swap(inputs[i + 1]->get_mpz_t(), wrap_result[1].get_mpz_t());
 				continue;
@@ -802,6 +869,66 @@ void Batch_smooth::Run_batch_check()
 	return;
 }
 
+//result = the bits of a from position up to position + count, as a number.
+static void bits_of(mpz_ptr result, mpz_srcptr a, mp_bitcnt_t position, mp_bitcnt_t count)
+{
+	mp_size_t a_limbs = abs(a->_mp_size);
+	mp_size_t first = (mp_size_t)(position / GMP_LIMB_BITS);
+	if (count == 0 || first >= a_limbs)
+	{
+		mpz_set_ui(result, 0);
+		return;
+	}
+
+	mp_size_t out_limbs = (mp_size_t)((count + GMP_LIMB_BITS - 1) / GMP_LIMB_BITS);
+	mp_size_t source_limbs = min(out_limbs + 1, a_limbs - first);
+	if (result->_mp_alloc < source_limbs)
+	{
+		mpz_realloc2(result, source_limbs * GMP_LIMB_BITS);
+	}
+
+	if (position % GMP_LIMB_BITS != 0)
+	{
+		mpn_rshift(result->_mp_d, a->_mp_d + first, source_limbs, (unsigned int)(position % GMP_LIMB_BITS));
+	}
+	else
+	{
+		mpn_copyi(result->_mp_d, a->_mp_d + first, source_limbs);
+	}
+
+	out_limbs = min(out_limbs, source_limbs);
+	if (count % GMP_LIMB_BITS != 0 && out_limbs == (mp_size_t)((count + GMP_LIMB_BITS - 1) / GMP_LIMB_BITS))
+	{
+		result->_mp_d[out_limbs - 1] &= (((mp_limb_t)1) << (count % GMP_LIMB_BITS)) - 1;
+	}
+	while (out_limbs > 0 && result->_mp_d[out_limbs - 1] == 0)
+	{
+		out_limbs--;
+	}
+	result->_mp_size = (int)out_limbs;
+}
+
+//result = a modulo 2^L - 1, from 0 to 2^L - 2. temp is used as scratch space.
+static void mod_2expm1(mpz_ptr result, mpz_srcptr a, mp_bitcnt_t L, mpz_ptr temp)
+{
+	mpz_set(result, a);
+	while (mpz_sizeinbase(result, 2) > L)
+	{
+		mpz_tdiv_q_2exp(temp, result, L);
+		mpz_tdiv_r_2exp(result, result, L);
+		mpz_add(result, result, temp);
+	}
+	mpz_add_ui(result, result, 1);
+	if (mpz_sizeinbase(result, 2) > L)
+	{
+		mpz_set_ui(result, 0);
+	}
+	else
+	{
+		mpz_sub_ui(result, result, 1);
+	}
+}
+
 //Replace the root of the product tree X by the root of the scaled remainder tree, floor((P mod X) * 2^precision / X),
 //where P is the prime product. One inverse of X is computed and used both for P mod X (Barrett reduction) and for the
 //scaling, which is faster than two divisions that each compute an inverse. The result can be one too small, which the
@@ -812,45 +939,37 @@ void Batch_smooth::Scaled_root_value(mpz_ptr root, mp_bitcnt_t precision)
 	mp_size_t limbs = abs(root->_mp_size);
 	mp_bitcnt_t normalize = limbs * GMP_LIMB_BITS - bits;
 
-	//V = B^(limbs + 1) + I is the inverse of the root shifted to fill limbs + 1 limbs, so that root * V < 2^E <= root * (V + 1)
-	//with E = 128 * limbs + 64 - normalize. The extra limb makes the scaling below accurate to less than one unit.
+	//V is the inverse of the root shifted to fill limbs + 1 limbs, root * V < 2^e, and at most INVERSE_MAX_ERROR less than
+	//2^e / root, with e = 128 * limbs + 64 - normalize. The extra limb makes the scaling below accurate to less than one unit.
 	mpz_mul_2exp(root_shifted.get_mpz_t(), root, normalize + GMP_LIMB_BITS);
 	mpz_ptr v = root_inverse.get_mpz_t();
-	if (v->_mp_alloc < limbs + 2)
-	{
-		mpz_realloc2(v, (limbs + 2) * GMP_LIMB_BITS);
-	}
-	mpn_invert(v->_mp_d, root_shifted.get_mpz_t()->_mp_d, limbs + 1);
-	v->_mp_d[limbs + 1] = 1;
-	v->_mp_size = (int)(limbs + 2);
+	cyclic.Inverse(v, root_shifted.get_mpz_t());
 	mp_bitcnt_t e = 128 * limbs + GMP_LIMB_BITS - normalize;
 
-	//r = P mod X. Barrett reduction needs P < 2^(2 * bits), which the choice of tree size gives, otherwise divide.
+	//r = P mod X. Barrett reduction works for numbers less than 2^(2 * bits), which the choice of tree size gives. A larger prime
+	//product, as in the second stage when its tree is not full, is reduced one part at a time from the top: the remainder so far,
+	//followed by the next bits - 1 bits of P, is less than 2^(2 * bits - 1).
 	mpz_ptr r = root_remainder.get_mpz_t();
-	mp_bitcnt_t product_size = mpz_sizeinbase(prime_product->get_mpz_t(), 2);
+	mpz_srcptr p = prime_product->get_mpz_t();
+	mp_bitcnt_t product_size = mpz_sizeinbase(p, 2);
 
-	if (product_size < bits)
+	if (product_size <= 2 * bits)
 	{
-		mpz_set(r, prime_product->get_mpz_t());
-	}
-	else if (product_size <= 2 * bits)
-	{
-		//mu = floor(2^(2 * bits) / X), or one less. The quotient estimate is then at most 3 too small.
-		mpz_ptr q = root_quotient.get_mpz_t();
-		mpz_tdiv_q_2exp(q, v, e - 2 * bits);
-		mpz_tdiv_q_2exp(r, prime_product->get_mpz_t(), bits - 1);
-		mpz_mul(q, q, r);
-		mpz_tdiv_q_2exp(q, q, bits + 1);
-		mpz_mul(q, q, root);
-		mpz_sub(r, prime_product->get_mpz_t(), q);
-		while (mpz_cmp(r, root) >= 0)
-		{
-			mpz_sub(r, r, root);
-		}
+		Barrett_reduce(r, p, root, e, bits);
 	}
 	else
 	{
-		mpz_tdiv_r(r, prime_product->get_mpz_t(), root);
+		mp_bitcnt_t position = product_size;
+		mpz_set_ui(r, 0);
+		while (position > 0)
+		{
+			mp_bitcnt_t part = (position > bits - 1) ? bits - 1 : position;
+			position -= part;
+			bits_of(root_part.get_mpz_t(), p, position, part);
+			mpz_mul_2exp(r, r, part);
+			mpz_add(r, r, root_part.get_mpz_t());
+			Barrett_reduce(r, r, root, e, bits);
+		}
 	}
 
 	//floor(r * 2^precision / X) = floor(r * V / 2^(e - precision)), or one less.
@@ -858,63 +977,44 @@ void Batch_smooth::Scaled_root_value(mpz_ptr root, mp_bitcnt_t precision)
 	mpz_tdiv_q_2exp(root, root, e - precision);
 }
 
-//Compute the bits from shift up to precision of (y * x) mod 2^precision, i.e. (y * x mod 2^precision) >> shift.
-//y must be less than 2^precision, and x less than 2^(shift + 1).
-//The product is computed modulo B^n + 1, with n a little more than precision bits, using the FFT of MPIR. That is
-//cheaper than the full product. The part of the product above B^n wraps around and is subtracted from the low bits,
-//below the bits that are needed, so the result can be one too small. The guard bits of the scaled remainder tree
-//absorb such errors, just as they absorb the truncation errors of the shifts.
-void Batch_smooth::Middle_product(mpz_ptr result, mpz_srcptr y, mpz_srcptr x, mp_bitcnt_t shift, mp_bitcnt_t precision)
+//r = a mod x, for a less than 2^(2 * bits), with x of bits bits and its inverse V from Scaled_root_value (root_inverse), so that
+//x * V < 2^e. r can be a.
+void Batch_smooth::Barrett_reduce(mpz_ptr r, mpz_srcptr a, mpz_srcptr x, mp_bitcnt_t e, mp_bitcnt_t bits)
 {
-	mp_size_t limbs = (mp_size_t)((precision + 2 * GMP_LIMB_BITS - 1) / GMP_LIMB_BITS); //at least 64 bits more than precision.
-	if (limbs >= FFT_MULMOD_2EXPP1_CUTOFF)
+	mp_bitcnt_t a_size = mpz_sizeinbase(a, 2);
+	if (a_size < bits)
 	{
-		limbs = (mp_size_t)__mpir_fft_adjust_limbs(limbs);
-	}
-
-	if (wrap_buffer.size() < (size_t)limbs + 1)
-	{
-		wrap_buffer.resize(limbs + 1);
-	}
-	mp_ptr product = wrap_buffer.data();
-
-	if (__gmpn_mulmod_Bexpp1_fft(product, limbs, y->_mp_d, abs(y->_mp_size), x->_mp_d, abs(x->_mp_size)) != 0)
-	{
-		//The product is B^n, i.e. -1 mod B^n + 1, which only happens if the needed bits are all zero.
-		mpz_set_ui(result, 0);
+		mpz_set(r, a);
 		return;
 	}
 
-	//Shift down the needed bits.
-	mp_bitcnt_t out_bits = precision - shift;
-	mp_size_t out_limbs = (mp_size_t)((out_bits + GMP_LIMB_BITS - 1) / GMP_LIMB_BITS);
-	mp_size_t first_limb = (mp_size_t)(shift / GMP_LIMB_BITS);
-	mp_size_t source_limbs = (mp_size_t)((precision + GMP_LIMB_BITS - 1) / GMP_LIMB_BITS) - first_limb;
+	//mu = floor(2^(2 * bits) / x), or up to two less, without the bits that do not matter for the quotient. The quotient has
+	//at most quotient_bits bits, and the bits of mu more than 64 below that change the estimate by less than one.
+	//The quotient estimate is then at most 5 too small.
+	mpz_ptr q = root_quotient.get_mpz_t();
+	mpz_ptr t = root_temp.get_mpz_t();
+	mp_bitcnt_t quotient_bits = a_size - bits + 1;
+	mp_bitcnt_t cut = (bits > quotient_bits + GMP_LIMB_BITS) ? bits - quotient_bits - GMP_LIMB_BITS : 0;
+	mpz_tdiv_q_2exp(q, root_inverse.get_mpz_t(), e - 2 * bits + cut);
+	mpz_tdiv_q_2exp(t, a, bits - 1);
+	mpz_mul(q, q, t);
+	mpz_tdiv_q_2exp(q, q, bits + 1 - cut);
 
-	if (result->_mp_alloc < source_limbs)
+	//r = a - q x is less than 6 x, so it can be computed modulo 2^L - 1 > 6 x, which only needs q x modulo 2^L - 1.
+	mp_bitcnt_t L = cyclic.Product_mod(q, q, x, bits + 3);
+	mod_2expm1(t, a, L, root_part.get_mpz_t());
+	mpz_sub(r, t, q);
+	if (mpz_sgn(r) < 0)
 	{
-		mpz_realloc2(result, source_limbs * GMP_LIMB_BITS);
+		mpz_set_ui(q, 0);
+		mpz_setbit(q, L);
+		mpz_sub_ui(q, q, 1);
+		mpz_add(r, r, q);
 	}
-
-	if (shift % GMP_LIMB_BITS != 0)
+	while (mpz_cmp(r, x) >= 0)
 	{
-		mpn_rshift(result->_mp_d, product + first_limb, source_limbs, (unsigned int)(shift % GMP_LIMB_BITS));
+		mpz_sub(r, r, x);
 	}
-	else
-	{
-		mpn_copyi(result->_mp_d, product + first_limb, source_limbs);
-	}
-
-	if (out_bits % GMP_LIMB_BITS != 0)
-	{
-		result->_mp_d[out_limbs - 1] &= (((mp_limb_t)1) << (out_bits % GMP_LIMB_BITS)) - 1;
-	}
-
-	while (out_limbs > 0 && result->_mp_d[out_limbs - 1] == 0)
-	{
-		out_limbs--;
-	}
-	result->_mp_size = (int)out_limbs;
 }
 
 //Append a prime to a comma separated list of hexadecimal primes.
