@@ -112,8 +112,6 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 
 	Setup_memory(tree_size, max_bits_in_input, backend);
 
-	relation_factor_list = new unsigned int[MAX_FACTORS_IN_RELATION]; //Small primes are stored with multiplicity, so this needs room for many factors.
-	other_side_factor_list = new unsigned int[MAX_FACTORS_IN_RELATION];
 
 	factor1 = new mpz_class;
 	factor2 = new mpz_class;
@@ -152,8 +150,6 @@ Batch_smooth::~Batch_smooth(void)
 	delete[] is_smooth;
 	delete[] lp1;
 	delete[] lp2;
-	delete[] relation_factor_list;
-	delete[] other_side_factor_list;
 	delete factor1;
 	delete factor2;
 }
@@ -774,6 +770,7 @@ bool Batch_smooth::Complete_other_side(int index, string& list)
 	//Factor whatever is left, which also finds any higher multiplicities of the listed primes.
 	if (norm > 1)
 	{
+		unsigned int other_side_factor_list[MAX_FACTORS_IN_RELATION];
 		int num_other_factors = factor_general(other_side_factor_list, norm.get_mpz_t(), MAX_FACTORS_IN_RELATION);
 
 		if (num_other_factors < 0)
@@ -798,35 +795,143 @@ bool Batch_smooth::Complete_other_side(int index, string& list)
 }
 
 //Complete_other_side, with the time counted in the profile.
-bool Batch_smooth::Timed_complete_other_side(int index, string& list)
+//For each relation passing the batch smoothnes checking, complete the relation and print it.
+//The output line of a relation found smooth: the checked side is factored (its large primes are known), and the factor list of
+//the other side is the saved one, or rebuilt from its norm. Thread safe.
+Batch_smooth::relation_status Batch_smooth::Format_relation(int index, string& relation_text)
 {
-	unsigned long long t = profile_now();
-	bool result = Complete_other_side(index, list);
-	profile_add(PROF_OTHER_SIDE, t);
-	return result;
+	mpz_class value = *tree->Leaf(index);
+	mpz_class temp;
+	unsigned int large[MAX_COFACTOR_PRIMES];
+	unsigned int factors[MAX_FACTORS_IN_RELATION];
+	int num_factors = 0;
+	int num_large = 0;
+	string checked_side_list; //factors of the relation value that was batch checked.
+	string other_side_list; //factors of the other side, as saved or rebuilt.
+
+	//negative values are handled by msieve, ignore here.
+	if (value < 0)
+	{
+		value = -value;
+	}
+
+	//factor the relation. First, divide out the large primes, which are printed first.
+	if (three_lp_stage)
+	{
+		//The value is the cofactor from the first stage, and all its primes are below 2^lbp. Those are the large primes,
+		//and the rest of the polynomial value is factored as for other relations.
+		num_large = factor_smooth(large, value.get_mpz_t(), MAX_COFACTOR_PRIMES);
+		poly->evaluate_polynomial_homogenous(&temp, a_vals[index], b_vals[index]);
+		mpz_abs(temp.get_mpz_t(), temp.get_mpz_t());
+
+		if (num_large < 0 || temp == 0 || !mpz_divisible_p(temp.get_mpz_t(), value.get_mpz_t()))
+		{
+			num_factors = -1;
+		}
+		else
+		{
+			mpz_divexact(value.get_mpz_t(), temp.get_mpz_t(), value.get_mpz_t());
+		}
+	}
+	else
+	{
+		if (lp1[index] > 1)
+		{
+			large[num_large++] = (unsigned int)lp1[index];
+			mpz_divexact_ui(value.get_mpz_t(), value.get_mpz_t(), lp1[index]);
+		}
+
+		if (lp2[index] > 1)
+		{
+			large[num_large++] = (unsigned int)lp2[index];
+			mpz_divexact_ui(value.get_mpz_t(), value.get_mpz_t(), lp2[index]);
+		}
+	}
+
+	//run Pollard rho factoring on the remaining part of the relation. Since it is smooth Pollard rho should be a decent choice.
+	if (num_factors == 0 && value > 1)
+	{
+		num_factors = factor_general(factors, value.get_mpz_t(), MAX_FACTORS_IN_RELATION);
+	}
+
+	if (num_factors < 0)
+	{
+		//Typically: one factor is too big for an uint32. An incomplete relation is useless, so skip it.
+		return RELATION_FACTORING_FAILED;
+	}
+	if (other_poly != NULL)
+	{
+		if (!Complete_other_side(index, other_side_list))
+		{
+			return RELATION_OTHER_SIDE_FAILED;
+		}
+	}
+	else
+	{
+		Get_saved_list(index, other_side_list);
+	}
+
+	//The factor list for the batch checked side: large primes first, then the other factors.
+	for (int j = 0; j < num_large; j++)
+	{
+		if (large[j] >= (unsigned int)min_saved_prime_limit)
+		{
+			append_prime(checked_side_list, large[j]);
+		}
+	}
+
+	for (int j = 0; j < num_factors; j++)
+	{
+		if (factors[j] >= (unsigned int)min_saved_prime_limit)
+		{
+			append_prime(checked_side_list, factors[j]);
+		}
+	}
+
+	//The relation is a,b:rational factors:algebraic factors
+	char ab_text[50];
+	sprintf(ab_text, "%lld,%lld:", a_vals[index], b_vals[index]);
+	relation_text = ab_text;
+
+	if (side == 0)
+	{
+		//rational factors were just found, the algebraic ones were saved.
+		relation_text += checked_side_list;
+		relation_text += ':';
+		relation_text += other_side_list;
+	}
+	else
+	{
+		//algebraic factors were just found, the rational ones were saved.
+		relation_text += other_side_list;
+		relation_text += ':';
+		relation_text += checked_side_list;
+	}
+
+	relation_text += '\n';
+	return RELATION_WRITTEN;
 }
 
-//For each relation passing the batch smoothnes checking, complete the relation and print it.
+//Write the relations of the batch that were found smooth to the output file, factored by the threads (with the threads option),
+//and written in their order in the batch.
 void Batch_smooth::Output_solutions()
 {
-	//Print all found relations to file
-	int limit;
-	limit = (1 << (tree_size - 1)) - 1;
-	int index;
-
-	string checked_side_list; //factors of the relation value that was batch checked.
-	string other_side_list; //factors of the other side, if it is rebuilt.
-	string relation_text;
-	char ab_text[50];
-
 	int num_good = 0;
+	unsigned long long t = profile_now();
 
-	unsigned long long t_start = profile_now();
-	unsigned long long factor_start = profile_cycles[PROF_FACTOR] + profile_cycles[PROF_OTHER_SIDE];
+	relation_texts.resize(num_relations_per_batch);
+	relation_result.resize(num_relations_per_batch);
+#pragma omp parallel for schedule(dynamic, 16)
+	for (int index = 0; index < entries; index++)
+	{
+		if (is_smooth[index])
+		{
+			relation_result[index] = (unsigned char)Format_relation(index, relation_texts[index]);
+		}
+	}
+	t = profile_add(PROF_FACTOR, t);
 
-	FILE* outfile;
-
-	outfile = fopen(save_filename.c_str(), "a");
+	FILE* outfile = fopen(save_filename.c_str(), "a");
 
 	if (outfile == NULL)
 	{
@@ -834,127 +939,23 @@ void Batch_smooth::Output_solutions()
 		return;
 	}
 
-	for (int i = limit; i <= 2 * limit; i++)
+	for (int index = 0; index < num_relations_per_batch; index++)
 	{
-		index = i - limit;
-
 		//If the relation passed the smoothness test, and has been checked.
 		if (index < entries && is_smooth[index])
 		{
-			relation_value = tree->Leaf(index);
-
-			//negative values are handled by msieve, ignore here.
-			if (*relation_value < 0)
+			if (relation_result[index] == RELATION_FACTORING_FAILED)
 			{
-				*relation_value = *relation_value * -1;
-			}
-
-			//factor the relation. First, divide out the large primes, which are printed first.
-			num_factors = 0;
-			num_large_primes = 0;
-
-			if (three_lp_stage)
-			{
-				//The value is the cofactor from the first stage, and all its primes are below 2^lbp. Those are the large primes,
-				//and the rest of the polynomial value is factored as for other relations.
-				unsigned long long tf = profile_now();
-				num_large_primes = factor_smooth(large_primes, relation_value->get_mpz_t(), MAX_COFACTOR_PRIMES);
-				poly->evaluate_polynomial_homogenous(temp_number, a_vals[index], b_vals[index]);
-				mpz_abs(temp_number->get_mpz_t(), temp_number->get_mpz_t());
-
-				if (num_large_primes < 0 || *temp_number == 0 || !mpz_divisible_p(temp_number->get_mpz_t(), relation_value->get_mpz_t()))
-				{
-					num_factors = -1;
-				}
-				else
-				{
-					mpz_divexact(relation_value->get_mpz_t(), temp_number->get_mpz_t(), relation_value->get_mpz_t());
-				}
-				profile_add(PROF_FACTOR, tf);
-			}
-			else
-			{
-				if (lp1[index] > 1)
-				{
-					large_primes[num_large_primes++] = (unsigned int)lp1[index];
-					mpz_divexact_ui(relation_value->get_mpz_t(), relation_value->get_mpz_t(), lp1[index]);
-				}
-
-				if (lp2[index] > 1)
-				{
-					large_primes[num_large_primes++] = (unsigned int)lp2[index];
-					mpz_divexact_ui(relation_value->get_mpz_t(), relation_value->get_mpz_t(), lp2[index]);
-				}
-			}
-
-			//run Pollard rho factoring on the remaining part of the relation. Since it is smooth Pollard rho should be a decent choice.
-			if (num_factors == 0 && *relation_value > 1)
-			{
-				unsigned long long tf = profile_now();
-				num_factors = factor_general(relation_factor_list, relation_value->get_mpz_t(), MAX_FACTORS_IN_RELATION);
-				profile_add(PROF_FACTOR, tf);
-			}
-
-			if (num_factors < 0)
-			{
-				//Typically: one factor is too big for an uint32. An incomplete relation is useless, so skip it.
 				num_factoring_failures++;
 			}
-			else if (other_poly != NULL && !Timed_complete_other_side(index, other_side_list))
+			else if (relation_result[index] == RELATION_OTHER_SIDE_FAILED)
 			{
 				num_other_side_failures++;
 			}
 			else
 			{
-				if (other_poly == NULL)
-				{
-					Get_saved_list(index, other_side_list);
-				}
-				const string& saved_list = other_side_list;
-
-				//The factor list for the batch checked side: large primes first, then the other factors.
-				checked_side_list.clear();
-
-				for (int j = 0; j < num_large_primes; j++)
-				{
-					if (large_primes[j] >= (unsigned int)min_saved_prime_limit)
-					{
-						append_prime(checked_side_list, large_primes[j]);
-					}
-				}
-
-				for (int j = 0; j < num_factors; j++)
-				{
-					if (relation_factor_list[j] >= (unsigned int)min_saved_prime_limit)
-					{
-						append_prime(checked_side_list, relation_factor_list[j]);
-					}
-				}
-
-				//The relation is a,b:rational factors:algebraic factors
-				sprintf(ab_text, "%lld,%lld:", a_vals[index], b_vals[index]);
-				relation_text = ab_text;
-
-				if (side == 0)
-				{
-					//rational factors were just found, the algebraic ones were saved.
-					relation_text += checked_side_list;
-					relation_text += ':';
-					relation_text += saved_list;
-				}
-				else
-				{
-					//algebraic factors were just found, the rational ones were saved.
-					relation_text += saved_list;
-					relation_text += ':';
-					relation_text += checked_side_list;
-				}
-
-				relation_text += '\n';
-
 				//print the found relation
-				fputs(relation_text.c_str(), outfile);
-
+				fputs(relation_texts[index].c_str(), outfile);
 				num_good++;
 			}
 		}
@@ -970,8 +971,7 @@ void Batch_smooth::Output_solutions()
 
 	fclose(outfile);
 
-	profile_add(PROF_WRITE, t_start);
-	profile_cycles[PROF_WRITE] -= profile_cycles[PROF_FACTOR] + profile_cycles[PROF_OTHER_SIDE] - factor_start; //factoring is counted separately.
+	profile_add(PROF_WRITE, t);
 
 	if (three_lp_stage)
 	{

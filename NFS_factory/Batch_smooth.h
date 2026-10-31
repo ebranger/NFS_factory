@@ -44,22 +44,19 @@ private:
 	void Get_saved_list(int index, string& list);
 	void Get_saved_primes(int index, vector<unsigned long long>& primes);
 	mpz_class* temp_number;
-	mpz_class* relation_value;
 
-	int num_factors;
-	unsigned int* relation_factor_list; //for Pollard rho factoring of the found relations.
-	unsigned int* other_side_factor_list; //for factoring the norm of the other side, when rebuilding its factor list.
 	unsigned long long* lp1;
 	unsigned long long* lp2;
-	unsigned int large_primes[MAX_COFACTOR_PRIMES]; //the large primes of the relation being printed.
-	int num_large_primes;
 
 	void Setup_prime_product(long long smooth_bound);
 	void Setup_memory(int tree_levels, int max_bits_in_input, tree_backend_kind backend);
 
 	void Output_solutions();
+	enum relation_status { RELATION_WRITTEN, RELATION_FACTORING_FAILED, RELATION_OTHER_SIDE_FAILED };
+	relation_status Format_relation(int index, string& relation_text);
+	vector<string> relation_texts;
+	vector<unsigned char> relation_result;
 	bool Complete_other_side(int index, string& list);
-	bool Timed_complete_other_side(int index, string& list);
 
 	string save_filename;
 	int tree_size;

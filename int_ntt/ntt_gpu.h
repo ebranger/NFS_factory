@@ -83,5 +83,7 @@ private:
 	void* table_memory;
 	uint64_t* scratch;
 	size_t scratch_limbs;
+	uint8_t* carry_scratch; //the carry functions of the limbs and chunks of Combine
+	size_t carry_bytes;
 	void Reserve_scratch(size_t limbs);
 };
