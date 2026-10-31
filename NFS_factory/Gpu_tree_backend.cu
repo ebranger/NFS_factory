@@ -2633,7 +2633,7 @@ int gpu_pipeline(int levels, int max_bits_in_input)
 	{
 		printf("GPU: %.1f GB free may not be enough for a tree of about %.2f GB; treelevels in the polynomial file can make it smaller.\n", free_bytes / 1e9, tree_bytes / 1e9);
 	}
-	trees = (trees < 1) ? 1 : ((trees > 5) ? 5 : trees);
+	trees = (trees < 1) ? 1 : ((trees > 6) ? 6 : trees); //6: four trees on the GPU at once, with a batch being read and one checked
 	printf("GPU: %.1f of %.1f GB free, about %.2f GB per tree: %d batches in progress at once.\n", free_bytes / 1e9, total_bytes / 1e9, tree_bytes / 1e9, trees);
 	return trees;
 }

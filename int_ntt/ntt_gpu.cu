@@ -1090,6 +1090,199 @@ __global__ void __launch_bounds__(COMBINE_THREADS) k_carry(size_t n, size_t chun
 	}
 }
 
+//The combine of short rows, of at most COMBINE_ROW_LIMBS limbs, in one kernel instead of k_combine_limbs and k_carry, whose blocks
+//of COMBINE_CHUNK limbs would be mostly idle on them: S threads per row (a power of 2, at least a warp, COMBINE_ITEMS limbs each),
+//and rows_per_block rows per block. Each row has its coefficients by the CRT in shared memory, its carries by a scan within its
+//threads, and the finish of combine_finish, by its first thread for a cyclic product. The results are those of k_combine_limbs
+//and k_carry.
+constexpr size_t COMBINE_ROW_LIMBS = (size_t)COMBINE_THREADS / 2 * COMBINE_ITEMS;
+
+//The exclusive scan of the carry functions within the segments of S threads of the block (S a power of 2, at most the block):
+//each thread gets the composition of the carry functions of the threads before it in its segment.
+__device__ uint32_t segment_exclusive_carry_scan(uint32_t f, uint32_t* scan, int S)
+{
+	const int tid = threadIdx.x, lane = tid & (S - 1);
+	scan[tid] = f;
+	__syncthreads();
+	for (int offset = 1; offset < S; offset *= 2)
+	{
+		uint32_t v = (lane >= offset) ? carry_compose(scan[tid - offset], scan[tid]) : scan[tid];
+		__syncthreads();
+		scan[tid] = v;
+		__syncthreads();
+	}
+	return (lane > 0) ? scan[tid - 1] : CARRY_IDENTITY;
+}
+
+template <int P>
+__global__ void __launch_bounds__(COMBINE_THREADS) k_combine_rows(const uint32_t* __restrict__ X, size_t rows, Gpu_ntt_tables t, int logT, int b, int S,
+	int rows_per_block, int cyclic, uint64_t* __restrict__ out, size_t stride, uint32_t* __restrict__ out_size)
+{
+	__shared__ uint32_t scan[COMBINE_THREADS];
+	__shared__ unsigned int row_top[COMBINE_THREADS / 32];
+	extern __shared__ uint32_t coefficient_words[];
+	const size_t T = (size_t)1 << logT;
+	const size_t n_out = combine_limbs(logT, b);
+	const int seg = threadIdx.x / S, lane = threadIdx.x & (S - 1);
+	const size_t row = (size_t)blockIdx.x * rows_per_block + seg;
+	const bool active = seg < rows_per_block && row < rows;
+	uint32_t* words = coefficient_words + (size_t)seg * T * 5;
+	if (lane == 0)
+	{
+		row_top[seg] = 0;
+	}
+	if (active)
+	{
+		for (size_t k = lane; k < T; k += S)
+		{
+			crt_coefficient<P>(X, rows, logT, row, k, t, words + 5 * k);
+		}
+	}
+	__syncthreads();
+	auto coefficient = [&](long long k, uint64_t v[3])
+	{
+		const uint32_t* w = words + 5 * k;
+		v[0] = w[0] | ((uint64_t)w[1] << 32);
+		v[1] = w[2] | ((uint64_t)w[3] << 32);
+		v[2] = w[4];
+	};
+
+	//The limb sums and their carry functions, as k_combine_limbs.
+	uint64_t* o = out + row * stride;
+	const size_t j0 = (size_t)lane * COMBINE_ITEMS;
+	uint64_t s[COMBINE_ITEMS];
+	uint32_t f[COMBINE_ITEMS];
+	uint32_t composed = CARRY_IDENTITY;
+	uint64_t lo, prev_hi = 0;
+	if (active && j0 > 0 && j0 - 1 < n_out)
+	{
+		limb_sum(coefficient, T, b, j0 - 1, lo, prev_hi);
+	}
+#pragma unroll
+	for (int it = 0; it < COMBINE_ITEMS; it++)
+	{
+		const size_t j = j0 + it;
+		s[it] = 0;
+		f[it] = CARRY_IDENTITY;
+		if (active && j < n_out)
+		{
+			uint64_t hi;
+			limb_sum(coefficient, T, b, j, lo, hi);
+			s[it] = lo + prev_hi;
+			const uint32_t g = (s[it] < lo);
+			f[it] = g | ((g | (s[it] == ~0ULL ? 1u : 0u)) << 1);
+			prev_hi = hi;
+		}
+		composed = carry_compose(composed, f[it]);
+	}
+
+	//The carries, as k_carry.
+	const uint32_t prefix = segment_exclusive_carry_scan(composed, scan, S);
+	uint32_t carry = carry_apply(prefix, 0);
+	unsigned int top = 0;
+#pragma unroll
+	for (int it = 0; it < COMBINE_ITEMS; it++)
+	{
+		const size_t j = j0 + it;
+		if (active && j < n_out)
+		{
+			s[it] += carry;
+			o[j] = s[it];
+			carry = carry_apply(f[it], carry);
+			top = (s[it] != 0) ? (unsigned int)(j + 1) : top;
+		}
+	}
+	for (size_t j = n_out + lane; j < stride; j += S)
+	{
+		if (active)
+		{
+			o[j] = 0;
+		}
+	}
+	if (!cyclic)
+	{
+		if (top != 0)
+		{
+			atomicMax(row_top + seg, top);
+		}
+		__syncthreads();
+		if (active && lane == 0)
+		{
+			out_size[row] = row_top[seg];
+		}
+		return;
+	}
+
+	//The finish of a cyclic product, as combine_finish, by the first thread of the row.
+	__syncthreads();
+	if (!active || lane != 0)
+	{
+		return;
+	}
+	const uint64_t L = (uint64_t)T * b;
+	const size_t L_limbs = (size_t)(L >> 6);
+	const unsigned int L_bit = (unsigned int)(L & 63);
+	const uint64_t L_mask = (1ULL << L_bit) - 1;
+	uint64_t high[3];
+	for (int w = 0; w < 3; w++)
+	{
+		const size_t j = L_limbs + w;
+		uint64_t v = (j < n_out) ? o[j] >> L_bit : 0;
+		if (L_bit != 0 && j + 1 < n_out)
+		{
+			v |= o[j + 1] << (64 - L_bit);
+		}
+		high[w] = v;
+	}
+	o[L_limbs] &= L_mask;
+	for (size_t j = L_limbs + 1; j < n_out; j++)
+	{
+		o[j] = 0;
+	}
+	carry = 0;
+	for (size_t j = 0; j <= L_limbs && (j < 3 || carry != 0); j++)
+	{
+		const uint64_t a = (j < 3) ? high[j] : 0;
+		uint64_t v = o[j] + a;
+		uint64_t c = (v < a);
+		v += carry;
+		c |= (v < carry);
+		o[j] = v;
+		carry = (uint32_t)c;
+	}
+	if ((o[L_limbs] >> L_bit) & 1)
+	{
+		o[L_limbs] &= L_mask;
+		for (size_t j = 0; j <= L_limbs; j++)
+		{
+			const uint64_t v = o[j] + 1;
+			o[j] = v;
+			if (v != 0)
+			{
+				break;
+			}
+		}
+	}
+	bool all_ones = (L_bit == 0 || o[L_limbs] == L_mask);
+	for (size_t j = 0; j < L_limbs && all_ones; j++)
+	{
+		all_ones = (o[j] == ~0ULL);
+	}
+	if (all_ones)
+	{
+		for (size_t j = 0; j <= L_limbs; j++)
+		{
+			o[j] = 0;
+		}
+	}
+	size_t size = (L_limbs + 1 < n_out) ? L_limbs + 1 : n_out;
+	while (size > 0 && o[size - 1] == 0)
+	{
+		size--;
+	}
+	out_size[row] = (uint32_t)size;
+}
+
 //Extract_middle in two kernels, so that both the few long rows at the top of a tree and the many short ones at the bottom are
 //spread over the GPU. out = bits shift up to precision of in, minus one, masked, or 0 for y = 0.
 constexpr int EXTRACT_THREADS = 128;
@@ -1803,6 +1996,9 @@ Gpu_ntt::Gpu_ntt()
 	CUDA_CHECK(cudaFuncSetAttribute(k_combine_limbs<true, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, combine_shared));
 	CUDA_CHECK(cudaFuncSetAttribute(k_combine_limbs<true, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, combine_shared));
 	CUDA_CHECK(cudaFuncSetAttribute(k_combine_limbs<true, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, combine_shared));
+	CUDA_CHECK(cudaFuncSetAttribute(k_combine_rows<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, combine_shared));
+	CUDA_CHECK(cudaFuncSetAttribute(k_combine_rows<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, combine_shared));
+	CUDA_CHECK(cudaFuncSetAttribute(k_combine_rows<5>, cudaFuncAttributeMaxDynamicSharedMemorySize, combine_shared));
 }
 
 Gpu_ntt::~Gpu_ntt()
@@ -1996,6 +2192,34 @@ void Gpu_ntt::Combine_inverse(const Ntt_plan& plan, uint32_t* X, size_t rows, bo
 	uint8_t* limb_f = carry_scratch;
 	uint8_t* chunk_f = carry_scratch + rows * n_out;
 	const int logT = plan.log_length, b = plan.coefficient_bits;
+	//Short rows: several in a block, in one kernel.
+	const size_t T = plan.Length();
+	if (n_out <= COMBINE_ROW_LIMBS && 2 * T <= combine_coefficients)
+	{
+		int S = 32;
+		while ((size_t)S * COMBINE_ITEMS < n_out)
+		{
+			S *= 2;
+		}
+		int rows_per_block = COMBINE_THREADS / S;
+		rows_per_block = ((size_t)rows_per_block * T <= combine_coefficients) ? rows_per_block : (int)(combine_coefficients / T);
+		const size_t shared = 5 * sizeof(uint32_t) * T * rows_per_block;
+		const unsigned grid = (unsigned)((rows + rows_per_block - 1) / rows_per_block);
+		switch (plan.primes)
+		{
+		case 3:
+			k_combine_rows<3><<<grid, COMBINE_THREADS, shared, stream>>>(X, rows, tables, logT, b, S, rows_per_block, cyclic ? 1 : 0, out.limbs, out.stride, out.size);
+			break;
+		case 4:
+			k_combine_rows<4><<<grid, COMBINE_THREADS, shared, stream>>>(X, rows, tables, logT, b, S, rows_per_block, cyclic ? 1 : 0, out.limbs, out.stride, out.size);
+			break;
+		default:
+			k_combine_rows<5><<<grid, COMBINE_THREADS, shared, stream>>>(X, rows, tables, logT, b, S, rows_per_block, cyclic ? 1 : 0, out.limbs, out.stride, out.size);
+			break;
+		}
+		CUDA_CHECK(cudaGetLastError());
+		return;
+	}
 	Reserve_rows(rows);
 	if (chunk_coefficients(b) <= combine_coefficients)
 	{

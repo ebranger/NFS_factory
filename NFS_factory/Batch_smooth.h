@@ -50,7 +50,7 @@ public:
 	//three_lp_stage: if true, this is the 3LP second stage. Its inputs are the cofactors given with Add_candidate, which are checked against all primes below 2^lbp (fblim and mfb are not used).
 	//pipeline: the number of batches in progress at once (see Batch_slot), each with its own tree, or 0 for the default of the
 	//backend (default_pipeline). 1 checks each batch when it is full, in the calling thread. With more, the batches are checked in a pipeline of threads while the next ones are read: the
-	//polynomial values and the trees (by up to two threads, as the trees use the GPU), and then the cofactors and the output (one
+	//polynomial values and the trees (by up to four threads, as the trees use the GPU), and then the cofactors and the output (one
 	//thread, in the order of the batches, so that the output does not depend on the pipeline). The second stage always uses 1.
 	Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, int max_tree_levels, tree_backend_kind backend, bool three_lp_stage = false, int pipeline = 1);
 	~Batch_smooth(void);
