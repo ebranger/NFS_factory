@@ -25,6 +25,20 @@ enum tree_backend_kind
 //False if the depth uses exact products.
 bool tree_level_plan(Ntt_plan& plan, const mp_bitcnt_t* bits, size_t count, mp_bitcnt_t guard);
 
+//The checks of the cofactors of the leaves that a backend can do itself, as Batch_smooth::Classify_cofactor, with its limits:
+//cofactors of more than max_cofactor_bits bits are 3LP candidates if composite, of at most three_lp_max_bits bits and at least
+//three_lp_min (two limbs); those of more than two_lp_min_bits bits are split into two large primes of at most one_lp_bits bits;
+//and those of at most one_lp_bits bits are one large prime if prime and more than max_batch_prime.
+struct Leaf_check
+{
+	int max_cofactor_bits, three_lp_max_bits, two_lp_min_bits, one_lp_bits;
+	unsigned long long three_lp_min[2];
+	unsigned long long max_batch_prime;
+};
+
+//The result of the check of a leaf: the first four as Batch_smooth::cofactor_result, and the cofactors that the CPU checks.
+enum leaf_class { LEAF_NOT_SMOOTH, LEAF_SMOOTH, LEAF_CANDIDATE, LEAF_TINYQS, LEAF_CHECK_ON_CPU };
+
 //The batch smoothness check of the numbers N_i of a batch against a prime product P, with Bernstein's scaled remainder tree.
 //The product tree has the N_i as leaves and their product X at the root. Each node of the remainder tree then holds the
 //fraction (P mod N) / N of its node value N, as a fixed-point number: the root from P mod X, and each other node from its parent's
@@ -51,14 +65,28 @@ public:
 	//unchanged.
 	virtual void Leaf_cofactors() = 0;
 	virtual mpz_class* Leaf_cofactor(int index) = 0;
+
+	//Have Leaf_cofactors check the cofactors too, if the backend can; false if it cannot. After Leaf_cofactors, Leaf_classes then
+	//gives the class of each leaf (or NULL if this batch was not checked), and Leaf_large_primes its two large primes for
+	//LEAF_SMOOTH (0 for none). Leaf_cofactor is then only set for the leaves that are not LEAF_SMOOTH or LEAF_NOT_SMOOTH.
+	virtual bool Set_leaf_check(const Leaf_check& check) { return false; }
+	virtual const unsigned char* Leaf_classes() { return NULL; }
+	virtual const unsigned long long* Leaf_large_primes() { return NULL; }
 };
 
 //A tree backend with the given number of levels (at least 2), for leaves of up to max_bits_in_input bits (to set up the memory).
 Tree_backend* create_tree_backend(tree_backend_kind kind, int levels, int max_bits_in_input);
 
 //The default number of batches in progress at once for a backend (see Batch_smooth), each with a tree of this size: 1 on the CPU,
-//and on the GPU as many as fit in its free memory, up to 5 (1 if not even two fit).
+//and on the GPU as many as fit in its free memory, up to 5 (1 if not even two fit). Also no more than fit in half of the free
+//memory of the computer.
 int default_pipeline(tree_backend_kind kind, int levels, int max_bits_in_input);
+
+#ifdef NFS_GPU
+//Use GPU number device (from 0) for the gpu backend. Returns false, after saying why, if there is no such CUDA GPU, or if it is
+//older than compute capability 7.5. Call it before anything else uses the GPU; otherwise GPU 0 is used.
+bool gpu_init(int device);
+#endif
 
 //The large products of the tree computations on the CPU.
 class Tree_products
@@ -92,7 +120,9 @@ private:
 class Cpu_tree_backend : public Tree_backend
 {
 public:
-	Cpu_tree_backend(Tree_products* products, int levels, int max_bits_in_input);
+	//With preallocate_nodes, the memory of all nodes is allocated up front; otherwise only that of the leaves (the GPU backend
+	//keeps the other nodes on the GPU).
+	Cpu_tree_backend(Tree_products* products, int levels, int max_bits_in_input, bool preallocate_nodes = true);
 	~Cpu_tree_backend();
 
 	mpz_class* Leaf(int index);

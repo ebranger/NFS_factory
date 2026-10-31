@@ -21,13 +21,13 @@ The first step in using Coppersmiths factorization factory is to sieve for relat
 
 Once enough relations have been stored, it is time for NFS_factory to start working. The program is invoked from the command line taking three arguments:
 
-NFS_factory <polynomial file name> <saved relation file name> <output file name> [-rels N]
+NFS_factory <polynomial file name> <saved relation file name> <output file name> [-rels N] [-threads N] [-gpu N]
 
 The polynomial file describes the polynomial used for the current factorization, in GGNFS format with a few extra options, detailed below. The relation file contains the NFS relations stored by the sieving procedure, and accepts either the GGNFS/msieve relation format, or a binary format I have used to save some space. The program will run until all relations in the file have been processed. All found relations are appended to the output file specified.
 
 Several relation files can be processed in one run, which sets up the prime products only once and keeps filling the same remainder tree across the files:
 
-NFS_factory <polynomial file name> -list <list file name> <output file name> [-rels N]
+NFS_factory <polynomial file name> -list <list file name> <output file name> [-rels N] [-threads N] [-gpu N]
 
 The list file names one relation file per line (empty lines and lines starting with # are skipped), and the files are read in that order. With -rels N, the run stops once N relations have been found: it finishes the batches it has read (up to the number of batches of the pipeline option) and the 3LP candidates found so far, so it usually finds more than N. Relations found by an earlier, interrupted run of the same input count towards N.
 
@@ -39,7 +39,9 @@ A typical use is a driver script that runs NFS_factory on a list of relation fil
 
 The GPU build (NFS_factory_gpu, see "Compiling the code.txt") does the product and remainder trees, and the cofactors of the relation values at their leaves, on an NVIDIA GPU, and is meant to be run as one process, on a list of relation files. It checks the batches in a pipeline: while one thread reads the next batch, several batches are in the trees on the GPU at once, and the checks of the cofactors and the output of the batches before them run on the CPU, in the order of the batches, so that the output is the same as without the pipeline. The number of batches in progress is chosen from the free memory of the GPU (see pipeline below), and the build runs on NVIDIA GPUs of compute capability 7.5 (RTX 20 series) and later. The CPU build runs one relation file per process as before, typically as several processes in parallel.
 
--threads N sets the number of threads of the checks on the CPU: the cofactors of the relation values (primality tests, Pollard rho), and the factoring of the relations found (default 1 in the CPU build; in the GPU build 8, or the number of hardware threads if that is less). The output does not depend on it. With the GPU build on SNFS-240 (RTX 4070 Ti SUPER), the checks keep up with the GPU from about 8 threads, and use about four CPU cores on average; with fewer, the CPU is the limit, and the run is correspondingly slower.
+-threads N sets the number of threads of the checks on the CPU: the cofactors of the relation values (primality tests, Pollard rho; the GPU build does these on the GPU, except tinyqs and a few rare cases), and the factoring of the relations found (default 1 in the CPU build; in the GPU build 8, or the number of hardware threads if that is less). The output does not depend on it. With the GPU build on SNFS-240 (RTX 4070 Ti SUPER), the checks keep up with the GPU from about 4 to 6 threads, and use about three CPU cores on average; with fewer, the CPU is the limit, and the run is correspondingly slower.
+
+-gpu N selects the GPU of the GPU build, numbered from 0 (default 0); the one used is printed at the start. The GPU build needs a CUDA GPU of compute capability 7.5 or later, and stops with a message saying so if there is none; on such a computer, use the CPU build.
 
 The polynomial file contains the polynomial pair and factorization parameters in a GGNFS format, and NFS_factory needs the polynomial pair, rlim/alim, lbpr/lbpa and mfbr/mfba to run. The batch smoothness checking will test the relations for all primes up to rlim/alim, and any remiainder is checked if it is a single large prime if it is less than lbpr/lbpa, or double-large prime if it is less than mfbr/mfba (or 2 lbpr/lbpa, if mfbr/mfba is larger, see "Three large primes" below). One more parameter is required to control which polynomial should be checked for smoothness. Batch smoothness checking is done on the rational side if “side: 0” is specified in the polynomial file, and on the algebraic side if “side: 1” is specified.
 
@@ -52,7 +54,7 @@ A few optional parameters can also be given in the polynomial file:
 - 3lp: auto (default) or save. Only used when mfbr/mfba is more than 2 lbpr/lbpa, see "Three large primes" below.
 - 3lpfile: the file that "3lp: save" appends the 3LP candidates to. The default is the output file name, followed by a dot, the name of the relation file and ".3lp".
 - 3lptreelevels: the maximum number of levels in the remainder tree when running on a 3LP candidate file (default 22). treelevels is not used for such runs.
-- pipeline: the number of batches in progress at once, each with its own tree (on the GPU, about 1 GB each for SNFS-240): one being read, one being checked, and the others in the trees (up to four at once). With the gpu backend the default is as many as fit in 70 % of the free memory of the GPU, up to 5 (the choice is printed at the start; 5 is the fastest on an RTX 4070 Ti SUPER, and 2 still overlaps the reading and the checks with the GPU). Otherwise the default is 1, which checks each batch in turn.
+- pipeline: the number of batches in progress at once, each with its own tree (on the GPU, about 1 GB each for SNFS-240): one being read, one being checked, and the others in the trees (up to four at once). With the gpu backend the default is as many as fit in 70 % of the free memory of the GPU, up to 5, and in half of the free memory of the computer (about 0.15 GB each for SNFS-240); the choice is printed at the start. 5 is the fastest on an RTX 4070 Ti SUPER, and 2 still overlaps the reading and the checks with the GPU. Otherwise the default is 1, which checks each batch in turn.
 - backend: how the product and remainder trees are computed. mpir (the default of the CPU build) uses MPIR's products. gpu (the default of the GPU build, and only available there) uses an integer number-theoretic transform on the GPU, from the int_ntt folder. ntt uses the same transform on the CPU, and computes the same numbers as the GPU in every node of the trees; it is much slower than MPIR, and is the reference for testing the GPU version. All of them give exactly the same relations.
 
 Three large primes

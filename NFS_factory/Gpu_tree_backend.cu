@@ -14,6 +14,8 @@
 #include <utility>
 #include <algorithm>
 
+static void gpu_start();
+
 //Products on the GPU one at a time, with copies to and from the GPU, as the Tree_products of the code of Cpu_tree_backend that
 //the GPU tree uses (the GPU tree computes its root with Gpu_root instead). Small products are left to MPIR.
 class Gpu_tree_products : public Tree_products
@@ -573,6 +575,488 @@ void Gpu_root::Compute(Gpu_number& fraction, const uint64_t* X, size_t x_limbs, 
 	gpu->Shift(fraction.d, fraction.n, product.d, product.n, (long long)(e - precision), 0, false, 0);
 }
 
+static unsigned int grid_size_leaves(size_t count)
+{
+	const size_t blocks = (count + 127) / 128;
+	return (unsigned int)((blocks < 65536) ? ((blocks > 0) ? blocks : 1) : 65536);
+}
+
+//The checks of the cofactors on the GPU, one thread per leaf: Batch_smooth::Classify_cofactor for cofactors of up to two limbs,
+//with the same primality tests and the same Pollard-Brent rho as Smooth_factor.cpp, so that the results are the same. Cofactors
+//that need more (the rare factoring of a one large prime cofactor, and cofactors of more than 128 bits in a range that is checked)
+//are left to the CPU.
+namespace
+{
+
+#define RHO_MAX_ITERATIONS (1 << 20) //as in Smooth_factor.cpp
+#define RHO_GCD_INTERVAL 64
+
+__device__ __forceinline__ uint64_t montgomery_inverse64(uint64_t n)
+{
+	uint64_t inverse = n; //correct to 3 bits, since n * n = 1 mod 8 for odd n.
+	for (int i = 0; i < 5; i++)
+	{
+		inverse *= 2 - n * inverse;
+	}
+	return 0 - inverse;
+}
+
+//a b / 2^64 mod n, for a, b < n and odd n.
+__device__ __forceinline__ uint64_t montgomery_multiply64(uint64_t a, uint64_t b, uint64_t n, uint64_t ninv)
+{
+	const uint64_t lo = a * b, hi = __umul64hi(a, b);
+	const uint64_t m = lo * ninv;
+	const uint64_t mhi = __umul64hi(m, n);
+	//(lo + m n) is 0 mod 2^64, with a carry unless lo is 0.
+	uint64_t t = hi + mhi;
+	uint32_t carry = (t < hi);
+	const uint64_t t2 = t + (lo != 0);
+	carry |= (t2 < t);
+	t = t2;
+	if (carry || t >= n)
+	{
+		t -= n;
+	}
+	return t;
+}
+
+__device__ __forceinline__ uint64_t rho_step64(uint64_t y, uint64_t c, uint64_t n, uint64_t ninv)
+{
+	const uint64_t r = montgomery_multiply64(y, y, n, ninv);
+	uint64_t sum = r + c;
+	if (sum < r || sum >= n)
+	{
+		sum -= n;
+	}
+	return sum;
+}
+
+//The binary algorithm, since 64-bit division is slow on the GPU. The same gcd as in Smooth_factor.cpp.
+__device__ uint64_t gcd64(uint64_t a, uint64_t b)
+{
+	if (a == 0 || b == 0)
+	{
+		return a | b;
+	}
+	const int shift = __ffsll((long long)(a | b)) - 1;
+	a >>= __ffsll((long long)a) - 1;
+	while (b != 0)
+	{
+		b >>= __ffsll((long long)b) - 1;
+		if (a > b)
+		{
+			const uint64_t t = a;
+			a = b;
+			b = t;
+		}
+		b -= a;
+	}
+	return a << shift;
+}
+
+//Pollard-Brent rho for an odd composite n < 2^64, as rho64 in Smooth_factor.cpp. Returns 0 if no factor was found.
+__device__ uint64_t rho64(uint64_t n)
+{
+	const uint64_t ninv = montgomery_inverse64(n);
+	for (uint64_t c = 1; c <= 5; c++)
+	{
+		uint64_t y = 2, x = y, saved_y = y, q = 1, g = 1;
+		uint64_t r = 1;
+		while (g == 1 && r <= RHO_MAX_ITERATIONS)
+		{
+			x = y;
+			for (uint64_t i = 0; i < r; i++)
+			{
+				y = rho_step64(y, c, n, ninv);
+			}
+			for (uint64_t k = 0; k < r && g == 1; k += RHO_GCD_INTERVAL)
+			{
+				saved_y = y;
+				const uint64_t steps = (r - k < RHO_GCD_INTERVAL) ? r - k : RHO_GCD_INTERVAL;
+				for (uint64_t i = 0; i < steps; i++)
+				{
+					y = rho_step64(y, c, n, ninv);
+					q = montgomery_multiply64(q, (x > y) ? x - y : y - x, n, ninv);
+				}
+				g = gcd64(q, n);
+			}
+			r *= 2;
+		}
+		if (g == n || g == 0)
+		{
+			//Several factors were found at once, go back and take one step at a time.
+			do
+			{
+				saved_y = rho_step64(saved_y, c, n, ninv);
+				g = gcd64((x > saved_y) ? x - saved_y : saved_y - x, n);
+			} while (g == 1);
+		}
+		if (g != 1 && g != n)
+		{
+			return g;
+		}
+	}
+	return 0;
+}
+
+//Deterministic Miller-Rabin for n < 2^32, with the bases 2, 7 and 61.
+__device__ bool is_prime32(uint64_t n)
+{
+	if (n < 2)
+	{
+		return false;
+	}
+	const uint64_t bases[3] = { 2, 7, 61 };
+	for (int b = 0; b < 3; b++)
+	{
+		if (n == bases[b])
+		{
+			return true;
+		}
+		if (n % bases[b] == 0)
+		{
+			return false;
+		}
+	}
+	uint64_t d = n - 1;
+	int s = 0;
+	while ((d & 1) == 0)
+	{
+		d >>= 1;
+		s++;
+	}
+	for (int b = 0; b < 3; b++)
+	{
+		//x = base^d mod n
+		uint64_t x = 1, base = bases[b] % n, e = d;
+		while (e > 0)
+		{
+			if (e & 1)
+			{
+				x = x * base % n;
+			}
+			base = base * base % n;
+			e >>= 1;
+		}
+		if (x == 1 || x == n - 1)
+		{
+			continue;
+		}
+		bool composite = true;
+		for (int i = 1; i < s && composite; i++)
+		{
+			x = x * x % n;
+			composite = (x != n - 1);
+		}
+		if (composite)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+//Strong probable prime to base 2, for odd n, 2^32 <= n < 2^64.
+__device__ bool sprp2_64(uint64_t n)
+{
+	const uint64_t ninv = montgomery_inverse64(n);
+	const uint64_t one = (0 - n) % n;
+	const uint64_t minus_one = n - one;
+	const int s = __ffsll((long long)(n - 1)) - 1;
+	const uint64_t d = (n - 1) >> s;
+	const int top = 63 - __clzll((long long)d);
+	uint64_t x = one;
+	for (int i = top; i >= 0; i--)
+	{
+		x = montgomery_multiply64(x, x, n, ninv);
+		if ((d >> i) & 1)
+		{
+			const uint64_t doubled = x + x;
+			x = (doubled < x || doubled >= n) ? doubled - n : doubled;
+		}
+	}
+	if (x == one || x == minus_one)
+	{
+		return true;
+	}
+	for (int i = 1; i < s; i++)
+	{
+		x = montgomery_multiply64(x, x, n, ninv);
+		if (x == minus_one)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+//x = r mod n for r < 2n (r of 129 bits, with carry the top bit).
+__device__ __forceinline__ void reduce_once128(uint64_t& lo, uint64_t& hi, uint64_t carry, uint64_t nlo, uint64_t nhi)
+{
+	const uint64_t slo = lo - nlo;
+	const uint64_t b1 = (lo < nlo);
+	const uint64_t shi = hi - nhi - b1;
+	const uint64_t borrow = (hi < nhi) | ((hi == nhi) & b1);
+	if (carry || !borrow)
+	{
+		lo = slo;
+		hi = shi;
+	}
+}
+
+__device__ __forceinline__ void add_carry(uint64_t& sum, uint64_t a, uint64_t& carry)
+{
+	const uint64_t s = sum + a;
+	const uint64_t c1 = (s < a);
+	const uint64_t s2 = s + carry;
+	carry = c1 + (s2 < s);
+	sum = s2;
+}
+
+//a^2 / 2^128 mod n for a < n and odd n of two limbs, as montgomery_square in Smooth_factor.cpp.
+__device__ void montgomery_square128(uint64_t& alo, uint64_t& ahi, uint64_t nlo, uint64_t nhi, uint64_t ninv)
+{
+	//t = a^2 = alo^2 + 2 alo ahi 2^64 + ahi^2 2^128, less than 2^256.
+	uint64_t t0 = alo * alo, t1 = __umul64hi(alo, alo);
+	uint64_t t2 = ahi * ahi, t3 = __umul64hi(ahi, ahi);
+	uint64_t lo = alo * ahi, hi = __umul64hi(alo, ahi);
+	const uint64_t top = hi >> 63;
+	hi = (hi << 1) | (lo >> 63);
+	lo <<= 1;
+	uint64_t c = 0;
+	add_carry(t1, lo, c);
+	add_carry(t2, hi, c);
+	add_carry(t3, top, c);
+	//Two reduction steps, each clearing the lowest limb. c4 is the carry out of t3.
+	uint64_t c4 = 0;
+	uint64_t m = t0 * ninv;
+	lo = m * nlo;
+	hi = __umul64hi(m, nlo);
+	c = 0;
+	add_carry(t0, lo, c);
+	uint64_t h = hi;
+	lo = m * nhi;
+	hi = __umul64hi(m, nhi);
+	add_carry(t1, h, c);
+	hi += c;
+	c = 0;
+	add_carry(t1, lo, c);
+	add_carry(t2, hi, c);
+	add_carry(t3, 0, c);
+	c4 += c;
+	m = t1 * ninv;
+	lo = m * nlo;
+	hi = __umul64hi(m, nlo);
+	c = 0;
+	add_carry(t1, lo, c);
+	h = hi;
+	lo = m * nhi;
+	hi = __umul64hi(m, nhi);
+	add_carry(t2, h, c);
+	hi += c;
+	c = 0;
+	add_carry(t2, lo, c);
+	add_carry(t3, hi, c);
+	c4 += c;
+	alo = t2;
+	ahi = t3;
+	reduce_once128(alo, ahi, c4, nlo, nhi);
+}
+
+__device__ __forceinline__ void double_mod128(uint64_t& lo, uint64_t& hi, uint64_t nlo, uint64_t nhi)
+{
+	const uint64_t carry = hi >> 63;
+	hi = (hi << 1) | (lo >> 63);
+	lo <<= 1;
+	reduce_once128(lo, hi, carry, nlo, nhi);
+}
+
+//Strong probable prime to base 2, for odd n, 2^64 <= n < 2^128.
+__device__ bool sprp2_128(uint64_t nlo, uint64_t nhi)
+{
+	const uint64_t ninv = montgomery_inverse64(nlo);
+	//one = 2^128 mod n, by doubling 2^(bits - 1) < n up to 2^128.
+	const int top = 63 - __clzll((long long)nhi);
+	uint64_t one_lo = 0, one_hi = 1ULL << top;
+	for (int i = top + 64; i < 128; i++)
+	{
+		double_mod128(one_lo, one_hi, nlo, nhi);
+	}
+	const uint64_t minus_lo = nlo - one_lo;
+	const uint64_t minus_hi = nhi - one_hi - (nlo < one_lo);
+
+	//n - 1 = d 2^s
+	uint64_t dlo = nlo - 1, dhi = nhi;
+	int s;
+	if (dlo != 0)
+	{
+		s = __ffsll((long long)dlo) - 1;
+		dlo = (dlo >> s) | ((s != 0) ? dhi << (64 - s) : 0);
+		dhi >>= s;
+	}
+	else
+	{
+		s = 64 + __ffsll((long long)dhi) - 1;
+		dlo = dhi >> (s - 64);
+		dhi = 0;
+	}
+	const int d_top = (dhi != 0) ? 127 - __clzll((long long)dhi) : 63 - __clzll((long long)dlo);
+
+	uint64_t xlo = one_lo, xhi = one_hi;
+	for (int i = d_top; i >= 0; i--)
+	{
+		montgomery_square128(xlo, xhi, nlo, nhi, ninv);
+		const uint64_t bit = (i >= 64) ? (dhi >> (i - 64)) & 1 : (dlo >> i) & 1;
+		if (bit)
+		{
+			double_mod128(xlo, xhi, nlo, nhi);
+		}
+	}
+	if ((xlo == one_lo && xhi == one_hi) || (xlo == minus_lo && xhi == minus_hi))
+	{
+		return true;
+	}
+	for (int i = 1; i < s; i++)
+	{
+		montgomery_square128(xlo, xhi, nlo, nhi, ninv);
+		if (xlo == minus_lo && xhi == minus_hi)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+//is_probable_prime of Smooth_factor.cpp, for numbers of up to two limbs.
+__device__ bool is_probable_prime128(uint64_t lo, uint64_t hi)
+{
+	if ((lo & 1) == 0)
+	{
+		return hi == 0 && lo == 2;
+	}
+	if (hi != 0)
+	{
+		return sprp2_128(lo, hi);
+	}
+	if (lo < (1ULL << 32))
+	{
+		return is_prime32(lo);
+	}
+	return sprp2_64(lo);
+}
+
+__device__ __forceinline__ int bits64(uint64_t x)
+{
+	return (x == 0) ? 0 : 64 - __clzll((long long)x);
+}
+
+//Check_two_primes of Batch_smooth.
+__device__ unsigned char check_two_primes(uint64_t p, uint64_t q, const Leaf_check& check, uint64_t* lp)
+{
+	if (bits64(p) > check.one_lp_bits || bits64(q) > check.one_lp_bits)
+	{
+		return LEAF_NOT_SMOOTH;
+	}
+	if (!is_probable_prime128(p, 0) || !is_probable_prime128(q, 0))
+	{
+		return LEAF_NOT_SMOOTH;
+	}
+	lp[0] = (p < q) ? p : q;
+	lp[1] = (p < q) ? q : p;
+	return LEAF_SMOOTH;
+}
+
+//The cofactors that rho splits are listed (rho_list, rho_count) for k_rho, and are LEAF_TINYQS until then: rho takes long,
+//and a few of them would hold up most blocks.
+__global__ void k_classify(const uint64_t* __restrict__ c, size_t stride, const uint32_t* __restrict__ size, size_t count, Leaf_check check,
+	unsigned char* __restrict__ result, uint64_t* __restrict__ lp, uint32_t* __restrict__ rho_list, uint32_t* __restrict__ rho_count)
+{
+	for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < count; i += (size_t)gridDim.x * blockDim.x)
+	{
+		const uint32_t n = size[i];
+		const uint64_t* x = c + i * stride;
+		const int bits = (n == 0) ? 1 : 64 * ((int)n - 1) + bits64(x[n - 1]);
+		const uint64_t lo = (n > 0) ? x[0] : 0, hi = (n > 1) ? x[1] : 0;
+		uint64_t primes[2] = { 0, 0 };
+		unsigned char r;
+		if (bits > check.max_cofactor_bits)
+		{
+			//Can still have three large primes, if composite and at least fblim^3.
+			const bool at_least_min = (n > 2) || hi > check.three_lp_min[1] || (hi == check.three_lp_min[1] && lo >= check.three_lp_min[0]);
+			if (bits <= check.three_lp_max_bits && at_least_min)
+			{
+				r = (n > 2) ? LEAF_CHECK_ON_CPU : (is_probable_prime128(lo, hi) ? LEAF_NOT_SMOOTH : LEAF_CANDIDATE);
+			}
+			else
+			{
+				r = LEAF_NOT_SMOOTH;
+			}
+		}
+		else if (bits > check.two_lp_min_bits)
+		{
+			if (n > 2)
+			{
+				r = LEAF_CHECK_ON_CPU;
+			}
+			else if (is_probable_prime128(lo, hi))
+			{
+				r = LEAF_NOT_SMOOTH;
+			}
+			else
+			{
+				r = LEAF_TINYQS;
+				if (bits <= 63 && (lo & 1))
+				{
+					rho_list[atomicAdd(rho_count, 1u)] = (uint32_t)i;
+				}
+			}
+		}
+		else if (bits > check.one_lp_bits)
+		{
+			r = LEAF_NOT_SMOOTH;
+		}
+		else if (n == 1 && lo == 1)
+		{
+			r = LEAF_SMOOTH;
+		}
+		else if (n <= 2 && (hi != 0 || lo > check.max_batch_prime) && is_probable_prime128(lo, hi))
+		{
+			primes[0] = lo; //bits <= one_lp_bits, so it fits in one limb
+			r = LEAF_SMOOTH;
+		}
+		else
+		{
+			r = LEAF_CHECK_ON_CPU; //factored on the CPU, rarely needed
+		}
+		result[i] = r;
+		lp[2 * i] = primes[0];
+		lp[2 * i + 1] = primes[1];
+	}
+}
+
+//Pollard rho on the cofactors that k_classify listed, one thread each, in small blocks so that they are spread over the GPU.
+//A cofactor that rho does not split stays LEAF_TINYQS, as on the CPU.
+__global__ void k_rho(const uint64_t* __restrict__ c, size_t stride, const uint32_t* __restrict__ rho_list, const uint32_t* __restrict__ rho_count, Leaf_check check,
+	unsigned char* __restrict__ result, uint64_t* __restrict__ lp)
+{
+	const uint32_t count = *rho_count;
+	for (uint32_t j = blockIdx.x * blockDim.x + threadIdx.x; j < count; j += gridDim.x * blockDim.x)
+	{
+		const uint32_t i = rho_list[j];
+		const uint64_t n = c[(size_t)i * stride];
+		const uint64_t factor = rho64(n);
+		if (factor != 0)
+		{
+			uint64_t primes[2] = { 0, 0 };
+			result[i] = check_two_primes(factor, n / factor, check, primes);
+			lp[2 * (size_t)i] = primes[0];
+			lp[2 * (size_t)i + 1] = primes[1];
+		}
+	}
+}
+
+} //namespace
+
 class Gpu_tree_backend : public Cpu_tree_backend
 {
 public:
@@ -582,6 +1066,9 @@ public:
 	void Scaled_root(mpz_srcptr prime_product);
 	void Remainder_tree();
 	void Leaf_cofactors();
+	bool Set_leaf_check(const Leaf_check& check);
+	const unsigned char* Leaf_classes();
+	const unsigned long long* Leaf_large_primes();
 
 private:
 	//The nodes of a depth: the product tree, and then the fractions of the remainder tree.
@@ -609,6 +1096,21 @@ private:
 	size_t leaf_limbs; //the most limbs of a leaf
 	Gpu_level cofactors; //of the leaves
 	size_t cofactor_limb_capacity, cofactor_size_capacity;
+	bool checking; //the cofactors, with check
+	Leaf_check check;
+	bool classes_valid; //for this batch
+	unsigned char* classes; //on the GPU, and host_classes
+	size_t classes_capacity;
+	uint64_t* large_primes; //on the GPU, two per leaf, and host_large_primes
+	size_t large_primes_capacity;
+	uint32_t* rho_list; //the leaves for k_rho, and their count at rho_list[0]
+	size_t rho_list_capacity;
+	cudaStream_t rho_stream; //k_rho runs on a stream of its own, after classified (on the stream of the thread)
+	cudaEvent_t classified, rho_done; //k_rho of the batch, which the thread that checks the batch waits for (Leaf_classes)
+	bool rho_pending;
+	void Finish_rho();
+	std::vector<unsigned char> host_classes;
+	std::vector<unsigned long long> host_large_primes;
 	std::vector<Depth> depth_data;
 	uint32_t* parent_transform;
 	size_t parent_transform_capacity;
@@ -622,7 +1124,7 @@ private:
 	std::vector<uint32_t> host_sizes, host_words;
 };
 
-Gpu_tree_backend::Gpu_tree_backend(int levels, int max_bits_in_input) : Cpu_tree_backend(new Gpu_tree_products, levels, max_bits_in_input)
+Gpu_tree_backend::Gpu_tree_backend(int levels, int max_bits_in_input) : Cpu_tree_backend(new Gpu_tree_products, levels, max_bits_in_input, false)
 {
 	gpu = &static_cast<Gpu_tree_products*>(products)->gpu;
 	root = new Gpu_root(gpu);
@@ -654,6 +1156,16 @@ Gpu_tree_backend::Gpu_tree_backend(int levels, int max_bits_in_input) : Cpu_tree
 	cofactors.stride = 0;
 	cofactors.count = 0;
 	cofactor_limb_capacity = cofactor_size_capacity = 0;
+	checking = false;
+	classes_valid = false;
+	classes = NULL;
+	large_primes = NULL;
+	rho_list = NULL;
+	classes_capacity = large_primes_capacity = rho_list_capacity = 0;
+	CUDA_CHECK(cudaStreamCreateWithFlags(&rho_stream, cudaStreamNonBlocking));
+	CUDA_CHECK(cudaEventCreateWithFlags(&classified, cudaEventDisableTiming));
+	CUDA_CHECK(cudaEventCreateWithFlags(&rho_done, cudaEventDisableTiming));
+	rho_pending = false;
 }
 
 Gpu_tree_backend::~Gpu_tree_backend()
@@ -674,6 +1186,49 @@ Gpu_tree_backend::~Gpu_tree_backend()
 	cudaFree(precision);
 	cudaFree(cofactors.limbs);
 	cudaFree(cofactors.size);
+	if (rho_pending)
+	{
+		cudaEventSynchronize(rho_done);
+	}
+	cudaEventDestroy(rho_done);
+	cudaEventDestroy(classified);
+	cudaStreamDestroy(rho_stream);
+	cudaFree(classes);
+	cudaFree(large_primes);
+	cudaFree(rho_list);
+}
+
+bool Gpu_tree_backend::Set_leaf_check(const Leaf_check& leaf_check)
+{
+	check = leaf_check;
+	checking = true;
+	return true;
+}
+
+//The results of k_rho, in the thread that checks the batch: by then it is usually done.
+void Gpu_tree_backend::Finish_rho()
+{
+	if (!rho_pending)
+	{
+		return;
+	}
+	gpu_start();
+	CUDA_CHECK(cudaEventSynchronize(rho_done));
+	CUDA_CHECK(cudaMemcpy(host_classes.data(), classes, num_leaves, cudaMemcpyDeviceToHost));
+	CUDA_CHECK(cudaMemcpy(host_large_primes.data(), large_primes, 2 * (size_t)num_leaves * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+	rho_pending = false;
+}
+
+const unsigned char* Gpu_tree_backend::Leaf_classes()
+{
+	Finish_rho();
+	return classes_valid ? host_classes.data() : NULL;
+}
+
+const unsigned long long* Gpu_tree_backend::Leaf_large_primes()
+{
+	Finish_rho();
+	return classes_valid ? host_large_primes.data() : NULL;
 }
 
 void Gpu_tree_backend::Set_stride(Depth& d, size_t count, size_t stride)
@@ -745,6 +1300,7 @@ void Gpu_tree_backend::Download_bits(int depth)
 
 mp_bitcnt_t Gpu_tree_backend::Build_product_tree()
 {
+	gpu_start();
 	//The leaves, with room for their fractions too.
 	const int leaf_depth = levels - 1;
 	size_t max_leaf = 1;
@@ -800,6 +1356,7 @@ mp_bitcnt_t Gpu_tree_backend::Build_product_tree()
 //The root stays on the GPU: the fraction of the root replaces the product there.
 void Gpu_tree_backend::Scaled_root(mpz_srcptr prime_product)
 {
+	gpu_start();
 	Depth& top = depth_data[0];
 	const size_t limbs = (size_t)((node_bits[0] + GMP_LIMB_BITS - 1) / GMP_LIMB_BITS);
 	root->Compute(fraction, top.level.limbs, limbs, node_bits[0], node_bits[0] + guard, prime_product);
@@ -839,6 +1396,7 @@ void Gpu_tree_backend::Shifts(int depth)
 
 void Gpu_tree_backend::Remainder_tree()
 {
+	gpu_start();
 	if (levels < 3)
 	{
 		return; //The root is the parent of the leaves, and is on the CPU.
@@ -884,6 +1442,7 @@ void Gpu_tree_backend::Remainder_tree()
 
 void Gpu_tree_backend::Leaf_cofactors()
 {
+	gpu_start();
 	Depth& leaves = depth_data[levels - 1];
 	Depth& parents = depth_data[levels - 2];
 	const int K = Gpu_ntt::Leaf_kernel_limbs((int)leaf_limbs);
@@ -895,12 +1454,31 @@ void Gpu_tree_backend::Leaf_cofactors()
 		cofactors.count = num_leaves;
 		if (gpu->Leaf_cofactors(parents.level, parents.bits, leaves.level, leaves.bits, (int)leaf_limbs, (uint32_t)guard, MAX_SQUARINGS_IN_CHECK, cofactors, 0))
 		{
+			classes_valid = checking;
+			if (checking)
+			{
+				reserve(classes, classes_capacity, (size_t)num_leaves);
+				reserve(large_primes, large_primes_capacity, 2 * (size_t)num_leaves);
+				reserve(rho_list, rho_list_capacity, (size_t)num_leaves + 1);
+				CUDA_CHECK(cudaMemsetAsync(rho_list, 0, sizeof(uint32_t)));
+				k_classify<<<grid_size_leaves(num_leaves), 128>>>(cofactors.limbs, K, cofactors.size, num_leaves, check, classes, large_primes, rho_list + 1, rho_list);
+				CUDA_CHECK(cudaGetLastError());
+				host_classes.resize(num_leaves);
+				host_large_primes.resize(2 * (size_t)num_leaves);
+				CUDA_CHECK(cudaMemcpy(host_classes.data(), classes, num_leaves, cudaMemcpyDeviceToHost));
+				CUDA_CHECK(cudaMemcpy(host_large_primes.data(), large_primes, 2 * (size_t)num_leaves * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+			}
 			host_limbs.resize((size_t)num_leaves * K);
 			host_sizes.resize(num_leaves);
 			CUDA_CHECK(cudaMemcpy(host_limbs.data(), cofactors.limbs, host_limbs.size() * sizeof(uint64_t), cudaMemcpyDeviceToHost));
 			CUDA_CHECK(cudaMemcpy(host_sizes.data(), cofactors.size, num_leaves * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+			//The cofactors as numbers: those that the CPU still needs, if they were checked.
 			parallel_for(num_leaves, 4096, [&](int r)
 			{
+				if (checking && host_classes[r] != LEAF_CANDIDATE && host_classes[r] != LEAF_TINYQS && host_classes[r] != LEAF_CHECK_ON_CPU)
+				{
+					return;
+				}
 				mpz_ptr a = cofactor[r].get_mpz_t();
 				const int n = (int)host_sizes[r];
 				if (a->_mp_alloc < n)
@@ -910,23 +1488,76 @@ void Gpu_tree_backend::Leaf_cofactors()
 				memcpy(a->_mp_d, host_limbs.data() + (size_t)r * K, n * sizeof(uint64_t));
 				a->_mp_size = n;
 			});
+			if (checking)
+			{
+				//Rho on the cofactors that need it, which is slow on the GPU (long chains of dependent products) but uses few of its
+				//multiprocessors: the thread that checks the batch waits for it, so that this one can go on with the next batch. Until
+				//then those cofactors are LEAF_TINYQS, and they are among the ones copied above.
+				CUDA_CHECK(cudaEventRecord(classified, 0));
+				CUDA_CHECK(cudaStreamWaitEvent(rho_stream, classified, 0));
+				k_rho<<<256, 32, 0, rho_stream>>>(cofactors.limbs, K, rho_list + 1, rho_list, check, classes, large_primes);
+				CUDA_CHECK(cudaGetLastError());
+				CUDA_CHECK(cudaEventRecord(rho_done, rho_stream));
+				rho_pending = true;
+			}
 			return;
 		}
 	}
-	//Large leaves: on the CPU, from the fractions of their parents.
+	//Large leaves: on the CPU, from the fractions of their parents. Their cofactors are not checked here.
+	classes_valid = false;
 	Download(levels - 2);
 	Cpu_tree_backend::Leaf_cofactors();
 }
 
-//Before the first use of the GPU: the threads that wait for it sleep instead of spinning, which leaves the CPU to the threads
-//that check the batches (the waits get a little longer).
+//The GPU used, chosen by gpu_init. Each host thread has its own current device, so the threads that use the GPU set it first
+//(gpu_start).
+static int gpu_device = -1;
+static thread_local bool gpu_device_set = false;
+
+bool gpu_init(int device)
+{
+	int count = 0;
+	cudaError_t error = cudaGetDeviceCount(&count);
+	if (error != cudaSuccess || count == 0)
+	{
+		printf("This is the GPU build of NFS_factory, but no CUDA GPU was found (%s).\n", (error != cudaSuccess) ? cudaGetErrorString(error) : "no devices");
+		printf("Use the CPU build (NFS_factory) on this computer, or set backend: mpir in the polynomial file.\n");
+		return false;
+	}
+	if (device < 0 || device >= count)
+	{
+		printf("There is no GPU %d: this computer has %d CUDA GPU%s, numbered from 0.\n", device, count, (count > 1) ? "s" : "");
+		return false;
+	}
+	cudaDeviceProp properties;
+	CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+	if (properties.major * 10 + properties.minor < 75)
+	{
+		printf("GPU %d (%s) has compute capability %d.%d, and the GPU build needs 7.5 or later. Use the CPU build (NFS_factory).\n", device, properties.name,
+			properties.major, properties.minor);
+		return false;
+	}
+	gpu_device = device;
+	CUDA_CHECK(cudaSetDevice(device));
+	//The threads that wait for the GPU sleep instead of spinning, which leaves the CPU to the threads that check the batches
+	//(the waits get a little longer).
+	CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+	gpu_device_set = true;
+	printf("GPU %d: %s, compute capability %d.%d, %.1f GB.\n", device, properties.name, properties.major, properties.minor, properties.totalGlobalMem / 1e9);
+	return true;
+}
+
+//Before a thread uses the GPU.
 static void gpu_start()
 {
-	static bool started = false;
-	if (!started)
+	if (gpu_device < 0 && !gpu_init(0))
 	{
-		started = true;
-		cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+		exit(3);
+	}
+	if (!gpu_device_set)
+	{
+		CUDA_CHECK(cudaSetDevice(gpu_device));
+		gpu_device_set = true;
 	}
 }
 

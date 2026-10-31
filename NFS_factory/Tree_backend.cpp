@@ -2,8 +2,15 @@
 //See Bernstein, "How to find smooth parts of integers" and "Scaled remainder trees", for the algorithm.
 
 #include "Tree_backend.h"
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 #include "Parallel.h"
 #include <stdlib.h>
+#include <stdio.h>
 
 #define WRAPAROUND_MIN_LIMBS 512 //Use wraparound products in the remainder tree for nodes of at least this many limbs. Tuned on an i7-14700F.
 #define TREE_NTT_MIN_LIMBS 512 //The NTT backend multiplies with the NTT when the product has at least this many limbs, and with MPIR below
@@ -150,15 +157,39 @@ Tree_backend* create_gpu_tree_backend(int levels, int max_bits_in_input); //Gpu_
 int gpu_pipeline(int levels, int max_bits_in_input); //Gpu_tree_backend.cu
 #endif
 
+//The physical memory that is free, in bytes (0 if unknown).
+static double free_host_memory()
+{
+#ifdef _WIN32
+	MEMORYSTATUSEX status;
+	status.dwLength = sizeof(status);
+	return GlobalMemoryStatusEx(&status) ? (double)status.ullAvailPhys : 0;
+#else
+	long pages = sysconf(_SC_AVPHYS_PAGES), page_size = sysconf(_SC_PAGESIZE);
+	return (pages > 0 && page_size > 0) ? (double)pages * page_size : 0;
+#endif
+}
+
 int default_pipeline(tree_backend_kind kind, int levels, int max_bits_in_input)
 {
+	int slots = 1;
 #ifdef NFS_GPU
 	if (kind == TREE_BACKEND_GPU)
 	{
-		return gpu_pipeline(levels, max_bits_in_input);
+		slots = gpu_pipeline(levels, max_bits_in_input);
 	}
 #endif
-	return 1;
+	//A batch in progress takes about 420 bytes per relation on the host (its relation, the saved factor list, the leaf and
+	//its cofactor), and more for larger leaves.
+	const double slot_bytes = (double)((size_t)1 << (levels - 1)) * (420.0 + max_bits_in_input / 4.0);
+	const double host = free_host_memory();
+	if (slots > 1 && host > 0 && slots * slot_bytes > 0.5 * host)
+	{
+		const int fit = (int)(0.5 * host / slot_bytes);
+		slots = (fit < 1) ? 1 : fit;
+		printf("Memory: %.1f GB free, about %.2f GB per batch in progress: %d batches in progress at once.\n", host / 1e9, slot_bytes / 1e9, slots);
+	}
+	return slots;
 }
 
 Tree_backend* create_tree_backend(tree_backend_kind kind, int levels, int max_bits_in_input)
@@ -177,7 +208,7 @@ Tree_backend* create_tree_backend(tree_backend_kind kind, int levels, int max_bi
 }
 
 //The tree takes ownership of products.
-Cpu_tree_backend::Cpu_tree_backend(Tree_products* products, int levels, int max_bits_in_input)
+Cpu_tree_backend::Cpu_tree_backend(Tree_products* products, int levels, int max_bits_in_input, bool preallocate_nodes)
 {
 	this->products = products;
 	this->levels = levels;
@@ -187,7 +218,7 @@ Cpu_tree_backend::Cpu_tree_backend(Tree_products* products, int levels, int max_
 	//A guard bit for each level of truncations, and two more.
 	guard = levels + 2;
 
-	//Allocate enough memory for every node, so that the numbers do not have to grow during the run.
+	//Allocate enough memory for every node (or only the leaves), so that the numbers do not have to grow during the run.
 	node.resize(2 * num_leaves - 1);
 	node_bits.resize(2 * num_leaves - 1);
 	cofactor.resize(num_leaves);
@@ -196,7 +227,10 @@ Cpu_tree_backend::Cpu_tree_backend(Tree_products* products, int levels, int max_
 	{
 		for (int i = (1 << depth) - 1; i <= 2 * ((1 << depth) - 1); i++)
 		{
-			mpz_realloc2(node[i].get_mpz_t(), bits);
+			if (preallocate_nodes || depth == levels - 1)
+			{
+				mpz_realloc2(node[i].get_mpz_t(), bits);
+			}
 			node[i] = 1;
 		}
 		bits *= 2;

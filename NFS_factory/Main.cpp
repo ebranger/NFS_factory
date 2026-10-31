@@ -932,6 +932,7 @@ int main(int argc, char* argv[])
 #else
 	int threads = 1; //The CPU build is typically run as several processes.
 #endif
+	int gpu = 0;
 	vector<string> positional;
 	bool arguments_ok = true;
 	for (int i = 1; i < argc; i++)
@@ -946,6 +947,17 @@ int main(int argc, char* argv[])
 			try
 			{
 				target_relations = stoll(argv[++i]);
+			}
+			catch (const exception&)
+			{
+				arguments_ok = false;
+			}
+		}
+		else if (arg == "-gpu" && i + 1 < argc)
+		{
+			try
+			{
+				gpu = stoi(argv[++i]);
 			}
 			catch (const exception&)
 			{
@@ -971,12 +983,13 @@ int main(int argc, char* argv[])
 	}
 	if (!arguments_ok || positional.size() != (listfile.empty() ? 3u : 2u))
 	{
-		cout << "Usage: NFS_factory <polynomial file> <relation file> <output file> [-rels N] [-threads N]" << endl;
-		cout << "   or: NFS_factory <polynomial file> -list <list file> <output file> [-rels N] [-threads N]" << endl;
+		cout << "Usage: NFS_factory <polynomial file> <relation file> <output file> [-rels N] [-threads N] [-gpu N]" << endl;
+		cout << "   or: NFS_factory <polynomial file> -list <list file> <output file> [-rels N] [-threads N] [-gpu N]" << endl;
 		cout << "The list file names relation files, one per line, which are read in order. With -rels, the run stops when N relations" << endl;
 		cout << "have been found. An interrupted run continues where it was, from <output file>.resume, when it is run again with the" << endl;
 		cout << "same relation file or list. A summary is written to <output file>.status at the end. -threads sets the number of" << endl;
 		cout << "threads for checking the cofactors and factoring the relations found (default 1 in the CPU build, 8 in the GPU build)." << endl;
+		cout << "-gpu selects the GPU of the GPU build, numbered from 0 (default 0)." << endl;
 		return 0;
 	}
 	omp_set_num_threads(threads);
@@ -1067,6 +1080,14 @@ int main(int argc, char* argv[])
 		cout << "Failed to read the polynomials from the polynomial file." << endl;
 		return -1;
 	}
+
+#ifdef NFS_GPU
+	//The GPU, before anything else uses it.
+	if (param->backend == TREE_BACKEND_GPU && !gpu_init(gpu))
+	{
+		return -1;
+	}
+#endif
 
 	//Values for the side to batch check.
 	bool rational = (param->smoothness_checking_side == 0);

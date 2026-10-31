@@ -129,6 +129,23 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	checked = 0;
 	stopping = false;
 	reader_blocked = 0;
+	//The trees check the cofactors themselves, if they can (the GPU), with the limits of Classify_cofactor.
+	if (do_cofactorization && mpz_size(three_lp_min.get_mpz_t()) <= 2)
+	{
+		Leaf_check check;
+		check.max_cofactor_bits = max_cofactor_bit_size;
+		check.three_lp_max_bits = three_lp_max_bits;
+		check.two_lp_min_bits = (int)two_lp_min_limit;
+		check.one_lp_bits = one_lp_bit_limit;
+		check.three_lp_min[0] = mpz_getlimbn(three_lp_min.get_mpz_t(), 0);
+		check.three_lp_min[1] = mpz_getlimbn(three_lp_min.get_mpz_t(), 1);
+		check.max_batch_prime = (unsigned long long)max_batch_prime;
+		for (Batch_slot* s : slots)
+		{
+			s->tree->Set_leaf_check(check);
+		}
+	}
+
 	if (pipelined)
 	{
 		//The slots that are not being filled or checked can be in the trees at once (up to 4).
@@ -746,20 +763,43 @@ void Batch_smooth::Run_checks(Batch_slot& s)
 	cout << "Size of top node of product tree: " << s.root_bits << " bits." << endl;
 
 	s.leaf_result.resize(num_relations_per_batch);
-	parallel_for(num_relations_per_batch, 256, [&](int index)
+	const unsigned char* classes = s.tree->Leaf_classes();
+	if (classes != NULL)
 	{
-		mpz_class& Q = *s.tree->Leaf_cofactor(index);
+		//Checked by the tree: the large primes of the smooth ones, and the rest that the CPU checks.
+		const unsigned long long* large_primes = s.tree->Leaf_large_primes();
+		parallel_for(num_relations_per_batch, 4096, [&](int index)
+		{
+			if (classes[index] == LEAF_CHECK_ON_CPU)
+			{
+				s.leaf_result[index] = (unsigned char)Classify_cofactor(s, *s.tree->Leaf_cofactor(index), index);
+				return;
+			}
+			s.leaf_result[index] = classes[index];
+			if (classes[index] == LEAF_SMOOTH)
+			{
+				s.lp1[index] = large_primes[2 * index];
+				s.lp2[index] = large_primes[2 * index + 1];
+			}
+		});
+	}
+	else
+	{
+		parallel_for(num_relations_per_batch, 256, [&](int index)
+		{
+			mpz_class& Q = *s.tree->Leaf_cofactor(index);
 
-		if (do_cofactorization == true)
-		{
-			s.leaf_result[index] = (unsigned char)Classify_cofactor(s, Q, index);
-		}
-		else
-		{
-			//Do not do 2lp testing. If the cofactor is 1 then the relation is smooth
-			s.leaf_result[index] = (unsigned char)((Q > 1) ? COFACTOR_NOT_SMOOTH : COFACTOR_SMOOTH);
-		}
-	});
+			if (do_cofactorization == true)
+			{
+				s.leaf_result[index] = (unsigned char)Classify_cofactor(s, Q, index);
+			}
+			else
+			{
+				//Do not do 2lp testing. If the cofactor is 1 then the relation is smooth
+				s.leaf_result[index] = (unsigned char)((Q > 1) ? COFACTOR_NOT_SMOOTH : COFACTOR_SMOOTH);
+			}
+		});
+	}
 
 	for (int index = 0; index < num_relations_per_batch; index++)
 	{
