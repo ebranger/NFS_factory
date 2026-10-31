@@ -36,6 +36,11 @@ and the batch factorization code in CADO-NFS.
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #else
 #include <unistd.h>
 #endif
@@ -45,6 +50,7 @@ using namespace std;
 #define MAX_LINE_LENGTH 1024 //Longer lines in a relation file are skipped. gnfs-lasieve relations are typically less than 200 characters.
 #define MAX_BINARY_PRIMES 32 //Maximum number of primes in one relation in a binary relation file. More than this is treated as a corrupt file.
 #define READ_BUFFER_SIZE (16 * 1024 * 1024) //Binary relation files are read in blocks of this size.
+#define READ_AHEAD_BLOCKS 4 //Reads of READ_BUFFER_SIZE in flight at once (Windows): a hard disk then reads at full speed.
 #define STAGE2_ONLY_TREE_LEVELS 22 //Default maximum number of levels in the remainder tree of a run on a 3LP candidate file. Such runs are few, so they can use more memory than the runs on relation files.
 
 struct nfs_parameters {
@@ -775,10 +781,156 @@ read_result read_batch_from_file(string filename, Batch_smooth* batch, nfs_param
 	return stopped ? READ_STOPPED : READ_END;
 }
 
+//A file read in order, in blocks of READ_BUFFER_SIZE. On Windows, READ_AHEAD_BLOCKS reads are in flight at once (overlapped I/O),
+//so that a hard disk keeps reading while the relations are parsed, or the reader waits for a batch: one read at a time, as fread
+//does, got about 180 MB/s from a disk that reads 260 MB/s. Elsewhere, fread.
+class Block_reader
+{
+public:
+	Block_reader()
+	{
+#ifdef _WIN32
+		handle = INVALID_HANDLE_VALUE;
+#else
+		file = NULL;
+#endif
+	}
+	~Block_reader()
+	{
+		Close();
+	}
+
+	bool Open(const string& name)
+	{
+#ifdef _WIN32
+		handle = CreateFileA(name.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+		if (handle == INVALID_HANDLE_VALUE)
+		{
+			return false;
+		}
+		next_offset = 0;
+		current = 0;
+		position = size = 0;
+		finished = false;
+		for (int i = 0; i < READ_AHEAD_BLOCKS; i++)
+		{
+			blocks[i].resize(READ_BUFFER_SIZE);
+			ZeroMemory(&requests[i], sizeof(OVERLAPPED));
+			requests[i].hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+			Issue(i);
+		}
+		return true;
+#else
+		file = fopen(name.c_str(), "rb");
+		return file != NULL;
+#endif
+	}
+
+	//Up to max of the next bytes of the file into out. Returns how many, 0 at the end of the file (or on a read error).
+	size_t Read(unsigned char* out, size_t max)
+	{
+#ifdef _WIN32
+		size_t written = 0;
+		while (written < max && !finished)
+		{
+			if (position == size)
+			{
+				//The next block, in the order the reads were issued.
+				DWORD got = 0;
+				if (!pending[current] || !GetOverlappedResult(handle, &requests[current], &got, TRUE))
+				{
+					got = 0;
+				}
+				pending[current] = false;
+				position = 0;
+				size = got;
+				if (got == 0)
+				{
+					finished = true;
+					break;
+				}
+			}
+			const size_t n = std::min(max - written, size - position);
+			memcpy(out + written, blocks[current].data() + position, n);
+			written += n;
+			position += n;
+			if (position == size)
+			{
+				//The block is used up: read the next part of the file into it, unless this was the end.
+				if (size == READ_BUFFER_SIZE)
+				{
+					Issue(current);
+				}
+				current = (current + 1) % READ_AHEAD_BLOCKS;
+				if (size < READ_BUFFER_SIZE)
+				{
+					finished = true;
+				}
+				position = size = 0;
+			}
+		}
+		return written;
+#else
+		return fread(out, 1, max, file);
+#endif
+	}
+
+	void Close()
+	{
+#ifdef _WIN32
+		if (handle == INVALID_HANDLE_VALUE)
+		{
+			return;
+		}
+		CancelIo(handle);
+		for (int i = 0; i < READ_AHEAD_BLOCKS; i++)
+		{
+			DWORD got;
+			if (pending[i])
+			{
+				GetOverlappedResult(handle, &requests[i], &got, TRUE);
+			}
+			CloseHandle(requests[i].hEvent);
+		}
+		CloseHandle(handle);
+		handle = INVALID_HANDLE_VALUE;
+#else
+		if (file != NULL)
+		{
+			fclose(file);
+			file = NULL;
+		}
+#endif
+	}
+
+private:
+#ifdef _WIN32
+	void Issue(int i)
+	{
+		requests[i].Offset = (DWORD)next_offset;
+		requests[i].OffsetHigh = (DWORD)(next_offset >> 32);
+		ResetEvent(requests[i].hEvent);
+		pending[i] = ReadFile(handle, blocks[i].data(), READ_BUFFER_SIZE, NULL, &requests[i]) || GetLastError() == ERROR_IO_PENDING;
+		next_offset += READ_BUFFER_SIZE;
+	}
+
+	HANDLE handle;
+	vector<unsigned char> blocks[READ_AHEAD_BLOCKS];
+	OVERLAPPED requests[READ_AHEAD_BLOCKS];
+	bool pending[READ_AHEAD_BLOCKS];
+	unsigned long long next_offset; //of the next read issued
+	int current; //the block being used, in the order of the file
+	size_t position, size; //in the current block
+	bool finished;
+#else
+	FILE* file;
+#endif
+};
+
 //A buffer for reading a binary file in large blocks.
 struct read_buffer
 {
-	FILE* file;
+	Block_reader file;
 	vector<unsigned char> data;
 	size_t position; //first unread byte
 	size_t filled; //bytes of data in the buffer
@@ -793,7 +945,7 @@ struct read_buffer
 			filled -= position;
 			position = 0;
 
-			size_t read = fread(data.data() + filled, 1, data.size() - filled, file);
+			size_t read = file.Read(data.data() + filled, data.size() - filled);
 			if (read == 0)
 			{
 				return false;
@@ -826,9 +978,7 @@ read_result read_batch_from_binary_file(string filename, Batch_smooth* batch, nf
 	bool stopped = false;
 
 	read_buffer input;
-	input.file = fopen(filename.c_str(), "rb");
-
-	if (input.file == NULL)
+	if (!input.file.Open(filename))
 	{
 		cout << "Failed to open input saved relations file " << filename << endl;
 		return READ_FAILED;
@@ -900,7 +1050,7 @@ read_result read_batch_from_binary_file(string filename, Batch_smooth* batch, nf
 		//Part of a relation is left at the end of the file.
 		corrupt = true;
 	}
-	fclose(input.file);
+	input.file.Close();
 
 	if (!stopped)
 	{
