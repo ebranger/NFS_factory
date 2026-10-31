@@ -207,6 +207,7 @@ struct Gpu_number
 };
 
 #define ROOT_MAX_DEPTH 40 //of the Newton iteration, which halves the length down to INVERSE_EXACT_LIMBS
+#define ROOT_CACHE_ALIGN 18 //the grain in bits of the sizes for which the transform of the top of the prime product is kept
 
 //The root of the scaled remainder tree on the GPU: the steps of Cpu_tree_backend::Scaled_root, Barrett_reduce and
 //Tree_products::Inverse on numbers in device memory, with the same numbers in every step, so that the result is the same.
@@ -225,9 +226,10 @@ public:
 private:
 	void Newton_inverse(int depth, const uint64_t* a, size_t n);
 	const uint64_t* Floor_shift(Gpu_number& x, size_t limbs, bool negative, size_t& out_limbs);
-	void Barrett_reduce(Gpu_number& r, const uint64_t* a, size_t a_limbs, mp_bitcnt_t a_bits, const uint64_t* x, size_t x_limbs, mp_bitcnt_t e, mp_bitcnt_t bits);
+	void Barrett_reduce(Gpu_number& r, const uint64_t* a, size_t a_limbs, mp_bitcnt_t a_bits, const uint64_t* x, size_t x_limbs, mp_bitcnt_t e, mp_bitcnt_t bits,
+		bool constant_a = false);
 	void Mod_2expm1(Gpu_number& result, const uint64_t* a, size_t a_limbs, mp_bitcnt_t L);
-	void Multiply(Gpu_number& out, const uint64_t* a, size_t a_limbs, const uint64_t* b, size_t b_limbs);
+	void Multiply(Gpu_number& out, const uint64_t* a, size_t a_limbs, const uint64_t* b, size_t b_limbs, long long b_key = -1);
 	mp_bitcnt_t Product_mod(Gpu_number& out, const uint64_t* y, size_t y_limbs, const uint64_t* x, size_t x_limbs, mp_bitcnt_t min_L);
 	bool Transform_pair(const Ntt_plan& plan, const uint64_t* a, const uint64_t* b);
 	void Sizes(const uint64_t* a, size_t a_limbs, const uint64_t* b, size_t b_limbs);
@@ -242,6 +244,11 @@ private:
 	uint32_t host_words[8];
 	uint32_t *X, *Y;
 	size_t transform_words;
+	//The transform of the b of the last Multiply with a b_key, which the next one with the same key and plan reuses.
+	uint32_t* cached;
+	size_t cached_words;
+	long long cached_key;
+	Ntt_plan cached_plan;
 	Gpu_number level[ROOT_MAX_DEPTH]; //the inverses of the Newton iteration, of the whole root at 0
 	Gpu_number shifted, d, magnitude, product, remainder, part, quotient, temp, temp2, prime_product_gpu;
 	mpz_srcptr prime_product_host; //of prime_product_gpu
@@ -256,6 +263,9 @@ Gpu_root::Gpu_root(Gpu_ntt* gpu)
 	CUDA_CHECK(cudaMalloc(&words, 8 * sizeof(uint32_t)));
 	X = Y = NULL;
 	transform_words = 0;
+	cached = NULL;
+	cached_words = 0;
+	cached_key = -1;
 	prime_product_host = NULL;
 	prime_product_limbs = 0;
 }
@@ -263,6 +273,7 @@ Gpu_root::Gpu_root(Gpu_ntt* gpu)
 Gpu_root::~Gpu_root()
 {
 	cudaFree(words);
+	cudaFree(cached);
 	cudaFree(X);
 	cudaFree(Y);
 }
@@ -334,8 +345,9 @@ bool Gpu_root::Transform_pair(const Ntt_plan& plan, const uint64_t* a, const uin
 	return true;
 }
 
-//out = a * b. out must not be a or b.
-void Gpu_root::Multiply(Gpu_number& out, const uint64_t* a, size_t a_limbs, const uint64_t* b, size_t b_limbs)
+//out = a * b. out must not be a or b. With b_key (0 or more), b is the same number whenever the key is, and its transform is
+//kept for the next product with the key and the same plan.
+void Gpu_root::Multiply(Gpu_number& out, const uint64_t* a, size_t a_limbs, const uint64_t* b, size_t b_limbs, long long b_key)
 {
 	Sizes(a, a_limbs, b, b_limbs);
 	Ntt_plan plan;
@@ -353,9 +365,50 @@ void Gpu_root::Multiply(Gpu_number& out, const uint64_t* a, size_t a_limbs, cons
 		From_mpz(out, host_z.get_mpz_t(), a_limbs + b_limbs);
 		return;
 	}
-	Transform_pair(plan, a, b);
+	if (b_key >= 0)
+	{
+		//A plan for sizes rounded up, so that it is the same for products of about the same size, and b's transform can be kept.
+		const mp_bitcnt_t grain = (mp_bitcnt_t)1 << ROOT_CACHE_ALIGN;
+		Ntt_plan rounded;
+		if (ntt_plan_product(rounded, (host_words[1] + grain - 1) / grain * grain, (host_words[3] + grain - 1) / grain * grain))
+		{
+			plan = rounded;
+		}
+	}
 	out.Resize(Gpu_ntt::Combine_limbs(plan));
 	Gpu_level o = { out.d, out.n, words + 4, 1 };
+	if (b_key >= 0)
+	{
+		const bool same = (b_key == cached_key && plan.primes == cached_plan.primes && plan.log_length == cached_plan.log_length &&
+			plan.coefficient_bits == cached_plan.coefficient_bits);
+		const size_t words_needed = (size_t)plan.primes * plan.Length();
+		if (!same)
+		{
+			if (words_needed > cached_words)
+			{
+				cudaFree(cached);
+				cached_words = words_needed + words_needed / 8;
+				CUDA_CHECK(cudaMalloc(&cached, cached_words * sizeof(uint32_t)));
+			}
+			Gpu_level lb = { const_cast<uint64_t*>(b), host_words[2], words + 2, 1 };
+			gpu->Forward(plan, lb, cached, 0);
+			cached_key = b_key;
+			cached_plan = plan;
+		}
+		if (words_needed > transform_words)
+		{
+			cudaFree(X);
+			cudaFree(Y);
+			transform_words = words_needed + words_needed / 8;
+			CUDA_CHECK(cudaMalloc(&X, transform_words * sizeof(uint32_t)));
+			CUDA_CHECK(cudaMalloc(&Y, transform_words * sizeof(uint32_t)));
+		}
+		Gpu_level la = { const_cast<uint64_t*>(a), host_words[0], words, 1 };
+		gpu->Forward(plan, la, X, 0);
+		gpu->Combine_products(plan, PRODUCTS_PLAIN, X, cached, X, 1, false, o, 0);
+		return;
+	}
+	Transform_pair(plan, a, b);
 	gpu->Combine_products(plan, PRODUCTS_PLAIN, X, Y, X, 1, false, o, 0);
 }
 
@@ -499,7 +552,11 @@ void Gpu_root::Mod_2expm1(Gpu_number& result, const uint64_t* a, size_t a_limbs,
 }
 
 //r = a mod x, as Cpu_tree_backend::Barrett_reduce, with the inverse in level[0]. r must not be a.
-void Gpu_root::Barrett_reduce(Gpu_number& r, const uint64_t* a, size_t a_limbs, mp_bitcnt_t a_bits, const uint64_t* x, size_t x_limbs, mp_bitcnt_t e, mp_bitcnt_t bits)
+//With constant_a (a is the prime product), the top part of a that the quotient is estimated from starts at a multiple of
+//2^ROOT_CACHE_ALIGN bits, so that it is the same number for roots of about the same size, and Multiply keeps its transform. The
+//estimate then uses a few more bits of a, and is still not above the quotient.
+void Gpu_root::Barrett_reduce(Gpu_number& r, const uint64_t* a, size_t a_limbs, mp_bitcnt_t a_bits, const uint64_t* x, size_t x_limbs, mp_bitcnt_t e, mp_bitcnt_t bits,
+	bool constant_a)
 {
 	if (a_bits < bits)
 	{
@@ -511,12 +568,13 @@ void Gpu_root::Barrett_reduce(Gpu_number& r, const uint64_t* a, size_t a_limbs, 
 	const Gpu_number& V = level[0];
 	const mp_bitcnt_t quotient_bits = a_bits - bits + 1;
 	const mp_bitcnt_t cut = (bits > quotient_bits + GMP_LIMB_BITS) ? bits - quotient_bits - GMP_LIMB_BITS : 0;
-	const mp_bitcnt_t v_shift = e - 2 * bits + cut, a_shift = bits - 1, q_shift = bits + 1 - cut;
+	const mp_bitcnt_t extra = constant_a ? (bits - 1) & (((mp_bitcnt_t)1 << ROOT_CACHE_ALIGN) - 1) : 0;
+	const mp_bitcnt_t v_shift = e - 2 * bits + cut, a_shift = bits - 1 - extra, q_shift = bits + 1 - cut + extra;
 	quotient.Resize((V.n > v_shift / 64 + 1) ? V.n - v_shift / 64 : 1);
 	gpu->Shift(quotient.d, quotient.n, V.d, V.n, (long long)v_shift, 0, false, 0);
 	temp.Resize((a_limbs > a_shift / 64 + 1) ? a_limbs - a_shift / 64 : 1);
 	gpu->Shift(temp.d, temp.n, a, a_limbs, (long long)a_shift, 0, false, 0);
-	Multiply(product, quotient.d, quotient.n, temp.d, temp.n);
+	Multiply(product, quotient.d, quotient.n, temp.d, temp.n, constant_a ? (long long)a_shift : -1);
 	quotient.Resize((product.n > q_shift / 64 + 1) ? product.n - q_shift / 64 : 1);
 	gpu->Shift(quotient.d, quotient.n, product.d, product.n, (long long)q_shift, 0, false, 0);
 
@@ -570,12 +628,13 @@ void Gpu_root::Compute(Gpu_number& fraction, const uint64_t* X, size_t x_limbs, 
 		From_mpz(prime_product_gpu, prime_product, 1);
 		prime_product_host = prime_product;
 		prime_product_limbs = p_limbs;
+		cached_key = -1;
 	}
 	const mp_bitcnt_t product_size = mpz_sizeinbase(prime_product, 2);
 
 	if (product_size <= 2 * bits)
 	{
-		Barrett_reduce(remainder, prime_product_gpu.d, prime_product_gpu.n, product_size, X, x_limbs, e, bits);
+		Barrett_reduce(remainder, prime_product_gpu.d, prime_product_gpu.n, product_size, X, x_limbs, e, bits, true);
 	}
 	else
 	{
@@ -2156,28 +2215,40 @@ void Gpu_tree_backend::Set_stride(Depth& d, size_t count, size_t stride)
 }
 
 //Copy the nodes of a depth from the CPU to the GPU.
+//The numbers are copied as wide as the largest of them (the stride can have room to spare, as for the leaves), into the scratch
+//level, and spread out to the stride on the GPU.
 void Gpu_tree_backend::Upload(int depth)
 {
 	Depth& d = depth_data[depth];
 	const int first = (1 << depth) - 1;
 	const size_t count = d.level.count, stride = d.level.stride;
-	host_limbs.resize(count * stride);
+	size_t width = 1;
+	for (size_t r = 0; r < count; r++)
+	{
+		const size_t n = mpz_size(node[first + r].get_mpz_t());
+		width = (n > width) ? n : width;
+	}
+	if (width > stride)
+	{
+		fprintf(stderr, "Gpu_tree_backend: a node of %zu limbs does not fit in %zu\n", width, stride);
+		exit(3);
+	}
+	host_limbs.resize(count * width);
 	host_sizes.resize(count);
 	for (size_t r = 0; r < count; r++)
 	{
 		mpz_srcptr a = node[first + r].get_mpz_t();
-		size_t n = mpz_size(a);
-		if (n > stride)
-		{
-			fprintf(stderr, "Gpu_tree_backend: a node of %zu limbs does not fit in %zu\n", n, stride);
-			exit(3);
-		}
-		uint64_t* x = host_limbs.data() + r * stride;
+		const size_t n = mpz_size(a);
+		uint64_t* x = host_limbs.data() + r * width;
 		memcpy(x, a->_mp_d, n * sizeof(uint64_t));
-		memset(x + n, 0, (stride - n) * sizeof(uint64_t));
+		memset(x + n, 0, (width - n) * sizeof(uint64_t));
 		host_sizes[r] = (uint32_t)n;
 	}
-	CUDA_CHECK(cudaMemcpy(d.level.limbs, host_limbs.data(), host_limbs.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
+	reserve(scratch_level.limbs, scratch_limb_capacity, count * width);
+	CUDA_CHECK(cudaMemsetAsync(d.level.limbs, 0, count * stride * sizeof(uint64_t)));
+	CUDA_CHECK(cudaMemcpy(scratch_level.limbs, host_limbs.data(), host_limbs.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy2DAsync(d.level.limbs, stride * sizeof(uint64_t), scratch_level.limbs, width * sizeof(uint64_t), width * sizeof(uint64_t), count,
+		cudaMemcpyDeviceToDevice));
 	CUDA_CHECK(cudaMemcpy(d.level.size, host_sizes.data(), count * sizeof(uint32_t), cudaMemcpyHostToDevice));
 }
 
@@ -2619,7 +2690,7 @@ void gpu_product_list(const uint32_t* factors, size_t n, mpz_class& result)
 
 //As many trees as fit in 70 % of the free memory of the GPU (the rest is left for the second stage, the products of the setup,
 //and other programs), from 1 to 5. A tree takes about 20 to 25 bytes per bit of its leaves, measured for 17 to 21 levels.
-int gpu_pipeline(int levels, int max_bits_in_input)
+int gpu_pipeline(int levels, int max_bits_in_input, bool report)
 {
 	gpu_start();
 	size_t free_bytes = 0, total_bytes = 0;
@@ -2629,12 +2700,15 @@ int gpu_pipeline(int levels, int max_bits_in_input)
 	}
 	const double tree_bytes = 26.0 * (double)((size_t)1 << (levels - 1)) * max_bits_in_input + 64e6;
 	int trees = (int)(0.7 * (double)free_bytes / tree_bytes);
-	if (trees < 1)
+	if (trees < 1 && report)
 	{
 		printf("GPU: %.1f GB free may not be enough for a tree of about %.2f GB; treelevels in the polynomial file can make it smaller.\n", free_bytes / 1e9, tree_bytes / 1e9);
 	}
-	trees = (trees < 1) ? 1 : ((trees > 6) ? 6 : trees); //6: four trees on the GPU at once, with a batch being read and one checked
-	printf("GPU: %.1f of %.1f GB free, about %.2f GB per tree: %d batches in progress at once.\n", free_bytes / 1e9, total_bytes / 1e9, tree_bytes / 1e9, trees);
+	trees = (trees < 1) ? 1 : ((trees > GPU_MAX_PIPELINE) ? GPU_MAX_PIPELINE : trees);
+	if (report)
+	{
+		printf("GPU: %.1f of %.1f GB free, about %.2f GB per tree: %d batches in progress at once.\n", free_bytes / 1e9, total_bytes / 1e9, tree_bytes / 1e9, trees);
+	}
 	return trees;
 }
 

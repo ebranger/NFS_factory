@@ -50,7 +50,7 @@ A few optional parameters can also be given in the polynomial file:
 - print: primes smaller than this are not printed for the batch checked side (default 1000, which msieve handles). Not needed with "format: cado".
 - maxa, maxb: relations with |a| larger than maxa, or b larger than maxb, are skipped. There is no limit by default.
 - maxrels: stop after this many relations have been read from the relation file. Useful for testing and timing.
-- treelevels: the maximum number of levels in the remainder tree (default 20). The number of levels is otherwise chosen from the size of the prime product and the relation values. Each level less halves the memory use of the tree, at some cost in speed.
+- treelevels: the maximum number of levels in the remainder tree (default 20). The number of levels is otherwise chosen from the size of the prime product and the relation values. Each level less halves the memory use of the tree, at some cost in speed. The GPU build uses one level more when the memory of the GPU and of the computer still allows six batches in progress at once (for SNFS-240 on a 16 GB GPU: 20 instead of 19 levels, about 4 % faster, about 1.8 GB of GPU memory per batch); treelevels still caps it, and pipeline in the polynomial file turns it off.
 - 3lp: auto (default) or save. Only used when mfbr/mfba is more than 2 lbpr/lbpa, see "Three large primes" below.
 - 3lpfile: the file that "3lp: save" appends the 3LP candidates to. The default is the output file name, followed by a dot, the name of the relation file and ".3lp".
 - 3lptreelevels: the maximum number of levels in the remainder tree when running on a 3LP candidate file (default 22). treelevels is not used for such runs.

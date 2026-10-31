@@ -154,7 +154,7 @@ private:
 
 #ifdef NFS_GPU
 Tree_backend* create_gpu_tree_backend(int levels, int max_bits_in_input); //Gpu_tree_backend.cu
-int gpu_pipeline(int levels, int max_bits_in_input); //Gpu_tree_backend.cu
+int gpu_pipeline(int levels, int max_bits_in_input, bool report); //Gpu_tree_backend.cu
 #endif
 
 //The physical memory that is free, in bytes (0 if unknown).
@@ -170,13 +170,13 @@ static double free_host_memory()
 #endif
 }
 
-int default_pipeline(tree_backend_kind kind, int levels, int max_bits_in_input)
+int default_pipeline(tree_backend_kind kind, int levels, int max_bits_in_input, bool report)
 {
 	int slots = 1;
 #ifdef NFS_GPU
 	if (kind == TREE_BACKEND_GPU)
 	{
-		slots = gpu_pipeline(levels, max_bits_in_input);
+		slots = gpu_pipeline(levels, max_bits_in_input, report);
 	}
 #endif
 	//A batch in progress takes about 420 bytes per relation on the host (its relation, the saved factor list, the leaf and
@@ -187,7 +187,10 @@ int default_pipeline(tree_backend_kind kind, int levels, int max_bits_in_input)
 	{
 		const int fit = (int)(0.5 * host / slot_bytes);
 		slots = (fit < 1) ? 1 : fit;
-		printf("Memory: %.1f GB free, about %.2f GB per batch in progress: %d batches in progress at once.\n", host / 1e9, slot_bytes / 1e9, slots);
+		if (report)
+		{
+			printf("Memory: %.1f GB free, about %.2f GB per batch in progress: %d batches in progress at once.\n", host / 1e9, slot_bytes / 1e9, slots);
+		}
 	}
 	return slots;
 }

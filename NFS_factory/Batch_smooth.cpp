@@ -95,7 +95,16 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	//For SNFS-240 on an i7-14700F, the root being 0.57 times the prime product (19 levels) was as fast as 1.15 times (20 levels),
 	//and 0.29 times (18 levels) about 5 % slower.
 	tree_size = (int)ceil(log2((double)mpz_sizeinbase(prime_product->get_mpz_t(), 2) / max_bits_in_input));
-	tree_size = min((max_tree_levels > 0) ? max_tree_levels : MAX_TREE_LEVELS, tree_size);  // Force the remainder tree to not be too big to save memory.
+	const int tree_cap = (max_tree_levels > 0) ? max_tree_levels : MAX_TREE_LEVELS;
+	//On the GPU, one level more if that still leaves the most batches in progress (the memory of the GPU and of the computer
+	//allows it): the root, which costs the same per batch, is then shared by twice the relations. For SNFS-240 on an RTX 4070 Ti
+	//SUPER, 20 levels (the root 1.15 times the prime product) were about 4 % faster than 19, with about 1.8 GB per batch.
+	if (backend == TREE_BACKEND_GPU && !three_lp_stage && pipeline <= 0 && tree_size + 1 <= tree_cap &&
+		default_pipeline(backend, tree_size + 1, max_bits_in_input, false) >= GPU_MAX_PIPELINE)
+	{
+		tree_size++;
+	}
+	tree_size = min(tree_cap, tree_size);  // Force the remainder tree to not be too big to save memory.
 	tree_size = max(2, tree_size); // The remainder tree needs at least one level above the relations.
 
 	max_entries_before_check = 1 << (tree_size - 1);
@@ -236,11 +245,12 @@ Batch_slot* Batch_smooth::New_slot(int tree_levels, int max_bits_in_input, tree_
 	s->is_smooth = new bool[n];
 	s->lp1 = new unsigned long long[n];
 	s->lp2 = new unsigned long long[n];
+	//The saved factor lists, in one block.
 	s->list_of_factors = new char*[n];
+	char* lists = new char[(size_t)n * MAX_CHARS_IN_RELATION_LIST];
 	for (int i = 0; i < n; i++)
 	{
-		//allocate space for storing the relation factor list
-		s->list_of_factors[i] = new char[MAX_CHARS_IN_RELATION_LIST];
+		s->list_of_factors[i] = lists + (size_t)i * MAX_CHARS_IN_RELATION_LIST;
 		s->a_vals[i] = 0;
 		s->b_vals[i] = 0;
 		s->lp1[i] = 0;
@@ -258,10 +268,7 @@ Batch_slot* Batch_smooth::New_slot(int tree_levels, int max_bits_in_input, tree_
 void Batch_smooth::Delete_slot(Batch_slot* s)
 {
 	delete s->tree;
-	for (int i = 0; i < num_relations_per_batch; i++)
-	{
-		delete[] s->list_of_factors[i];
-	}
+	delete[] s->list_of_factors[0];
 	delete[] s->list_of_factors;
 	delete[] s->a_vals;
 	delete[] s->b_vals;

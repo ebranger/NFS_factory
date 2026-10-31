@@ -87,9 +87,10 @@ public:
 Tree_backend* create_tree_backend(tree_backend_kind kind, int levels, int max_bits_in_input);
 
 //The default number of batches in progress at once for a backend (see Batch_smooth), each with a tree of this size: 1 on the CPU,
-//and on the GPU as many as fit in its free memory, up to 6 (1 if not even two fit). Also no more than fit in half of the free
-//memory of the computer.
-int default_pipeline(tree_backend_kind kind, int levels, int max_bits_in_input);
+//and on the GPU as many as fit in its free memory, up to GPU_MAX_PIPELINE (1 if not even two fit). Also no more than fit in half of
+//the free memory of the computer. With report, the choice is printed.
+#define GPU_MAX_PIPELINE 6 //four trees on the GPU at once, with a batch being read and one checked
+int default_pipeline(tree_backend_kind kind, int levels, int max_bits_in_input, bool report = true);
 
 #ifdef NFS_GPU
 //Use GPU number device (from 0) for the gpu backend. Returns false, after saying why, if there is no such CUDA GPU, or if it is
