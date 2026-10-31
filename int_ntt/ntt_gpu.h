@@ -109,6 +109,7 @@ private:
 	size_t carry_bytes;
 	unsigned int* row_done; //the blocks done in each row, for the carries
 	size_t row_done_count;
+	unsigned int* size_found; //the top found by the blocks of k_size, and the blocks done, 0 between calls
 	size_t combine_coefficients; //that the combine keeps in shared memory, from the shared memory of the GPU
 	void Reserve_scratch(size_t limbs);
 	void Reserve_carry(size_t bytes);

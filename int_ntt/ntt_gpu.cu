@@ -1129,17 +1129,45 @@ __global__ void k_shift(const uint64_t* __restrict__ in, size_t in_limbs, long l
 	}
 }
 
-//One block: *limbs = the number of limbs of in without leading zeros, and *bits its size in bits (1 for 0), if bits is not NULL.
-__global__ void k_size(const uint64_t* __restrict__ in, size_t n, uint32_t* __restrict__ limbs, uint32_t* __restrict__ bits)
+#define SIZE_CHUNK 4096 //limbs per block of k_size
+
+//*limbs = the number of limbs of in without leading zeros, and *bits its size in bits (1 for 0), if bits is not NULL. Each block
+//takes SIZE_CHUNK limbs, the first block the top ones, and skips them if a block above has found a nonzero limb already: the
+//numbers often have many zero limbs on top, which one block would go through one step at a time. found[0] is the largest size
+//found, and found[1] counts the blocks done: the last one writes the results and sets both to 0 for the next call.
+__global__ void k_size(const uint64_t* __restrict__ in, size_t n, uint32_t* __restrict__ limbs, uint32_t* __restrict__ bits, unsigned int* found)
 {
 	__shared__ unsigned int shared_max;
-	const size_t size = block_size(in, n, &shared_max);
+	__shared__ bool skip, last;
+	const size_t top = n - (size_t)blockIdx.x * SIZE_CHUNK;
+	const size_t bottom = (top > SIZE_CHUNK) ? top - SIZE_CHUNK : 0;
 	if (threadIdx.x == 0)
 	{
+		skip = *(volatile unsigned int*)found > top;
+	}
+	__syncthreads();
+	if (!skip)
+	{
+		const size_t size = block_size(in + bottom, top - bottom, &shared_max);
+		if (threadIdx.x == 0 && size != 0)
+		{
+			atomicMax(found, (unsigned int)(bottom + size));
+		}
+	}
+	if (threadIdx.x == 0)
+	{
+		__threadfence();
+		last = (atomicAdd(found + 1, 1u) == gridDim.x - 1);
+	}
+	__syncthreads();
+	if (last && threadIdx.x == 0)
+	{
+		const size_t size = atomicExch(found, 0u);
+		found[1] = 0;
 		*limbs = (uint32_t)size;
 		if (bits != NULL)
 		{
-			*bits = (size == 0) ? 1 : (uint32_t)(64 * (size - 1) + (64 - __clzll((long long)in[size - 1])));
+			*bits = (size == 0) ? 1 : (uint32_t)(64 * (size - 1) + (64 - __clzll((long long)__ldcg(in + size - 1))));
 		}
 	}
 }
@@ -1504,6 +1532,8 @@ Gpu_ntt::Gpu_ntt()
 	carry_bytes = 0;
 	row_done = NULL;
 	row_done_count = 0;
+	CUDA_CHECK(cudaMalloc(&size_found, 2 * sizeof(unsigned int)));
+	CUDA_CHECK(cudaMemset(size_found, 0, 2 * sizeof(unsigned int)));
 
 	//The transforms of up to 4096 points need more than the default 48 KB of shared memory.
 	CUDA_CHECK(cudaFuncSetAttribute(kRow<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)row_smem(12)));
@@ -1529,6 +1559,7 @@ Gpu_ntt::~Gpu_ntt()
 	cudaFree(scratch);
 	cudaFree(carry_scratch);
 	cudaFree(row_done);
+	cudaFree(size_found);
 }
 
 void Gpu_ntt::Reserve_scratch(size_t limbs)
@@ -1764,7 +1795,8 @@ void Gpu_ntt::Add(uint64_t* out, size_t n, const uint64_t* a, size_t a_limbs, co
 
 void Gpu_ntt::Size(const uint64_t* in, size_t n, uint32_t* limbs, uint32_t* bits, cudaStream_t stream)
 {
-	k_size<<<1, 256, 0, stream>>>(in, n, limbs, bits);
+	const size_t blocks = (n + SIZE_CHUNK - 1) / SIZE_CHUNK;
+	k_size<<<(unsigned)((blocks > 0) ? blocks : 1), 256, 0, stream>>>(in, n, limbs, bits, size_found);
 	CUDA_CHECK(cudaGetLastError());
 }
 

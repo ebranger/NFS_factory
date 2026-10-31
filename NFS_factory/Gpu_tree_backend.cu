@@ -153,6 +153,34 @@ template <class T> static void reserve(T*& p, size_t& capacity, size_t count)
 	}
 }
 
+//Page-locked host memory for the large copies to and from the GPU, which then run at full speed. It grows as needed and is kept;
+//resize does not keep the contents.
+template <class T> class Pinned
+{
+public:
+	Pinned() : p(NULL), capacity(0), count(0) {}
+	~Pinned() { cudaFreeHost(p); }
+	Pinned(const Pinned&) = delete;
+	Pinned& operator=(const Pinned&) = delete;
+	void resize(size_t n)
+	{
+		if (n > capacity)
+		{
+			cudaFreeHost(p);
+			capacity = n + n / 8;
+			CUDA_CHECK(cudaMallocHost(&p, capacity * sizeof(T)));
+		}
+		count = n;
+	}
+	T* data() { return p; }
+	size_t size() const { return count; }
+	T& operator[](size_t i) { return p[i]; }
+
+private:
+	T* p;
+	size_t capacity, count;
+};
+
 //A number on the GPU: n limbs, an upper bound of its size, with zeros above the value. The memory grows as needed, and its
 //contents are lost when it grows.
 struct Gpu_number
@@ -1763,6 +1791,27 @@ __global__ void __launch_bounds__(FACTOR_BLOCK) k_factor_smooth(const uint32_t* 
 	}
 }
 
+//The cofactors that the CPU still needs after the checks (LEAF_CANDIDATE, LEAF_TINYQS and LEAF_CHECK_ON_CPU), gathered for the
+//copy to the host, in any order: their leaves (list, after their count), sizes and limbs (K each).
+__global__ void k_gather_cofactors(const unsigned char* __restrict__ classes, const uint64_t* __restrict__ cofactors, const uint32_t* __restrict__ size, int K,
+	size_t count, uint32_t* __restrict__ list, uint32_t* __restrict__ list_count, uint32_t* __restrict__ gathered_size, uint64_t* __restrict__ gathered)
+{
+	for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < count; i += (size_t)gridDim.x * blockDim.x)
+	{
+		const unsigned char c = classes[i];
+		if (c == LEAF_CANDIDATE || c == LEAF_TINYQS || c == LEAF_CHECK_ON_CPU)
+		{
+			const uint32_t j = atomicAdd(list_count, 1u);
+			list[j] = (uint32_t)i;
+			gathered_size[j] = size[i];
+			for (int k = 0; k < K; k++)
+			{
+				gathered[(size_t)j * K + k] = cofactors[i * K + k];
+			}
+		}
+	}
+}
+
 } //namespace
 
 class Gpu_tree_backend : public Cpu_tree_backend
@@ -1833,8 +1882,13 @@ private:
 	void Start_factoring(int K);
 	std::vector<uint32_t> host_factor_list, host_factor_offsets, host_factor_primes;
 	std::vector<int> host_factor_counts, host_factor_entry; //host_factor_entry: the entry of each leaf in the list, or -1
-	std::vector<unsigned char> host_classes;
-	std::vector<unsigned long long> host_large_primes;
+	Pinned<unsigned char> host_classes;
+	Pinned<unsigned long long> host_large_primes;
+	//The cofactors that the CPU needs, gathered on the GPU (k_gather_cofactors): their leaves (after their count), sizes and limbs.
+	uint32_t *gather_list, *gather_sizes;
+	uint64_t* gather_limbs;
+	size_t gather_list_capacity, gather_sizes_capacity, gather_limbs_capacity;
+	Pinned<uint32_t> host_gather_list;
 	std::vector<Depth> depth_data;
 	uint32_t* parent_transform;
 	size_t parent_transform_capacity;
@@ -1844,8 +1898,9 @@ private:
 	size_t scratch_limb_capacity, scratch_size_capacity;
 	uint32_t *shift, *precision;
 	size_t shift_capacity, precision_capacity;
-	std::vector<uint64_t> host_limbs;
-	std::vector<uint32_t> host_sizes, host_words;
+	Pinned<uint64_t> host_limbs;
+	Pinned<uint32_t> host_sizes;
+	std::vector<uint32_t> host_words;
 };
 
 //The table of factor_trial, once.
@@ -1920,6 +1975,9 @@ Gpu_tree_backend::Gpu_tree_backend(int levels, int max_bits_in_input) : Cpu_tree
 	cofactor_limb_capacity = cofactor_size_capacity = 0;
 	checking = false;
 	factoring = false;
+	gather_list = gather_sizes = NULL;
+	gather_limbs = NULL;
+	gather_list_capacity = gather_sizes_capacity = gather_limbs_capacity = 0;
 	classes_valid = false;
 	classes = NULL;
 	large_primes = NULL;
@@ -1965,6 +2023,9 @@ Gpu_tree_backend::~Gpu_tree_backend()
 		cudaEventSynchronize(factored);
 	}
 	cudaEventDestroy(factored);
+	cudaFree(gather_list);
+	cudaFree(gather_sizes);
+	cudaFree(gather_limbs);
 	cudaFree(factor_list);
 	cudaFree(factor_counts);
 	cudaFree(factor_offsets);
@@ -1993,6 +2054,8 @@ void Gpu_tree_backend::Finish_rho()
 	}
 	gpu_start();
 	CUDA_CHECK(cudaEventSynchronize(rho_done));
+	host_classes.resize(num_leaves);
+	host_large_primes.resize(2 * (size_t)num_leaves);
 	CUDA_CHECK(cudaMemcpy(host_classes.data(), classes, num_leaves, cudaMemcpyDeviceToHost));
 	CUDA_CHECK(cudaMemcpy(host_large_primes.data(), large_primes, 2 * (size_t)num_leaves * sizeof(uint64_t), cudaMemcpyDeviceToHost));
 	rho_pending = false;
@@ -2100,7 +2163,7 @@ void Gpu_tree_backend::Upload(int depth)
 	Depth& d = depth_data[depth];
 	const int first = (1 << depth) - 1;
 	const size_t count = d.level.count, stride = d.level.stride;
-	host_limbs.assign(count * stride, 0);
+	host_limbs.resize(count * stride);
 	host_sizes.resize(count);
 	for (size_t r = 0; r < count; r++)
 	{
@@ -2111,7 +2174,9 @@ void Gpu_tree_backend::Upload(int depth)
 			fprintf(stderr, "Gpu_tree_backend: a node of %zu limbs does not fit in %zu\n", n, stride);
 			exit(3);
 		}
-		memcpy(host_limbs.data() + r * stride, a->_mp_d, n * sizeof(uint64_t));
+		uint64_t* x = host_limbs.data() + r * stride;
+		memcpy(x, a->_mp_d, n * sizeof(uint64_t));
+		memset(x + n, 0, (stride - n) * sizeof(uint64_t));
 		host_sizes[r] = (uint32_t)n;
 	}
 	CUDA_CHECK(cudaMemcpy(d.level.limbs, host_limbs.data(), host_limbs.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
@@ -2320,29 +2385,46 @@ void Gpu_tree_backend::Leaf_cofactors()
 				CUDA_CHECK(cudaMemsetAsync(rho_list, 0, sizeof(uint32_t)));
 				k_classify<<<grid_size_leaves(num_leaves), 128>>>(cofactors.limbs, K, cofactors.size, num_leaves, check, classes, large_primes, rho_list + 1, rho_list);
 				CUDA_CHECK(cudaGetLastError());
-				host_classes.resize(num_leaves);
-				host_large_primes.resize(2 * (size_t)num_leaves);
-				CUDA_CHECK(cudaMemcpy(host_classes.data(), classes, num_leaves, cudaMemcpyDeviceToHost));
-				CUDA_CHECK(cudaMemcpy(host_large_primes.data(), large_primes, 2 * (size_t)num_leaves * sizeof(uint64_t), cudaMemcpyDeviceToHost));
 			}
-			host_limbs.resize((size_t)num_leaves * K);
-			host_sizes.resize(num_leaves);
-			CUDA_CHECK(cudaMemcpy(host_limbs.data(), cofactors.limbs, host_limbs.size() * sizeof(uint64_t), cudaMemcpyDeviceToHost));
-			CUDA_CHECK(cudaMemcpy(host_sizes.data(), cofactors.size, num_leaves * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-			//The cofactors as numbers: those that the CPU still needs, if they were checked.
-			parallel_for(num_leaves, 4096, [&](int r)
+			//The cofactors as numbers: only those that the CPU still needs, if they were checked (the classes and large primes are
+			//copied after k_rho, by Finish_rho); otherwise all.
+			size_t count = num_leaves;
+			const uint32_t* leaf = NULL;
+			if (checking)
 			{
-				if (checking && host_classes[r] != LEAF_CANDIDATE && host_classes[r] != LEAF_TINYQS && host_classes[r] != LEAF_CHECK_ON_CPU)
+				reserve(gather_list, gather_list_capacity, (size_t)num_leaves + 1);
+				reserve(gather_sizes, gather_sizes_capacity, (size_t)num_leaves);
+				reserve(gather_limbs, gather_limbs_capacity, (size_t)num_leaves * K);
+				CUDA_CHECK(cudaMemsetAsync(gather_list, 0, sizeof(uint32_t)));
+				k_gather_cofactors<<<grid_size_leaves(num_leaves), 128>>>(classes, cofactors.limbs, cofactors.size, K, num_leaves, gather_list + 1, gather_list,
+					gather_sizes, gather_limbs);
+				CUDA_CHECK(cudaGetLastError());
+				uint32_t gathered = 0;
+				CUDA_CHECK(cudaMemcpy(&gathered, gather_list, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+				count = gathered;
+				host_gather_list.resize(count);
+				if (count > 0)
 				{
-					return;
+					CUDA_CHECK(cudaMemcpy(host_gather_list.data(), gather_list + 1, count * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 				}
-				mpz_ptr a = cofactor[r].get_mpz_t();
-				const int n = (int)host_sizes[r];
+				leaf = host_gather_list.data();
+			}
+			host_limbs.resize(count * K);
+			host_sizes.resize(count);
+			if (count > 0)
+			{
+				CUDA_CHECK(cudaMemcpy(host_limbs.data(), checking ? gather_limbs : cofactors.limbs, count * K * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+				CUDA_CHECK(cudaMemcpy(host_sizes.data(), checking ? gather_sizes : cofactors.size, count * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+			}
+			parallel_for((int)count, 4096, [&](int j)
+			{
+				mpz_ptr a = cofactor[(leaf != NULL) ? leaf[j] : j].get_mpz_t();
+				const int n = (int)host_sizes[j];
 				if (a->_mp_alloc < n)
 				{
 					mpz_realloc2(a, n * GMP_LIMB_BITS);
 				}
-				memcpy(a->_mp_d, host_limbs.data() + (size_t)r * K, n * sizeof(uint64_t));
+				memcpy(a->_mp_d, host_limbs.data() + (size_t)j * K, n * sizeof(uint64_t));
 				a->_mp_size = n;
 			});
 			if (checking)
