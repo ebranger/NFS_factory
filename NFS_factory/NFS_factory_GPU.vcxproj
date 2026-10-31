@@ -30,6 +30,7 @@
     <ClInclude Include="Polynomial.h" />
     <ClInclude Include="Prime_product.h" />
     <ClInclude Include="Profile.h" />
+    <ClInclude Include="Parallel.h" />
     <ClInclude Include="Smooth_factor.h" />
     <ClInclude Include="Tree_backend.h" />
     <ClInclude Include="..\int_ntt\arith32.h" />
@@ -108,7 +109,7 @@
       <Defines>_CRT_SECURE_NO_WARNINGS;NFS_GPU</Defines>
       <Runtime>MTd</Runtime>
       <CudaRuntime>Static</CudaRuntime>
-      <AdditionalOptions>-std=c++17 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>-std=c++17 --default-stream per-thread %(AdditionalOptions)</AdditionalOptions>
     </CudaCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -135,7 +136,7 @@
       <Defines>_CRT_SECURE_NO_WARNINGS;NFS_GPU</Defines>
       <Runtime>MT</Runtime>
       <CudaRuntime>Static</CudaRuntime>
-      <AdditionalOptions>-std=c++17 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>-std=c++17 --default-stream per-thread %(AdditionalOptions)</AdditionalOptions>
     </CudaCompile>
     <Link>
       <SubSystem>Console</SubSystem>

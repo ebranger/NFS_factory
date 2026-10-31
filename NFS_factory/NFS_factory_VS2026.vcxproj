@@ -30,6 +30,7 @@
     <ClInclude Include="Polynomial.h" />
     <ClInclude Include="Prime_product.h" />
     <ClInclude Include="Profile.h" />
+    <ClInclude Include="Parallel.h" />
     <ClInclude Include="Smooth_factor.h" />
     <ClInclude Include="Tree_backend.h" />
     <ClInclude Include="..\int_ntt\arith32.h" />

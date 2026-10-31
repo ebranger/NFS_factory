@@ -63,6 +63,7 @@ struct nfs_parameters {
 	bool save_3lp; // 3LP candidates (mfb more than 2 lpb) are saved to a file instead of checked in a second stage during the run.
 	string file_3lp; // File for the saved 3LP candidates. Empty means the default name.
 	tree_backend_kind backend; // How the products of the trees are computed.
+	int pipeline; // Batches in progress at once (see Batch_smooth). 0 means the default: 4 with the gpu backend, otherwise 1.
 };
 
 //Remove leading and trailing whitespace.
@@ -260,6 +261,17 @@ bool read_polynomial(string filename, nfs_parameters* params)
 			{
 				params->file_3lp = line;
 			}
+			//Batches in progress at once: 1 checks each batch when it is full; more checks them in a pipeline of threads while the
+			//next ones are read, each with its own tree.
+			else if (data == "pipeline")
+			{
+				params->pipeline = stoi(line);
+				if (params->pipeline < 1)
+				{
+					cout << "pipeline on line " << line_number << " of the polynomial file must be at least 1." << endl;
+					return false;
+				}
+			}
 			//How the products of the trees are computed: mpir (default of the CPU build), ntt, or gpu (default of the GPU build).
 			else if (data == "backend")
 			{
@@ -399,9 +411,10 @@ bool truncate_file(const string& name, long long size)
 }
 
 //The progress of a run over its relation files, for resuming an interrupted run and for stopping at a number of relations.
-//After each batch, when all relations read so far are checked and written to the output file, the position is saved to the
-//resume file: the input (the relation file, or the list of relation files), the file reached, and how many records (lines of a
-//text file, relations of a binary file) of it are done, with the number of relations found so far.
+//After each batch, when its relations are checked and written to the output file, the position of its last relation is saved
+//to the resume file: the input (the relation file, or the list of relation files), the file reached, and how many records (lines
+//of a text file, relations of a binary file) of it are done, with the number of relations found so far. With a pipeline, the
+//reader is ahead of that position, and the batches it read after it are checked again when the run resumes.
 //The size of the output file is saved too: relations written after that point by an interrupted run are removed when it resumes,
 //since their batch is checked again. 3LP candidates that wait for the second stage when a run is interrupted are not saved, and
 //their relations are lost.
@@ -418,8 +431,7 @@ struct run_progress
 	long long found_before; //relations found before this run (when resuming)
 	long long target; //stop when this many relations have been found (0: no target)
 	long long relations_added; //by this run, for maxrels
-	long long batches_seen;
-	bool target_reached;
+	atomic<bool> target_reached; //set after a batch, in the thread that checks the batches
 	bool complete; //all files were read
 
 	long long Found()
@@ -429,6 +441,11 @@ struct run_progress
 
 	void Save()
 	{
+		Save(file_index, done_records);
+	}
+
+	void Save(size_t file, long long records)
+	{
 		string temp = resume_filename + ".tmp";
 		FILE* f = fopen(temp.c_str(), "w");
 		if (f == NULL)
@@ -437,8 +454,8 @@ struct run_progress
 			return;
 		}
 		long long bytes = file_size(output_filename);
-		fprintf(f, "input %s\nfile %zu\nname %s\nrecords %lld\nfound %lld\noutput %lld\ncomplete %d\n", input.c_str(), file_index,
-			(file_index < files.size()) ? files[file_index].c_str() : "-", done_records, Found(), (bytes > 0) ? bytes : 0, complete ? 1 : 0);
+		fprintf(f, "input %s\nfile %zu\nname %s\nrecords %lld\nfound %lld\noutput %lld\ncomplete %d\n", input.c_str(), file,
+			(file < files.size()) ? files[file].c_str() : "-", records, Found(), (bytes > 0) ? bytes : 0, complete ? 1 : 0);
 		fclose(f);
 		remove(resume_filename.c_str());
 		rename(temp.c_str(), resume_filename.c_str());
@@ -492,23 +509,34 @@ struct run_progress
 		return true;
 	}
 
+	//Called after each batch, when its relations are written, with the position of its last relation: the file and the records
+	//of it read.
+	void Batch_done(const long long position[2])
+	{
+		Save((size_t)position[0], position[1]);
+		if (target > 0 && Found() >= target && !target_reached)
+		{
+			target_reached = true;
+			cout << "Found " << Found() << " relations, at least the " << target << " that were asked for." << endl;
+		}
+	}
+
+	//Called before each relation is added to the batch, with the records of the current file read so far, for the position of
+	//the relation.
+	void Adding(long long records_read)
+	{
+		batch->Set_read_position((long long)file_index, records_read);
+	}
+
 	//Called after each relation added to the batch, with the records of the current file read so far. Returns true if
 	//reading should stop.
 	bool Relation_added(long long records_read, nfs_parameters* param)
 	{
 		relations_added++;
 		read_records = records_read;
-		if (batch->Get_num_batches_checked() != batches_seen)
+		if (target_reached)
 		{
-			batches_seen = batch->Get_num_batches_checked();
-			done_records = records_read;
-			Save();
-			if (target > 0 && Found() >= target)
-			{
-				target_reached = true;
-				cout << "Found " << Found() << " relations, at least the " << target << " that were asked for." << endl;
-				return true;
-			}
+			return true;
 		}
 		if (param->maxrels > 0 && relations_added >= param->maxrels)
 		{
@@ -632,6 +660,7 @@ read_result read_batch_from_file(string filename, Batch_smooth* batch, nfs_param
 		}
 
 		//Add the relation to be batch smoothness checked. The factor list of the other side is saved for printing.
+		progress.Adding(records);
 		if (!batch->Add_number(a, b, (batch->side == 0) ? alglist : ratlist))
 		{
 			failed_relations++;
@@ -771,6 +800,7 @@ read_result read_batch_from_binary_file(string filename, Batch_smooth* batch, nf
 		}
 
 		//Add the relation to be batch smoothness checked.
+		progress.Adding(records);
 		if (candidates)
 		{
 			mpz_set_ui(cofactor.get_mpz_t(), (mpir_ui)cofactor_limbs[1]);
@@ -871,7 +901,7 @@ int main(int argc, char* argv[])
 		cout << "The list file names relation files, one per line, which are read in order. With -rels, the run stops when N relations" << endl;
 		cout << "have been found. An interrupted run continues where it was, from <output file>.resume, when it is run again with the" << endl;
 		cout << "same relation file or list. A summary is written to <output file>.status at the end. -threads sets the number of" << endl;
-		cout << "threads for the leaves of the remainder tree (default 1 in the CPU build, 8 in the GPU build)." << endl;
+		cout << "threads for checking the cofactors and factoring the relations found (default 1 in the CPU build, 8 in the GPU build)." << endl;
 		return 0;
 	}
 	omp_set_num_threads(threads);
@@ -917,7 +947,6 @@ int main(int argc, char* argv[])
 	progress.found_before = 0;
 	progress.target = target_relations;
 	progress.relations_added = 0;
-	progress.batches_seen = 0;
 	progress.target_reached = false;
 	progress.complete = false;
 
@@ -936,6 +965,7 @@ int main(int argc, char* argv[])
 	param->tree_levels = 0;
 	param->tree_levels_3lp = STAGE2_ONLY_TREE_LEVELS;
 	param->save_3lp = false;
+	param->pipeline = 0;
 #ifdef NFS_GPU
 	param->backend = TREE_BACKEND_GPU;
 #else
@@ -1041,7 +1071,8 @@ int main(int argc, char* argv[])
 	}
 	else
 	{
-		batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels, param->backend);
+		const int pipeline = (param->pipeline > 0) ? param->pipeline : ((param->backend == TREE_BACKEND_GPU) ? 4 : 1);
+		batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels, param->backend, false, pipeline);
 	}
 
 	if (three_lp)
@@ -1080,15 +1111,11 @@ int main(int argc, char* argv[])
 
 	long long total_num_relations = 0;
 
-	//The time in the readers that is not spent on batch checking is counted as reading.
-	unsigned long long batch_cycles = 0;
-	for (int i = PROF_POLY_EVAL; i < PROF_NUM_PHASES; i++)
-	{
-		batch_cycles -= profile_cycles[i];
-	}
+	//The time in the readers that is not spent on batch checking, or waiting for it, is counted as reading.
 	t = profile_now();
 
 	progress.batch = batch;
+	batch->Set_batch_done([&progress](const long long position[2]) { progress.Batch_done(position); });
 	if (progress.Load())
 	{
 		if (progress.complete)
@@ -1165,11 +1192,7 @@ int main(int argc, char* argv[])
 	total_num_relations = batch->Get_num_relations_found();
 
 	unsigned long long reader_cycles = profile_now() - t;
-	for (int i = PROF_POLY_EVAL; i < PROF_NUM_PHASES; i++)
-	{
-		batch_cycles += profile_cycles[i];
-	}
-	profile_cycles[PROF_READ] += reader_cycles - batch_cycles;
+	profile_cycles[PROF_READ] += reader_cycles - batch->Get_reader_blocked_cycles();
 
 	cout << "Batch-checking all numbers took " << (clock() - time) / CLOCKS_PER_SEC << " seconds. Found a total of " << total_num_relations << " relations." << endl;
 

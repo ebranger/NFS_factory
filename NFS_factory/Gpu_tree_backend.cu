@@ -8,6 +8,7 @@
 
 #include "Tree_backend.h"
 #include "ntt_gpu.h"
+#include "Parallel.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <utility>
@@ -894,8 +895,7 @@ void Gpu_tree_backend::Leaf_cofactors()
 			host_sizes.resize(num_leaves);
 			CUDA_CHECK(cudaMemcpy(host_limbs.data(), cofactors.limbs, host_limbs.size() * sizeof(uint64_t), cudaMemcpyDeviceToHost));
 			CUDA_CHECK(cudaMemcpy(host_sizes.data(), cofactors.size, num_leaves * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-#pragma omp parallel for schedule(static, 4096)
-			for (int r = 0; r < num_leaves; r++)
+			parallel_for(num_leaves, 4096, [&](int r)
 			{
 				mpz_ptr a = cofactor[r].get_mpz_t();
 				const int n = (int)host_sizes[r];
@@ -905,7 +905,7 @@ void Gpu_tree_backend::Leaf_cofactors()
 				}
 				memcpy(a->_mp_d, host_limbs.data() + (size_t)r * K, n * sizeof(uint64_t));
 				a->_mp_size = n;
-			}
+			});
 			return;
 		}
 	}
@@ -914,12 +914,25 @@ void Gpu_tree_backend::Leaf_cofactors()
 	Cpu_tree_backend::Leaf_cofactors();
 }
 
+//Before the first use of the GPU: the threads that wait for it sleep instead of spinning, which leaves the CPU to the threads
+//that check the batches (the waits get a little longer).
+static void gpu_start()
+{
+	static bool started = false;
+	if (!started)
+	{
+		started = true;
+		cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+	}
+}
+
 //The product of n factors on the GPU, for the prime products: a product tree whose leaves are products of up to
 //PRODUCT_LEAF_FACTORS factors, computed on the CPU, with one batched step per depth as in Build_product_tree: schoolbook
 //products for small nodes and NTT products above. A depth beyond the longest transform is finished on the CPU.
 #define PRODUCT_LEAF_FACTORS 16
 void gpu_product_list(const uint32_t* factors, size_t n, mpz_class& result)
 {
+	gpu_start();
 	const size_t leaves = (n + PRODUCT_LEAF_FACTORS - 1) / PRODUCT_LEAF_FACTORS;
 	size_t count = 2;
 	while (count < leaves)
@@ -1031,5 +1044,6 @@ void gpu_product_list(const uint32_t* factors, size_t n, mpz_class& result)
 
 Tree_backend* create_gpu_tree_backend(int levels, int max_bits_in_input)
 {
+	gpu_start();
 	return new Gpu_tree_backend(levels, max_bits_in_input);
 }

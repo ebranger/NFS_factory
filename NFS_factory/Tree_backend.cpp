@@ -2,6 +2,7 @@
 //See Bernstein, "How to find smooth parts of integers" and "Scaled remainder trees", for the algorithm.
 
 #include "Tree_backend.h"
+#include "Parallel.h"
 #include <stdlib.h>
 
 #define WRAPAROUND_MIN_LIMBS 512 //Use wraparound products in the remainder tree for nodes of at least this many limbs. Tuned on an i7-14700F.
@@ -433,9 +434,9 @@ void Cpu_tree_backend::Remainder_pair(int i)
 //cofactor is N_i / gcd(N_i, Q).
 void Cpu_tree_backend::Leaf_cofactors()
 {
-#pragma omp parallel for schedule(dynamic, 256)
-	for (int i = first_leaf; i < first_leaf + num_leaves; i++)
+	parallel_for(num_leaves, 256, [&](int leaf)
 	{
+		const int i = first_leaf + leaf;
 		const int parent = (i - 1) / 2;
 		const int sibling = (i % 2 == 1) ? i + 1 : i - 1;
 		mpz_ptr q = cofactor[i - first_leaf].get_mpz_t();
@@ -456,7 +457,7 @@ void Cpu_tree_backend::Leaf_cofactors()
 		mpz_class common;
 		mpz_gcd(common.get_mpz_t(), n, q);
 		mpz_divexact(q, n, common.get_mpz_t());
-	}
+	});
 }
 
 bool tree_level_plan(Ntt_plan& plan, const mp_bitcnt_t* bits, size_t count, mp_bitcnt_t guard)
