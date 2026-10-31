@@ -3,15 +3,12 @@ Compiling NFS_factory
 
 The code is compiled with Visual Studio on 64-bit Windows, and the project files are included. It requires the MPIR library (a Windows-friendly fork of GMP), which has to be built separately.
 
-There are two sets of project files:
+There are two solutions, for Visual Studio 2026 (platform toolset v145), x64 only:
 
-  NFS_factory_VS2026.sln   Current project files, for Visual Studio 2026 (platform toolset v145), x64 only.
-                           Use this one. The steps below describe how to set it up.
-  NFS_factory.sln          The original Visual Studio 2017 project files (toolset v141), kept as a backup.
-                           Newer Visual Studio versions can upgrade these, but they do not include
-                           Prime_product.cpp and expect MPIR in a hard-coded folder.
+  NFS_factory_VS2026.sln   The CPU build, NFS_factory.exe. The steps below describe how to set it up.
+  NFS_factory_GPU.sln      The GPU build, NFS_factory_gpu.exe, which also needs the CUDA Toolkit (see section 5).
 
-Both build the same source files in the NFS_factory folder.
+Both build the same source files in the NFS_factory and int_ntt folders, the GPU build also the .cu files.
 
 
 1. Install the tools

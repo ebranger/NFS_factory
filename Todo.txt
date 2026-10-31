@@ -2,16 +2,38 @@ This is a list of things that could be improved.
 
 Check that the polynomials match the input number. At currently I assume that this check is done by the python driver.
 
-Faster factorization of found relations. For now, just use the Pollard rho implementation from gnfs-lasieve, with squfof for the final factorization.
-If the relations factorization becomes really fast, consider storing only the (a,b) pair, and reconstruct the entire relation if it is found to be smooth.
-A fast tiny ECM would probably be better, and also for 2lp handling.
-A fast tiny ECM with early abort would also be useful for any 3lp factoring.
+A Linux build (CMake). The code has fallbacks for the Windows-specific parts (free host memory, file positions), but the
+binary relation files are read with fread there, without the read-ahead of the Windows build, and it has not been built or tested.
 
-Improvements can be done to further save space in the binary relation format. 
+A relation file format with only the (a,b) pairs. A binary relation is about 50 bytes, 84 % of them the saved primes of the
+other side, which are only needed for the relations found smooth (under 1 %). The saved lists hold all primes of at least 1000
+of the other side's norm, in ascending order, so they can be rebuilt by factoring the norm of the smooth relations on the GPU
+(the factoring of the leaves handles up to 256 bits). With 8 bytes per relation, the SNFS-240 relations (2.2 TB) would take
+0.35 TB, and a run from a hard disk would be limited by the GPU instead of the disk, about twice as fast. Needs a converter
+from the current format, and the CPU build would keep the current format (rebuilding the other side on the CPU is too slow).
 
-Further test rational side batch smoothness checking. I have used batch smoothness checking only on the algebraic side, mainly on degree-4 polynomials.
+The 3LP second stage runs in the thread that checks the batches of the first stage, which waits for it, and the candidates in
+an unfinished second stage batch are not part of the resume position: if a run is interrupted, they are lost.
 
-For smoothness checking on the algebraic side, include only factor-base primes in the prime product. I tried this with generating a 
-factor base using the code in Polynomial.cpp, but it turned out way to slow to be useful.
+Batch checking with early abort: a first batch against the primes up to about 2^20 only (a much smaller tree), and the full
+check only for the few values whose remaining part can still be smooth. Perhaps 15-25 % faster, but it loses some relations,
+and the best split depends on parameters that change during a factorization.
 
+GPU transform kernels: they are limited by latency (registers, barriers between the passes), not memory bandwidth. Passes of
+4 levels with 16 elements per thread would need fewer barriers, at the cost of registers. A few percent at most.
 
+The plan of the integer NTT (number of primes and transform length) is chosen with a cost model of the CPU transforms. On the
+GPU the CRT combine is a larger part, and grows with the square of the number of primes.
+
+The checks of a batch wait for k_rho (Pollard rho on the two large prime cofactors, about 10 ms per batch, one thread per
+cofactor). If the trees get faster than about 16 ms per batch, this becomes the limit; rho with a warp per cofactor (as the
+factoring of the relations) or an earlier start would help.
+
+The prime product of the 3LP second stage (all primes below 2^lbp) takes about 1.3 s to set up on the CPU (the root tests of
+28 million primes). Only noticeable on short runs.
+
+On the CPU still: the polynomial values (about 2 ms per batch per tree thread), the other side's factor list with format cado,
+relation values of more than 256 bits, and tinyqs.
+
+With -rels, a run stops after the batches in progress, so it finds a few more relations than asked for, more with a larger
+pipeline.
