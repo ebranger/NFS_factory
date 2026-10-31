@@ -409,13 +409,11 @@ __global__ void k_pointwise_pairs(const uint32_t* __restrict__ B, const uint32_t
 	}
 }
 
-//The coefficients of rows inverse transforms by the CRT, as 160-bit numbers in 3 limbs: C[(row T + k) 3 + 0..2].
-__global__ void k_crt(const uint32_t* __restrict__ X, size_t rows, int logT, int P, uint64_t* __restrict__ C, Gpu_ntt_tables t)
+//Coefficient k of row row of the inverse transforms, by the CRT, as a 160-bit number in 5 words.
+__device__ __forceinline__ void crt_coefficient(const uint32_t* __restrict__ X, size_t rows, int logT, int P, size_t row, size_t k, const Gpu_ntt_tables& t, uint32_t words[5])
 {
-	const size_t T = (size_t)1 << logT, total = rows * T;
-	for (size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x; e < total; e += (size_t)gridDim.x * blockDim.x)
+	const size_t T = (size_t)1 << logT;
 	{
-		const size_t row = e >> logT, k = e & (T - 1);
 		uint32_t v[NTT_MAX_PRIMES];
 		for (int q = 0; q < P; q++)
 		{
@@ -432,7 +430,11 @@ __global__ void k_crt(const uint32_t* __restrict__ X, size_t rows, int logT, int
 			}
 			v[i] = x;
 		}
-		uint32_t words[6] = { v[P - 1], 0, 0, 0, 0, 0 };
+		for (int w = 0; w < 5; w++)
+		{
+			words[w] = 0;
+		}
+		words[0] = v[P - 1];
 		for (int i = P - 2; i >= 0; i--)
 		{
 			uint64_t carry = v[i];
@@ -443,6 +445,17 @@ __global__ void k_crt(const uint32_t* __restrict__ X, size_t rows, int logT, int
 				carry = x >> 32;
 			}
 		}
+	}
+}
+
+//The coefficients of rows inverse transforms by the CRT, as 160-bit numbers in 3 limbs: C[(row T + k) 3 + 0..2].
+__global__ void k_crt(const uint32_t* __restrict__ X, size_t rows, int logT, int P, uint64_t* __restrict__ C, Gpu_ntt_tables t)
+{
+	const size_t T = (size_t)1 << logT, total = rows * T;
+	for (size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x; e < total; e += (size_t)gridDim.x * blockDim.x)
+	{
+		uint32_t words[5];
+		crt_coefficient(X, rows, logT, P, e >> logT, e & (T - 1), t, words);
 		uint64_t* c = C + e * 3;
 		c[0] = words[0] | ((uint64_t)words[1] << 32);
 		c[1] = words[2] | ((uint64_t)words[3] << 32);
@@ -451,24 +464,34 @@ __global__ void k_crt(const uint32_t* __restrict__ X, size_t rows, int logT, int
 }
 
 constexpr int COMBINE_THREADS = 256;
-constexpr int COMBINE_ITEMS = 8;
+constexpr int COMBINE_ITEMS = 4;
 
-//The sum of the parts of the coefficients c_k 2^(k b) that fall in limb j, as lo + 2^64 hi.
-__device__ void limb_sum(const uint64_t* __restrict__ c, size_t T, int b, size_t j, uint64_t& lo, uint64_t& hi)
+//The coefficients from which limb j is summed: from k_lo to k_hi.
+__device__ __forceinline__ void limb_coefficients(size_t T, int b, size_t j, long long& k_lo, long long& k_hi)
 {
-	lo = 0;
-	hi = 0;
 	const long long pos = 64 * (long long)j;
-	long long k_lo = (pos >= 160) ? (pos - 160) / b + 1 : 0;
-	long long k_hi = (pos + 63) / b;
+	k_lo = (pos >= 160) ? (pos - 160) / b + 1 : 0;
+	k_hi = (pos + 63) / b;
 	if (k_hi > (long long)T - 1)
 	{
 		k_hi = (long long)T - 1;
 	}
+}
+
+//The sum of the parts of the coefficients c_k 2^(k b) that fall in limb j, as lo + 2^64 hi. coefficient(k, v) gives c_k in 3 limbs.
+template <class Coefficient>
+__device__ __forceinline__ void limb_sum(Coefficient coefficient, size_t T, int b, size_t j, uint64_t& lo, uint64_t& hi)
+{
+	lo = 0;
+	hi = 0;
+	const long long pos = 64 * (long long)j;
+	long long k_lo, k_hi;
+	limb_coefficients(T, b, j, k_lo, k_hi);
 	for (long long k = k_lo; k <= k_hi; k++)
 	{
 		const long long d = k * b - pos;
-		const uint64_t* v = c + 3 * k;
+		uint64_t v[3];
+		coefficient(k, v);
 		uint64_t chunk;
 		if (d >= 0)
 		{
@@ -529,14 +552,23 @@ __device__ size_t block_size(const uint64_t* o, size_t n, unsigned int* shared_m
 		*shared_max = 0;
 	}
 	__syncthreads();
-	for (size_t j = threadIdx.x; j < n; j += blockDim.x)
+	//From the top down, blockDim limbs at a time: the top nonzero limb is usually in the first of them.
+	for (size_t top = n; top > 0;)
 	{
-		if (o[j] != 0)
+		const size_t width = (top < blockDim.x) ? top : blockDim.x;
+		if (threadIdx.x < width && o[top - 1 - threadIdx.x] != 0)
 		{
-			atomicMax(shared_max, (unsigned int)(j + 1));
+			atomicMax(shared_max, (unsigned int)(top - threadIdx.x));
 		}
+		__syncthreads();
+		const unsigned int found = *shared_max;
+		__syncthreads();
+		if (found != 0)
+		{
+			break;
+		}
+		top -= width;
 	}
-	__syncthreads();
 	size_t result = *shared_max;
 	__syncthreads();
 	return result;
@@ -570,10 +602,23 @@ __host__ __device__ __forceinline__ size_t combine_limbs(int logT, int b)
 	return (((((size_t)1 << logT) - 1) * (size_t)b + 160) >> 6) + 2;
 }
 
-__global__ void __launch_bounds__(COMBINE_THREADS) k_combine_limbs(const uint64_t* __restrict__ C, int logT, int b, size_t chunks, uint64_t* __restrict__ out, size_t stride,
-	uint8_t* __restrict__ limb_f, uint8_t* __restrict__ chunk_f)
+//The coefficients a chunk of limbs needs at most, for coefficients of b bits.
+__host__ __device__ __forceinline__ size_t chunk_coefficients(int b)
+{
+	return (64 * (COMBINE_CHUNK + 1) + 223) / (size_t)b + 2;
+}
+
+//The most coefficients that k_combine_limbs<true> keeps in shared memory, 5 words each.
+constexpr size_t COMBINE_SHARED_COEFFICIENTS = 4096;
+
+//With FUSED, the coefficients are computed here by the CRT from the inverse transforms X, the ones of the chunk into shared
+//memory, instead of being read from C (k_crt). That saves writing them, and reading each of them several times.
+template <bool FUSED>
+__global__ void __launch_bounds__(COMBINE_THREADS) k_combine_limbs(const uint64_t* __restrict__ C, const uint32_t* __restrict__ X, size_t rows, int P, Gpu_ntt_tables t,
+	int logT, int b, size_t chunks, uint64_t* __restrict__ out, size_t stride, uint8_t* __restrict__ limb_f, uint8_t* __restrict__ chunk_f)
 {
 	__shared__ uint32_t scan[COMBINE_THREADS];
+	extern __shared__ uint32_t coefficient_words[];
 	const size_t T = (size_t)1 << logT;
 	const size_t row = blockIdx.x / chunks, chunk = blockIdx.x % chunks;
 	const uint64_t* c = C + row * T * 3;
@@ -581,11 +626,46 @@ __global__ void __launch_bounds__(COMBINE_THREADS) k_combine_limbs(const uint64_
 	const size_t n_out = combine_limbs(logT, b);
 	uint8_t* f_row = limb_f + row * n_out;
 	const size_t j0 = chunk * COMBINE_CHUNK + (size_t)threadIdx.x * COMBINE_ITEMS;
+
+	long long first = 0;
+	if (FUSED)
+	{
+		//The coefficients of the limbs of the chunk, and of the limb before it.
+		const size_t j_first = chunk * COMBINE_CHUNK;
+		size_t j_last = j_first + COMBINE_CHUNK - 1;
+		j_last = (j_last < n_out - 1) ? j_last : n_out - 1;
+		long long lo_k, hi_k, unused;
+		limb_coefficients(T, b, (j_first > 0) ? j_first - 1 : 0, lo_k, unused);
+		limb_coefficients(T, b, j_last, unused, hi_k);
+		first = lo_k;
+		for (long long k = lo_k + threadIdx.x; k <= hi_k; k += COMBINE_THREADS)
+		{
+			crt_coefficient(X, rows, logT, P, row, (size_t)k, t, coefficient_words + 5 * (k - lo_k));
+		}
+		__syncthreads();
+	}
+	auto coefficient = [&](long long k, uint64_t v[3])
+	{
+		if (FUSED)
+		{
+			const uint32_t* w = coefficient_words + 5 * (k - first);
+			v[0] = w[0] | ((uint64_t)w[1] << 32);
+			v[1] = w[2] | ((uint64_t)w[3] << 32);
+			v[2] = w[4];
+		}
+		else
+		{
+			v[0] = c[3 * k];
+			v[1] = c[3 * k + 1];
+			v[2] = c[3 * k + 2];
+		}
+	};
+
 	uint32_t composed = CARRY_IDENTITY;
 	uint64_t lo, prev_hi = 0;
 	if (j0 > 0 && j0 - 1 < n_out)
 	{
-		limb_sum(c, T, b, j0 - 1, lo, prev_hi);
+		limb_sum(coefficient, T, b, j0 - 1, lo, prev_hi);
 	}
 	for (int it = 0; it < COMBINE_ITEMS; it++)
 	{
@@ -593,7 +673,7 @@ __global__ void __launch_bounds__(COMBINE_THREADS) k_combine_limbs(const uint64_
 		if (j < n_out)
 		{
 			uint64_t hi;
-			limb_sum(c, T, b, j, lo, hi);
+			limb_sum(coefficient, T, b, j, lo, hi);
 			uint64_t s = lo + prev_hi;
 			uint32_t g = (s < lo);
 			uint32_t f = g | ((g | (s == ~0ULL ? 1u : 0u)) << 1);
@@ -778,7 +858,8 @@ __global__ void k_extract(const uint64_t* __restrict__ in, size_t in_stride, con
 	{
 		if (o[j] != 0)
 		{
-			atomicMin(&shared_min, (unsigned int)j);
+			atomicMin(&shared_min, (unsigned int)j); //each thread's first is its lowest
+			break;
 		}
 	}
 	__syncthreads();
@@ -1388,6 +1469,7 @@ Gpu_ntt::Gpu_ntt()
 	CUDA_CHECK(cudaFuncSetAttribute(kRow<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)row_smem(12)));
 	CUDA_CHECK(cudaFuncSetAttribute(kCol<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)col_smem(12)));
 	CUDA_CHECK(cudaFuncSetAttribute(kCol<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)col_smem(12)));
+	CUDA_CHECK(cudaFuncSetAttribute(k_combine_limbs<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(5 * sizeof(uint32_t) * COMBINE_SHARED_COEFFICIENTS)));
 }
 
 Gpu_ntt::~Gpu_ntt()
@@ -1509,15 +1591,24 @@ void Gpu_ntt::Combine(const Ntt_plan& plan, uint32_t* X, size_t rows, bool cycli
 		exit(3);
 	}
 	Inverse(plan, X, rows, stream);
-	Reserve_scratch(rows * plan.Length() * 3);
 	const size_t n_out = Combine_limbs(plan), chunks = (n_out + COMBINE_CHUNK - 1) / COMBINE_CHUNK;
 	Reserve_carry(rows * (n_out + chunks));
 	uint8_t* limb_f = carry_scratch;
 	uint8_t* chunk_f = carry_scratch + rows * n_out;
 	const int logT = plan.log_length, b = plan.coefficient_bits;
-	k_crt<<<grid_size(rows * plan.Length(), 256), 256, 0, stream>>>(X, rows, logT, plan.primes, scratch, tables);
-	CUDA_CHECK(cudaGetLastError());
-	k_combine_limbs<<<(unsigned)(rows * chunks), COMBINE_THREADS, 0, stream>>>(scratch, logT, b, chunks, out.limbs, out.stride, limb_f, chunk_f);
+	if (chunk_coefficients(b) <= COMBINE_SHARED_COEFFICIENTS)
+	{
+		const size_t coefficients = (chunk_coefficients(b) < plan.Length()) ? chunk_coefficients(b) : plan.Length();
+		const size_t shared = 5 * sizeof(uint32_t) * coefficients;
+		k_combine_limbs<true><<<(unsigned)(rows * chunks), COMBINE_THREADS, shared, stream>>>(NULL, X, rows, plan.primes, tables, logT, b, chunks, out.limbs, out.stride, limb_f, chunk_f);
+	}
+	else
+	{
+		Reserve_scratch(rows * plan.Length() * 3);
+		k_crt<<<grid_size(rows * plan.Length(), 256), 256, 0, stream>>>(X, rows, logT, plan.primes, scratch, tables);
+		CUDA_CHECK(cudaGetLastError());
+		k_combine_limbs<false><<<(unsigned)(rows * chunks), COMBINE_THREADS, 0, stream>>>(scratch, X, rows, plan.primes, tables, logT, b, chunks, out.limbs, out.stride, limb_f, chunk_f);
+	}
 	CUDA_CHECK(cudaGetLastError());
 	k_combine_chunks<<<grid_size(rows, 128), 128, 0, stream>>>(chunk_f, chunks, rows);
 	CUDA_CHECK(cudaGetLastError());
