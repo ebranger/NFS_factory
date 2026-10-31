@@ -73,10 +73,12 @@ public:
 	virtual const unsigned char* Leaf_classes() { return NULL; }
 	virtual const unsigned long long* Leaf_large_primes() { return NULL; }
 
-	//The prime factors of the LEAF_SMOOTH leaves for the output, if the backend finds them (the GPU, in the background after the
-	//checks): Leaf_factors_ready waits for them, and returns false if there are none for this batch. Leaf_factors then gives the
-	//factors of leaf i without its large primes, in increasing order, and returns their number, or -1 if the leaf was not factored.
-	//Leaf_factors is thread safe.
+	//Have Leaf_cofactors also find the prime factors of the smooth leaves for the output, if the backend can (the GPU, in the
+	//background); false if it cannot. The smooth leaves are those of LEAF_SMOOTH if the backend checks the cofactors, and
+	//otherwise those with cofactor 1. Leaf_factors_ready waits for the factors, and returns false if there are none for this
+	//batch. Leaf_factors then gives the factors of leaf i without its large primes, in increasing order, and returns their number,
+	//or -1 if the leaf was not factored. Leaf_factors is thread safe.
+	virtual bool Set_leaf_factoring() { return false; }
 	virtual bool Leaf_factors_ready() { return false; }
 	virtual int Leaf_factors(int index, const unsigned int** factors) { return -1; }
 };

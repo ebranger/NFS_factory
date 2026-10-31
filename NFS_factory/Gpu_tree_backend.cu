@@ -1690,13 +1690,16 @@ __device__ int warp_factor(uint64_t* x, int n, uint32_t* f, uint64_t limit)
 	return count;
 }
 
-//The leaves to factor: LEAF_SMOOTH, except the unused leaves (1), in any order.
-__global__ void k_list_smooth(const unsigned char* __restrict__ classes, const uint64_t* __restrict__ leaves, size_t stride, const uint32_t* __restrict__ size,
-	size_t count, uint32_t* __restrict__ list, uint32_t* __restrict__ list_count)
+//The leaves to factor, in any order: LEAF_SMOOTH if they were checked (classes), and otherwise those with cofactor 1, except the
+//unused leaves (1).
+__global__ void k_list_smooth(const unsigned char* __restrict__ classes, const uint64_t* __restrict__ cofactors, size_t cofactor_stride,
+	const uint32_t* __restrict__ cofactor_size, const uint64_t* __restrict__ leaves, size_t stride, const uint32_t* __restrict__ size, size_t count,
+	uint32_t* __restrict__ list, uint32_t* __restrict__ list_count)
 {
 	for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < count; i += (size_t)gridDim.x * blockDim.x)
 	{
-		if (classes[i] == LEAF_SMOOTH && !(size[i] == 1 && leaves[i * stride] == 1))
+		const bool smooth = (classes != NULL) ? classes[i] == LEAF_SMOOTH : (cofactor_size[i] == 1 && cofactors[i * cofactor_stride] == 1);
+		if (smooth && !(size[i] == 1 && leaves[i * stride] == 1))
 		{
 			list[atomicAdd(list_count, 1u)] = (uint32_t)i;
 		}
@@ -1705,7 +1708,7 @@ __global__ void k_list_smooth(const unsigned char* __restrict__ classes, const u
 
 #define FACTOR_BLOCK 128 //threads in a block of k_factor_smooth
 
-//The factors of the listed leaves without their large primes, a warp each: factor_count[j] of them for list[j] (or -1 if it is
+//The factors of the listed leaves without their large primes (lp, two per leaf, or none), a warp each: factor_count[j] of them for list[j] (or -1 if it is
 //left to the CPU), from factor_offset[j] in the pool, which has room for pool_capacity. pool_used counts the room they need, also
 //beyond pool_capacity: those that do not fit are left to the CPU.
 __global__ void __launch_bounds__(FACTOR_BLOCK) k_factor_smooth(const uint32_t* __restrict__ list, const uint32_t* __restrict__ list_count, const uint64_t* __restrict__ leaves,
@@ -1730,7 +1733,7 @@ __global__ void __launch_bounds__(FACTOR_BLOCK) k_factor_smooth(const uint32_t* 
 			}
 			for (int k = 0; k < 2; k++)
 			{
-				const uint64_t p = lp[2 * (size_t)i + k];
+				const uint64_t p = (lp != NULL) ? lp[2 * (size_t)i + k] : 0;
 				if (p > 1)
 				{
 					n = divide_exact(x, n, p);
@@ -1774,6 +1777,7 @@ public:
 	bool Set_leaf_check(const Leaf_check& check);
 	const unsigned char* Leaf_classes();
 	const unsigned long long* Leaf_large_primes();
+	bool Set_leaf_factoring();
 	bool Leaf_factors_ready();
 	int Leaf_factors(int index, const unsigned int** factors);
 
@@ -1804,6 +1808,7 @@ private:
 	Gpu_level cofactors; //of the leaves
 	size_t cofactor_limb_capacity, cofactor_size_capacity;
 	bool checking; //the cofactors, with check
+	bool factoring; //the smooth leaves, with Start_factoring
 	Leaf_check check;
 	bool classes_valid; //for this batch
 	unsigned char* classes; //on the GPU, and host_classes
@@ -1825,6 +1830,7 @@ private:
 	uint32_t factor_pool; //the room in the pool for this batch: FACTOR_POOL_PER_LEAF per leaf, or what the last batch needed
 	cudaEvent_t factored;
 	bool factors_pending, factors_valid;
+	void Start_factoring(int K);
 	std::vector<uint32_t> host_factor_list, host_factor_offsets, host_factor_primes;
 	std::vector<int> host_factor_counts, host_factor_entry; //host_factor_entry: the entry of each leaf in the list, or -1
 	std::vector<unsigned char> host_classes;
@@ -1913,6 +1919,7 @@ Gpu_tree_backend::Gpu_tree_backend(int levels, int max_bits_in_input) : Cpu_tree
 	cofactors.count = 0;
 	cofactor_limb_capacity = cofactor_size_capacity = 0;
 	checking = false;
+	factoring = false;
 	classes_valid = false;
 	classes = NULL;
 	large_primes = NULL;
@@ -2001,6 +2008,34 @@ const unsigned long long* Gpu_tree_backend::Leaf_large_primes()
 {
 	Finish_rho();
 	return classes_valid ? host_large_primes.data() : NULL;
+}
+
+bool Gpu_tree_backend::Set_leaf_factoring()
+{
+	factoring = true;
+	return true;
+}
+
+//The factoring of the smooth leaves on rho_stream, after what is already on it (k_rho) and on the stream of the thread (the
+//cofactors), a warp per leaf.
+void Gpu_tree_backend::Start_factoring(int K)
+{
+	Depth& leaves = depth_data[levels - 1];
+	CUDA_CHECK(cudaEventRecord(classified, 0));
+	CUDA_CHECK(cudaStreamWaitEvent(rho_stream, classified, 0));
+	factor_pool = (factor_pool > FACTOR_POOL_PER_LEAF * (uint32_t)num_leaves) ? factor_pool : FACTOR_POOL_PER_LEAF * (uint32_t)num_leaves;
+	reserve(factor_list, factor_list_capacity, (size_t)num_leaves + 2);
+	reserve(factor_counts, factor_counts_capacity, (size_t)num_leaves);
+	reserve(factor_offsets, factor_offsets_capacity, (size_t)num_leaves);
+	reserve(factor_primes, factor_primes_capacity, (size_t)factor_pool);
+	CUDA_CHECK(cudaMemsetAsync(factor_list, 0, 2 * sizeof(uint32_t), rho_stream));
+	k_list_smooth<<<grid_size_leaves(num_leaves), 128, 0, rho_stream>>>(checking ? classes : NULL, cofactors.limbs, K, cofactors.size, leaves.level.limbs,
+		leaves.level.stride, leaves.level.size, num_leaves, factor_list + 2, factor_list);
+	k_factor_smooth<<<1024, FACTOR_BLOCK, 0, rho_stream>>>(factor_list + 2, factor_list, leaves.level.limbs, leaves.level.stride, leaves.level.size,
+		checking ? large_primes : NULL, factor_counts, factor_offsets, factor_primes, factor_list + 1, factor_pool);
+	CUDA_CHECK(cudaGetLastError());
+	CUDA_CHECK(cudaEventRecord(factored, rho_stream));
+	factors_pending = true;
 }
 
 //The factors of the smooth leaves, in the thread that checks the batch, which waits for them when it writes the relations.
@@ -2321,21 +2356,11 @@ void Gpu_tree_backend::Leaf_cofactors()
 				CUDA_CHECK(cudaGetLastError());
 				CUDA_CHECK(cudaEventRecord(rho_done, rho_stream));
 				rho_pending = true;
-
-				//Then the factoring of the smooth leaves for the output, after rho on the same stream (a warp per leaf).
-				factor_pool = (factor_pool > FACTOR_POOL_PER_LEAF * (uint32_t)num_leaves) ? factor_pool : FACTOR_POOL_PER_LEAF * (uint32_t)num_leaves;
-				reserve(factor_list, factor_list_capacity, (size_t)num_leaves + 2);
-				reserve(factor_counts, factor_counts_capacity, (size_t)num_leaves);
-				reserve(factor_offsets, factor_offsets_capacity, (size_t)num_leaves);
-				reserve(factor_primes, factor_primes_capacity, (size_t)factor_pool);
-				CUDA_CHECK(cudaMemsetAsync(factor_list, 0, 2 * sizeof(uint32_t), rho_stream));
-				k_list_smooth<<<grid_size_leaves(num_leaves), 128, 0, rho_stream>>>(classes, leaves.level.limbs, leaves.level.stride, leaves.level.size, num_leaves,
-					factor_list + 2, factor_list);
-				k_factor_smooth<<<1024, FACTOR_BLOCK, 0, rho_stream>>>(factor_list + 2, factor_list, leaves.level.limbs, leaves.level.stride, leaves.level.size,
-					large_primes, factor_counts, factor_offsets, factor_primes, factor_list + 1, factor_pool);
-				CUDA_CHECK(cudaGetLastError());
-				CUDA_CHECK(cudaEventRecord(factored, rho_stream));
-				factors_pending = true;
+			}
+			if (factoring)
+			{
+				//Then the factoring of the smooth leaves for the output, after rho on the same stream.
+				Start_factoring(K);
 			}
 			return;
 		}

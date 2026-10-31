@@ -145,6 +145,10 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 			s->tree->Set_leaf_check(check);
 		}
 	}
+	for (Batch_slot* s : slots)
+	{
+		s->tree->Set_leaf_factoring();
+	}
 
 	if (pipelined)
 	{
@@ -995,8 +999,18 @@ Batch_smooth::relation_status Batch_smooth::Format_relation(Batch_slot& s, int i
 	if (three_lp_stage)
 	{
 		//The value is the cofactor from the first stage, and all its primes are below 2^lbp. Those are the large primes,
-		//and the rest of the polynomial value is factored as for other relations.
-		num_large = factor_smooth(large, value.get_mpz_t(), MAX_COFACTOR_PRIMES);
+		//and the rest of the polynomial value is factored as for other relations. The tree may have factored the cofactor already
+		//(as factor_smooth would, which takes values of up to two limbs).
+		const unsigned int* tree_large = NULL;
+		num_large = (s.tree_factors && mpz_size(value.get_mpz_t()) <= 2) ? s.tree->Leaf_factors(index, &tree_large) : -1;
+		if (num_large >= 0 && num_large <= MAX_COFACTOR_PRIMES)
+		{
+			copy(tree_large, tree_large + num_large, large);
+		}
+		else
+		{
+			num_large = factor_smooth(large, value.get_mpz_t(), MAX_COFACTOR_PRIMES);
+		}
 		poly->evaluate_polynomial_homogenous(&temp, a_vals[index], b_vals[index]);
 		mpz_abs(temp.get_mpz_t(), temp.get_mpz_t());
 
@@ -1027,7 +1041,7 @@ Batch_smooth::relation_status Batch_smooth::Format_relation(Batch_slot& s, int i
 	//The factors of the rest, which the tree may have found already (as factor_general would). Otherwise Pollard rho: since the
 	//rest is smooth, it is a decent choice.
 	const unsigned int* tree_factors = NULL;
-	const int num_tree_factors = (s.tree_factors && num_factors == 0) ? s.tree->Leaf_factors(index, &tree_factors) : -1;
+	const int num_tree_factors = (s.tree_factors && !three_lp_stage && num_factors == 0) ? s.tree->Leaf_factors(index, &tree_factors) : -1;
 	if (num_tree_factors >= 0)
 	{
 		num_factors = num_tree_factors;
@@ -1105,7 +1119,7 @@ void Batch_smooth::Output_solutions(Batch_slot& s)
 
 	s.relation_texts.resize(num_relations_per_batch);
 	s.relation_result.resize(num_relations_per_batch);
-	s.tree_factors = !three_lp_stage && s.tree->Leaf_factors_ready();
+	s.tree_factors = s.tree->Leaf_factors_ready();
 	parallel_for(s.entries, 16, [&](int index)
 	{
 		if (s.is_smooth[index])
