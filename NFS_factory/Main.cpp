@@ -30,6 +30,8 @@ and the batch factorization code in CADO-NFS.
 #include <stdlib.h>
 #include <ctype.h>
 #include <limits.h>
+#include <algorithm>
+#include <thread>
 #include <omp.h>
 #ifdef _WIN32
 #include <io.h>
@@ -63,7 +65,7 @@ struct nfs_parameters {
 	bool save_3lp; // 3LP candidates (mfb more than 2 lpb) are saved to a file instead of checked in a second stage during the run.
 	string file_3lp; // File for the saved 3LP candidates. Empty means the default name.
 	tree_backend_kind backend; // How the products of the trees are computed.
-	int pipeline; // Batches in progress at once (see Batch_smooth). 0 means the default: 4 with the gpu backend, otherwise 1.
+	int pipeline; // Batches in progress at once (see Batch_smooth). 0 means the default: on the GPU from its free memory, otherwise 1.
 };
 
 //Remove leading and trailing whitespace.
@@ -439,12 +441,86 @@ struct run_progress
 		return found_before + batch->Get_num_relations_found();
 	}
 
-	void Save()
+	//The resume file is written by a thread of its own, since creating and renaming a file can take several ms on Windows. The
+	//position and the size of the output file are taken together when a batch is done, and the latest of them is written; if the
+	//run stops before that, the resume file holds an earlier one, which is just as valid.
+	thread writer;
+	mutex writer_lock;
+	condition_variable writer_changed;
+	string pending; //the next contents of the resume file, empty if none
+	bool writing;
+	bool writer_stop;
+
+	void Start_writer()
 	{
-		Save(file_index, done_records);
+		writing = false;
+		writer_stop = false;
+		writer = thread([this]
+		{
+			unique_lock<mutex> guard(writer_lock);
+			for (;;)
+			{
+				writer_changed.wait(guard, [this] { return writer_stop || !pending.empty(); });
+				if (pending.empty())
+				{
+					return;
+				}
+				string text;
+				text.swap(pending);
+				writing = true;
+				guard.unlock();
+				Write(text);
+				guard.lock();
+				writing = false;
+				writer_changed.notify_all();
+			}
+		});
 	}
 
-	void Save(size_t file, long long records)
+	//Wait until the resume file is written, and end the writer.
+	void Stop_writer()
+	{
+		{
+			lock_guard<mutex> guard(writer_lock);
+			writer_stop = true;
+		}
+		writer_changed.notify_all();
+		if (writer.joinable())
+		{
+			writer.join();
+		}
+	}
+
+	void Save()
+	{
+		Save(file_index, done_records, file_size(output_filename), false);
+	}
+
+	//The resume file, now or by the writer thread (background), with the size of the output file.
+	void Save(size_t file, long long records, long long bytes, bool background)
+	{
+		char text[4096];
+		snprintf(text, sizeof(text), "input %s\nfile %zu\nname %s\nrecords %lld\nfound %lld\noutput %lld\ncomplete %d\n", input.c_str(), file,
+			(file < files.size()) ? files[file].c_str() : "-", records, Found(), (bytes > 0) ? bytes : 0, complete ? 1 : 0);
+		if (background && writer.joinable())
+		{
+			{
+				lock_guard<mutex> guard(writer_lock);
+				pending = text;
+			}
+			writer_changed.notify_all();
+			return;
+		}
+		//Written now: after any that the writer has.
+		{
+			unique_lock<mutex> guard(writer_lock);
+			writer_changed.wait(guard, [this] { return !writing; });
+			pending.clear();
+		}
+		Write(text);
+	}
+
+	void Write(const string& text)
 	{
 		string temp = resume_filename + ".tmp";
 		FILE* f = fopen(temp.c_str(), "w");
@@ -453,9 +529,7 @@ struct run_progress
 			cout << "Could not write the resume file " << temp << endl;
 			return;
 		}
-		long long bytes = file_size(output_filename);
-		fprintf(f, "input %s\nfile %zu\nname %s\nrecords %lld\nfound %lld\noutput %lld\ncomplete %d\n", input.c_str(), file,
-			(file < files.size()) ? files[file].c_str() : "-", records, Found(), (bytes > 0) ? bytes : 0, complete ? 1 : 0);
+		fputs(text.c_str(), f);
 		fclose(f);
 		remove(resume_filename.c_str());
 		rename(temp.c_str(), resume_filename.c_str());
@@ -509,11 +583,11 @@ struct run_progress
 		return true;
 	}
 
-	//Called after each batch, when its relations are written, with the position of its last relation: the file and the records
-	//of it read.
-	void Batch_done(const long long position[2])
+	//Called after each batch, when its relations are written, with the position of its last relation (the file and the records
+	//of it read) and the size of the output file.
+	void Batch_done(const long long position[2], long long output_size)
 	{
-		Save((size_t)position[0], position[1]);
+		Save((size_t)position[0], position[1], (output_size >= 0) ? output_size : file_size(output_filename), true);
 		if (target > 0 && Found() >= target && !target_reached)
 		{
 			target_reached = true;
@@ -853,7 +927,8 @@ int main(int argc, char* argv[])
 	string inputfile, outputfile, polyfile, listfile;
 	long long target_relations = 0;
 #ifdef NFS_GPU
-	int threads = 8; //The GPU build runs as one process.
+	//The GPU build runs as one process: 8 threads keep up with the GPU on SNFS-240 (RTX 4070 Ti SUPER), or fewer on a smaller CPU.
+	int threads = (int)std::min(8u, std::max(1u, thread::hardware_concurrency()));
 #else
 	int threads = 1; //The CPU build is typically run as several processes.
 #endif
@@ -1071,8 +1146,7 @@ int main(int argc, char* argv[])
 	}
 	else
 	{
-		const int pipeline = (param->pipeline > 0) ? param->pipeline : ((param->backend == TREE_BACKEND_GPU) ? 4 : 1);
-		batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels, param->backend, false, pipeline);
+		batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels, param->backend, false, param->pipeline);
 	}
 
 	if (three_lp)
@@ -1115,7 +1189,8 @@ int main(int argc, char* argv[])
 	t = profile_now();
 
 	progress.batch = batch;
-	batch->Set_batch_done([&progress](const long long position[2]) { progress.Batch_done(position); });
+	batch->Set_batch_done([&progress](const long long position[2], long long output_size) { progress.Batch_done(position, output_size); });
+	progress.Start_writer();
 	if (progress.Load())
 	{
 		if (progress.complete)
@@ -1207,6 +1282,7 @@ int main(int argc, char* argv[])
 		fclose(status);
 	}
 
+	progress.Stop_writer();
 	delete batch;
 	delete param->algebraic_polynomial;
 	delete param->rational_polynomial;

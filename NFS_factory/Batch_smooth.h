@@ -47,8 +47,8 @@ public:
 	//If NULL, that factor list is printed as it was read.
 	//backend: the implementation of the tree computations.
 	//three_lp_stage: if true, this is the 3LP second stage. Its inputs are the cofactors given with Add_candidate, which are checked against all primes below 2^lbp (fblim and mfb are not used).
-	//pipeline: the number of batches in progress at once (see Batch_slot), each with its own tree. 1 checks each batch when it is
-	//full, in the calling thread. With more, the batches are checked in a pipeline of threads while the next ones are read: the
+	//pipeline: the number of batches in progress at once (see Batch_slot), each with its own tree, or 0 for the default of the
+	//backend (default_pipeline). 1 checks each batch when it is full, in the calling thread. With more, the batches are checked in a pipeline of threads while the next ones are read: the
 	//polynomial values and the trees (by up to two threads, as the trees use the GPU), and then the cofactors and the output (one
 	//thread, in the order of the batches, so that the output does not depend on the pipeline). The second stage always uses 1.
 	Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, int max_tree_levels, tree_backend_kind backend, bool three_lp_stage = false, int pipeline = 1);
@@ -63,8 +63,8 @@ public:
 	//by the batch done callback.
 	void Set_read_position(long long first, long long second);
 	//Called after each batch, in their order, when its relations are written to the output file (in the thread that writes them),
-	//with the read position of its last relation.
-	void Set_batch_done(function<void(const long long position[2])> callback);
+	//with the read position of its last relation, and the size of the output file then (-1 if it could not be written).
+	void Set_batch_done(function<void(const long long position[2], long long output_size)> callback);
 	//The time the thread that adds the relations spent in Add_* and Finish waiting for the checks, or doing them (pipeline 1).
 	unsigned long long Get_reader_blocked_cycles();
 
@@ -95,6 +95,7 @@ private:
 	bool Complete_other_side(Batch_slot& s, int index, string& list);
 
 	string save_filename;
+	FILE* output; //open from the first batch on; flushed after each batch, so that its size is that of the relations written
 	int tree_size;
 	int max_entries_before_check;
 	atomic<long long> num_relations_found;
@@ -140,7 +141,8 @@ private:
 	vector<Batch_slot*> slots;
 	Batch_slot* filling;
 	long long read_position[2];
-	function<void(const long long position[2])> batch_done;
+	function<void(const long long position[2], long long output_size)> batch_done;
+	long long output_size;
 	bool pipelined;
 	mutex lock;
 	condition_variable changed;

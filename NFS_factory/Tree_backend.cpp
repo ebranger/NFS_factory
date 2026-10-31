@@ -147,7 +147,19 @@ private:
 
 #ifdef NFS_GPU
 Tree_backend* create_gpu_tree_backend(int levels, int max_bits_in_input); //Gpu_tree_backend.cu
+int gpu_pipeline(int levels, int max_bits_in_input); //Gpu_tree_backend.cu
 #endif
+
+int default_pipeline(tree_backend_kind kind, int levels, int max_bits_in_input)
+{
+#ifdef NFS_GPU
+	if (kind == TREE_BACKEND_GPU)
+	{
+		return gpu_pipeline(levels, max_bits_in_input);
+	}
+#endif
+	return 1;
+}
 
 Tree_backend* create_tree_backend(tree_backend_kind kind, int levels, int max_bits_in_input)
 {

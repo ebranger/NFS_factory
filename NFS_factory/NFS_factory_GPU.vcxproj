@@ -105,7 +105,7 @@
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <CudaCompile>
-      <CodeGeneration>compute_89,sm_89</CodeGeneration>
+      <CodeGeneration>compute_75,sm_75;compute_80,sm_80;compute_86,sm_86;compute_89,sm_89;compute_90,sm_90;compute_120,sm_120;compute_120,compute_120</CodeGeneration>
       <Defines>_CRT_SECURE_NO_WARNINGS;NFS_GPU</Defines>
       <Runtime>MTd</Runtime>
       <CudaRuntime>Static</CudaRuntime>
@@ -132,7 +132,7 @@
       <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
     </ClCompile>
     <CudaCompile>
-      <CodeGeneration>compute_89,sm_89</CodeGeneration>
+      <CodeGeneration>compute_75,sm_75;compute_80,sm_80;compute_86,sm_86;compute_89,sm_89;compute_90,sm_90;compute_120,sm_120;compute_120,compute_120</CodeGeneration>
       <Defines>_CRT_SECURE_NO_WARNINGS;NFS_GPU</Defines>
       <Runtime>MT</Runtime>
       <CudaRuntime>Static</CudaRuntime>

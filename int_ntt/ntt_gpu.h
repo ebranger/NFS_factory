@@ -107,6 +107,10 @@ private:
 	size_t scratch_limbs;
 	uint8_t* carry_scratch; //the carry functions of the limbs and chunks of Combine
 	size_t carry_bytes;
+	unsigned int* row_done; //the blocks done in each row, for the carries
+	size_t row_done_count;
+	size_t combine_coefficients; //that the combine keeps in shared memory, from the shared memory of the GPU
 	void Reserve_scratch(size_t limbs);
 	void Reserve_carry(size_t bytes);
+	void Reserve_rows(size_t rows);
 };

@@ -138,13 +138,14 @@ private:
 };
 
 //Device memory that grows as needed and is kept.
+//With some room to spare, since the sizes vary a little from batch to batch, and cudaFree waits for the whole GPU.
 template <class T> static void reserve(T*& p, size_t& capacity, size_t count)
 {
 	if (count > capacity)
 	{
 		cudaFree(p);
-		CUDA_CHECK(cudaMalloc(&p, count * sizeof(T)));
-		capacity = count;
+		capacity = count + count / 8;
+		CUDA_CHECK(cudaMalloc(&p, capacity * sizeof(T)));
 	}
 }
 
@@ -291,9 +292,9 @@ bool Gpu_root::Transform_pair(const Ntt_plan& plan, const uint64_t* a, const uin
 	{
 		cudaFree(X);
 		cudaFree(Y);
-		CUDA_CHECK(cudaMalloc(&X, words_needed * sizeof(uint32_t)));
-		CUDA_CHECK(cudaMalloc(&Y, words_needed * sizeof(uint32_t)));
-		transform_words = words_needed;
+		transform_words = words_needed + words_needed / 8;
+		CUDA_CHECK(cudaMalloc(&X, transform_words * sizeof(uint32_t)));
+		CUDA_CHECK(cudaMalloc(&Y, transform_words * sizeof(uint32_t)));
 	}
 	Gpu_level la = { const_cast<uint64_t*>(a), host_words[0], words, 1 };
 	Gpu_level lb = { const_cast<uint64_t*>(b), host_words[2], words + 2, 1 };
@@ -814,23 +815,26 @@ void Gpu_tree_backend::Scaled_root(mpz_srcptr prime_product)
 	}
 }
 
+__global__ void k_shifts(const uint32_t* __restrict__ parent_bits, const uint32_t* __restrict__ node_bits, size_t count, uint32_t guard, uint32_t* __restrict__ shift,
+	uint32_t* __restrict__ precision)
+{
+	for (size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x; r < count; r += (size_t)gridDim.x * blockDim.x)
+	{
+		shift[r] = parent_bits[r / 2] - node_bits[r];
+		precision[r] = parent_bits[r / 2] + guard;
+	}
+}
+
 //The shifts and precisions of the middle products of the nodes of a depth: precision = parent bits + guard, and
-//shift = parent bits - node bits.
+//shift = parent bits - node bits, from the sizes of the product tree on the GPU.
 void Gpu_tree_backend::Shifts(int depth)
 {
-	const int first = (1 << depth) - 1;
 	const size_t count = (size_t)1 << depth;
-	host_words.resize(2 * count);
-	for (size_t r = 0; r < count; r++)
-	{
-		const int i = first + (int)r, parent = (i - 1) / 2;
-		host_words[r] = (uint32_t)(node_bits[parent] - node_bits[i]);
-		host_words[count + r] = (uint32_t)(node_bits[parent] + guard);
-	}
 	reserve(shift, shift_capacity, count);
 	reserve(precision, precision_capacity, count);
-	CUDA_CHECK(cudaMemcpy(shift, host_words.data(), count * sizeof(uint32_t), cudaMemcpyHostToDevice));
-	CUDA_CHECK(cudaMemcpy(precision, host_words.data() + count, count * sizeof(uint32_t), cudaMemcpyHostToDevice));
+	const unsigned int blocks = (unsigned int)((count + 255) / 256 < 65536 ? (count + 255) / 256 : 65536);
+	k_shifts<<<blocks, 256>>>(depth_data[depth - 1].bits, depth_data[depth].bits, count, (uint32_t)guard, shift, precision);
+	CUDA_CHECK(cudaGetLastError());
 }
 
 void Gpu_tree_backend::Remainder_tree()
@@ -1040,6 +1044,27 @@ void gpu_product_list(const uint32_t* factors, size_t n, mpz_class& result)
 	cudaFree(bits);
 	cudaFree(X);
 	cudaFree(Y);
+}
+
+//As many trees as fit in 70 % of the free memory of the GPU (the rest is left for the second stage, the products of the setup,
+//and other programs), from 1 to 5. A tree takes about 20 to 25 bytes per bit of its leaves, measured for 17 to 21 levels.
+int gpu_pipeline(int levels, int max_bits_in_input)
+{
+	gpu_start();
+	size_t free_bytes = 0, total_bytes = 0;
+	if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess)
+	{
+		return 2;
+	}
+	const double tree_bytes = 26.0 * (double)((size_t)1 << (levels - 1)) * max_bits_in_input + 64e6;
+	int trees = (int)(0.7 * (double)free_bytes / tree_bytes);
+	if (trees < 1)
+	{
+		printf("GPU: %.1f GB free may not be enough for a tree of about %.2f GB; treelevels in the polynomial file can make it smaller.\n", free_bytes / 1e9, tree_bytes / 1e9);
+	}
+	trees = (trees < 1) ? 1 : ((trees > 5) ? 5 : trees);
+	printf("GPU: %.1f of %.1f GB free, about %.2f GB per tree: %d batches in progress at once.\n", free_bytes / 1e9, total_bytes / 1e9, tree_bytes / 1e9, trees);
+	return trees;
 }
 
 Tree_backend* create_gpu_tree_backend(int levels, int max_bits_in_input)

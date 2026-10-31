@@ -84,8 +84,9 @@ Run it as:
 NFS_factory_GPU.sln builds NFS_factory_gpu.exe, which does the product and remainder trees on an NVIDIA GPU. It
 needs the CUDA Toolkit 13.4 (with its Visual Studio integration, which the CUDA installer adds) and builds the same
 source files as the CPU build, plus the .cu files, with NFS_GPU defined. The project builds code for compute
-capability 8.9 (RTX 40 series); for another GPU, change CodeGeneration (compute_89,sm_89) in
-NFS_factory\NFS_factory_GPU.vcxproj. Another CUDA version needs the "CUDA 13.4" props and targets imports there
-changed to that version.
+capabilities 7.5, 8.0, 8.6, 8.9, 9.0 and 12.0 (RTX 20 series to RTX 50 series, and the data center GPUs of those
+generations), and PTX for 12.0, which newer GPUs compile when the program starts. To build for fewer GPUs, which is
+faster, edit CodeGeneration in NFS_factory\NFS_factory_GPU.vcxproj. CUDA 13 supports compute capability 7.5 and
+later. Another CUDA version needs the "CUDA 13.4" props and targets imports there changed to that version.
 
 The CPU build needs no CUDA. Both builds take the same polynomial and relation files and write the same relations.

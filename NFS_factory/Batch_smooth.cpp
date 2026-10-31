@@ -100,6 +100,7 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 
 	max_entries_before_check = 1 << (tree_size - 1);
 	save_filename = filename;
+	output = NULL;
 	num_relations_found = 0;
 	num_factoring_failures = 0;
 	num_other_side_failures = 0;
@@ -110,6 +111,10 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 
 	//The batch slots, and the threads of the pipeline.
 	num_relations_per_batch = max_entries_before_check;
+	if (pipeline <= 0)
+	{
+		pipeline = three_lp_stage ? 1 : default_pipeline(backend, tree_size, max_bits_in_input);
+	}
 	pipelined = pipeline > 1 && !three_lp_stage;
 	const int num_slots = pipelined ? pipeline : 1;
 	for (int i = 0; i < num_slots; i++)
@@ -163,6 +168,10 @@ Batch_smooth::~Batch_smooth(void)
 	if (candidate_file != NULL)
 	{
 		fclose(candidate_file);
+	}
+	if (output != NULL)
+	{
+		fclose(output);
 	}
 
 	for (Batch_slot* s : slots)
@@ -709,6 +718,12 @@ void Batch_smooth::Run_trees(Batch_slot& s)
 	}
 	t = profile_add(profile, PROF_POLY_EVAL, t);
 
+	//Leaves without a relation (in a batch that is not full) must be 1.
+	for (int index = s.entries; index < num_relations_per_batch; index++)
+	{
+		*s.tree->Leaf(index) = 1;
+	}
+
 	s.root_bits = s.tree->Build_product_tree();
 	t = profile_add(profile, PROF_PRODUCT_TREE, t);
 
@@ -778,7 +793,9 @@ void Batch_smooth::Run_checks(Batch_slot& s)
 	Output_solutions(s);
 	if (batch_done)
 	{
-		batch_done(s.position);
+		t = profile_now();
+		batch_done(s.position, output_size);
+		profile_add(profile, PROF_WRITE, t);
 	}
 }
 
@@ -1049,17 +1066,20 @@ void Batch_smooth::Output_solutions(Batch_slot& s)
 	});
 	t = profile_add(profile, PROF_FACTOR, t);
 
-	FILE* outfile = fopen(save_filename.c_str(), "a");
-
-	if (outfile == NULL)
+	if (output == NULL)
 	{
-		cout << "Could not open output file for writing relations." << endl;
+		output = fopen(save_filename.c_str(), "a");
+		if (output == NULL)
+		{
+			cout << "Could not open output file for writing relations." << endl;
+		}
 	}
+	FILE* outfile = output;
 
-	for (int index = 0; index < num_relations_per_batch; index++)
+	for (int index = 0; index < s.entries; index++)
 	{
 		//If the relation passed the smoothness test, and has been checked.
-		if (index < s.entries && s.is_smooth[index] && outfile != NULL)
+		if (s.is_smooth[index] && outfile != NULL)
 		{
 			if (s.relation_result[index] == RELATION_FACTORING_FAILED)
 			{
@@ -1078,17 +1098,23 @@ void Batch_smooth::Output_solutions(Batch_slot& s)
 		}
 
 		//reset for next iteration.
-		*s.tree->Leaf(index) = 1;
-		s.a_vals[index] = 0;
-		s.b_vals[index] = 0;
 		s.is_smooth[index] = false;
 		s.lp1[index] = 0;
 		s.lp2[index] = 0;
 	}
 
+	//The size of the file, which the second stage may have written to too.
+	output_size = -1;
 	if (outfile != NULL)
 	{
-		fclose(outfile);
+		fflush(outfile);
+#ifdef _WIN32
+		_fseeki64(outfile, 0, SEEK_END);
+		output_size = _ftelli64(outfile);
+#else
+		fseeko(outfile, 0, SEEK_END);
+		output_size = (long long)ftello(outfile);
+#endif
 	}
 
 	profile_add(profile, PROF_WRITE, t);
@@ -1111,7 +1137,7 @@ void Batch_smooth::Set_read_position(long long first, long long second)
 	read_position[1] = second;
 }
 
-void Batch_smooth::Set_batch_done(function<void(const long long position[2])> callback)
+void Batch_smooth::Set_batch_done(function<void(const long long position[2], long long output_size)> callback)
 {
 	batch_done = callback;
 }

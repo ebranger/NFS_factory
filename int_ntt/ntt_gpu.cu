@@ -410,52 +410,59 @@ __global__ void k_pointwise_pairs(const uint32_t* __restrict__ B, const uint32_t
 }
 
 //Coefficient k of row row of the inverse transforms, by the CRT, as a 160-bit number in 5 words.
-__device__ __forceinline__ void crt_coefficient(const uint32_t* __restrict__ X, size_t rows, int logT, int P, size_t row, size_t k, const Gpu_ntt_tables& t, uint32_t words[5])
+//P primes, a template parameter so that the loops are unrolled and the residues stay in registers.
+template <int P>
+__device__ __forceinline__ void crt_coefficient(const uint32_t* __restrict__ X, size_t rows, int logT, size_t row, size_t k, const Gpu_ntt_tables& t, uint32_t* words)
 {
 	const size_t T = (size_t)1 << logT;
+	uint32_t v[P];
+#pragma unroll
+	for (int q = 0; q < P; q++)
 	{
-		uint32_t v[NTT_MAX_PRIMES];
-		for (int q = 0; q < P; q++)
+		v[q] = mul_shoup(X[((size_t)q * rows + row) * T + k], t.scale[q][logT], t.scale_shoup[q][logT], t.p[q]);
+	}
+#pragma unroll
+	for (int i = 1; i < P; i++)
+	{
+		const uint32_t pi = t.p[i];
+		uint32_t x = v[i];
+#pragma unroll
+		for (int j = 0; j < i; j++)
 		{
-			v[q] = mul_shoup(X[((size_t)q * rows + row) * T + k], t.scale[q][logT], t.scale_shoup[q][logT], t.p[q]);
+			uint32_t vj = (v[j] >= pi) ? v[j] - pi : v[j];
+			x = mul_shoup(sub_mod(x, vj, pi), t.garner[j][i], t.garner_shoup[j][i], pi);
 		}
-		for (int i = 1; i < P; i++)
+		v[i] = x;
+	}
+	uint32_t w[5] = { v[P - 1], 0, 0, 0, 0 };
+#pragma unroll
+	for (int i = P - 2; i >= 0; i--)
+	{
+		uint64_t carry = v[i];
+#pragma unroll
+		for (int k2 = 0; k2 < P; k2++)
 		{
-			const uint32_t pi = t.p[i];
-			uint32_t x = v[i];
-			for (int j = 0; j < i; j++)
-			{
-				uint32_t vj = (v[j] >= pi) ? v[j] - pi : v[j];
-				x = mul_shoup(sub_mod(x, vj, pi), t.garner[j][i], t.garner_shoup[j][i], pi);
-			}
-			v[i] = x;
+			uint64_t x = (uint64_t)w[k2] * t.p[i] + carry;
+			w[k2] = (uint32_t)x;
+			carry = x >> 32;
 		}
-		for (int w = 0; w < 5; w++)
-		{
-			words[w] = 0;
-		}
-		words[0] = v[P - 1];
-		for (int i = P - 2; i >= 0; i--)
-		{
-			uint64_t carry = v[i];
-			for (int w = 0; w < P; w++)
-			{
-				uint64_t x = (uint64_t)words[w] * t.p[i] + carry;
-				words[w] = (uint32_t)x;
-				carry = x >> 32;
-			}
-		}
+	}
+#pragma unroll
+	for (int k2 = 0; k2 < 5; k2++)
+	{
+		words[k2] = w[k2];
 	}
 }
 
 //The coefficients of rows inverse transforms by the CRT, as 160-bit numbers in 3 limbs: C[(row T + k) 3 + 0..2].
-__global__ void k_crt(const uint32_t* __restrict__ X, size_t rows, int logT, int P, uint64_t* __restrict__ C, Gpu_ntt_tables t)
+template <int P>
+__global__ void k_crt(const uint32_t* __restrict__ X, size_t rows, int logT, uint64_t* __restrict__ C, Gpu_ntt_tables t)
 {
 	const size_t T = (size_t)1 << logT, total = rows * T;
 	for (size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x; e < total; e += (size_t)gridDim.x * blockDim.x)
 	{
 		uint32_t words[5];
-		crt_coefficient(X, rows, logT, P, e >> logT, e & (T - 1), t, words);
+		crt_coefficient<P>(X, rows, logT, e >> logT, e & (T - 1), t, words);
 		uint64_t* c = C + e * 3;
 		c[0] = words[0] | ((uint64_t)words[1] << 32);
 		c[1] = words[2] | ((uint64_t)words[3] << 32);
@@ -501,10 +508,12 @@ __device__ __forceinline__ void limb_sum(Coefficient coefficient, size_t T, int 
 		{
 			const long long e = -d;
 			const int w = (int)(e >> 6), s = (int)(e & 63);
-			chunk = (w < 3) ? v[w] >> s : 0;
-			if (s != 0 && w + 1 < 3)
+			const uint64_t low = (w == 0) ? v[0] : ((w == 1) ? v[1] : ((w == 2) ? v[2] : 0));
+			const uint64_t high = (w == 0) ? v[1] : ((w == 1) ? v[2] : 0);
+			chunk = low >> s;
+			if (s != 0)
 			{
-				chunk |= v[w + 1] << (64 - s);
+				chunk |= high << (64 - s);
 			}
 		}
 		lo += chunk;
@@ -556,7 +565,7 @@ __device__ size_t block_size(const uint64_t* o, size_t n, unsigned int* shared_m
 	for (size_t top = n; top > 0;)
 	{
 		const size_t width = (top < blockDim.x) ? top : blockDim.x;
-		if (threadIdx.x < width && o[top - 1 - threadIdx.x] != 0)
+		if (threadIdx.x < width && __ldcg(o + top - 1 - threadIdx.x) != 0)
 		{
 			atomicMax(shared_max, (unsigned int)(top - threadIdx.x));
 		}
@@ -608,13 +617,14 @@ __host__ __device__ __forceinline__ size_t chunk_coefficients(int b)
 	return (64 * (COMBINE_CHUNK + 1) + 223) / (size_t)b + 2;
 }
 
-//The most coefficients that k_combine_limbs<true> keeps in shared memory, 5 words each.
+//The most coefficients that k_combine_limbs<true> keeps in shared memory, 5 words each, if the GPU allows that much shared
+//memory per block (Gpu_ntt::combine_coefficients).
 constexpr size_t COMBINE_SHARED_COEFFICIENTS = 4096;
 
 //With FUSED, the coefficients are computed here by the CRT from the inverse transforms X, the ones of the chunk into shared
 //memory, instead of being read from C (k_crt). That saves writing them, and reading each of them several times.
-template <bool FUSED>
-__global__ void __launch_bounds__(COMBINE_THREADS) k_combine_limbs(const uint64_t* __restrict__ C, const uint32_t* __restrict__ X, size_t rows, int P, Gpu_ntt_tables t,
+template <bool FUSED, int P>
+__global__ void __launch_bounds__(COMBINE_THREADS) k_combine_limbs(const uint64_t* __restrict__ C, const uint32_t* __restrict__ X, size_t rows, Gpu_ntt_tables t,
 	int logT, int b, size_t chunks, uint64_t* __restrict__ out, size_t stride, uint8_t* __restrict__ limb_f, uint8_t* __restrict__ chunk_f)
 {
 	__shared__ uint32_t scan[COMBINE_THREADS];
@@ -640,7 +650,7 @@ __global__ void __launch_bounds__(COMBINE_THREADS) k_combine_limbs(const uint64_
 		first = lo_k;
 		for (long long k = lo_k + threadIdx.x; k <= hi_k; k += COMBINE_THREADS)
 		{
-			crt_coefficient(X, rows, logT, P, row, (size_t)k, t, coefficient_words + 5 * (k - lo_k));
+			crt_coefficient<P>(X, rows, logT, row, (size_t)k, t, coefficient_words + 5 * (k - lo_k));
 		}
 		__syncthreads();
 	}
@@ -690,67 +700,18 @@ __global__ void __launch_bounds__(COMBINE_THREADS) k_combine_limbs(const uint64_
 	}
 }
 
-//One thread per row: chunk_f becomes the carry into each chunk.
-__global__ void k_combine_chunks(uint8_t* __restrict__ chunk_f, size_t chunks, size_t rows)
-{
-	for (size_t row = (size_t)blockIdx.x * blockDim.x + threadIdx.x; row < rows; row += (size_t)gridDim.x * blockDim.x)
-	{
-		uint32_t carry = 0;
-		uint8_t* f = chunk_f + row * chunks;
-		for (size_t k = 0; k < chunks; k++)
-		{
-			uint32_t next = carry_apply(f[k], carry);
-			f[k] = (uint8_t)carry;
-			carry = next;
-		}
-	}
-}
-
-//The carries applied to rows of n_out limbs, from the carry functions of the limbs and the carries into the chunks.
-__global__ void __launch_bounds__(COMBINE_THREADS) k_combine_carry(size_t n_out, size_t chunks, uint64_t* __restrict__ out, size_t stride, const uint8_t* __restrict__ limb_f,
-	const uint8_t* __restrict__ chunk_carry)
-{
-	__shared__ uint32_t scan[COMBINE_THREADS];
-	const size_t row = blockIdx.x / chunks, chunk = blockIdx.x % chunks;
-	uint64_t* o = out + row * stride;
-	const uint8_t* f_row = limb_f + row * n_out;
-	const size_t j0 = chunk * COMBINE_CHUNK + (size_t)threadIdx.x * COMBINE_ITEMS;
-	uint32_t f[COMBINE_ITEMS];
-	uint32_t composed = CARRY_IDENTITY;
-#pragma unroll
-	for (int it = 0; it < COMBINE_ITEMS; it++)
-	{
-		const size_t j = j0 + it;
-		f[it] = (j < n_out) ? f_row[j] : CARRY_IDENTITY;
-		composed = carry_compose(composed, f[it]);
-	}
-	uint32_t prefix = block_exclusive_carry_scan(composed, scan);
-	uint32_t carry = carry_apply(prefix, chunk_carry[row * chunks + chunk]);
-#pragma unroll
-	for (int it = 0; it < COMBINE_ITEMS; it++)
-	{
-		const size_t j = j0 + it;
-		if (j < n_out)
-		{
-			o[j] += carry;
-			carry = carry_apply(f[it], carry);
-		}
-	}
-}
-
-//One block per row: the limbs above the product are zeroed. For a cyclic product, the part from bit L upwards is added onto the
-//bottom, with the end-around carry, and 2^L - 1 is 0. Then the size.
-__global__ void __launch_bounds__(COMBINE_THREADS) k_combine_finish(int logT, int b, int cyclic, uint64_t* __restrict__ out, size_t stride, uint32_t* __restrict__ out_size)
+//The finish of a combined row, by one block: the limbs above the product are zeroed. For a cyclic product, the part from bit L
+//upwards is added onto the bottom, with the end-around carry, and 2^L - 1 is 0. Then the size. The limbs written by other blocks
+//of the same kernel are read through L2 (__ldcg).
+__device__ void combine_finish(int logT, int b, int cyclic, uint64_t* __restrict__ o, size_t stride, uint32_t* __restrict__ out_size)
 {
 	__shared__ unsigned int shared_max;
 	__shared__ int all_ones;
 	const size_t T = (size_t)1 << logT;
-	const size_t row = blockIdx.x;
-	uint64_t* o = out + row * stride;
 	const size_t n_out = combine_limbs(logT, b);
 	const int tid = threadIdx.x;
 
-	for (size_t j = n_out + tid; j < stride; j += COMBINE_THREADS)
+	for (size_t j = n_out + tid; j < stride; j += blockDim.x)
 	{
 		o[j] = 0;
 	}
@@ -769,39 +730,62 @@ __global__ void __launch_bounds__(COMBINE_THREADS) k_combine_finish(int logT, in
 			for (int w = 0; w < 3; w++)
 			{
 				size_t j = L_limbs + w;
-				uint64_t v = (j < n_out) ? o[j] >> L_bit : 0;
+				uint64_t v = (j < n_out) ? __ldcg(o + j) >> L_bit : 0;
 				if (L_bit != 0 && j + 1 < n_out)
 				{
-					v |= o[j + 1] << (64 - L_bit);
+					v |= __ldcg(o + j + 1) << (64 - L_bit);
 				}
 				high[w] = v;
 			}
-			o[L_limbs] &= L_mask;
+			o[L_limbs] = __ldcg(o + L_limbs) & L_mask;
 			for (size_t j = L_limbs + 1; j < n_out; j++)
 			{
 				o[j] = 0;
 			}
-			add_small(o, L_limbs + 1, high);
+			uint64_t carry = 0;
+			for (size_t j = 0; j <= L_limbs && (j < 3 || carry != 0); j++)
+			{
+				const uint64_t a = (j < 3) ? high[j] : 0;
+				uint64_t s = __ldcg(o + j) + a;
+				uint64_t c = (s < a);
+				s += carry;
+				c |= (s < carry);
+				o[j] = s;
+				carry = c;
+			}
 			if ((o[L_limbs] >> L_bit) & 1)
 			{
 				o[L_limbs] &= L_mask;
-				uint64_t one[3] = { 1, 0, 0 };
-				add_small(o, L_limbs + 1, one);
+				for (size_t j = 0; j <= L_limbs; j++)
+				{
+					const uint64_t v = __ldcg(o + j) + 1;
+					o[j] = v;
+					if (v != 0)
+					{
+						break;
+					}
+				}
 			}
 			all_ones = (L_bit == 0 || o[L_limbs] == L_mask);
 		}
 		__syncthreads();
-		for (size_t j = tid; j < L_limbs; j += COMBINE_THREADS)
+		//2^L - 1, all ones: checked blockDim limbs at a time, stopping at the first that is not.
+		for (size_t base = 0; base < L_limbs; base += blockDim.x)
 		{
-			if (o[j] != ~0ULL)
+			const size_t j = base + tid;
+			if (j < L_limbs && __ldcg(o + j) != ~0ULL)
 			{
 				all_ones = 0;
 			}
+			__syncthreads();
+			if (!all_ones)
+			{
+				break;
+			}
 		}
-		__syncthreads();
 		if (all_ones)
 		{
-			for (size_t j = tid; j <= L_limbs; j += COMBINE_THREADS)
+			for (size_t j = tid; j <= L_limbs; j += blockDim.x)
 			{
 				o[j] = 0;
 			}
@@ -812,7 +796,98 @@ __global__ void __launch_bounds__(COMBINE_THREADS) k_combine_finish(int logT, in
 	size_t size = block_size(o, n_out, &shared_max);
 	if (tid == 0)
 	{
-		out_size[row] = (uint32_t)size;
+		out_size[0] = (uint32_t)size;
+	}
+}
+
+//The carries of rows of n limbs, from the carry function of each limb (limb_f) and of each chunk of COMBINE_CHUNK limbs (chunk_f),
+//with carry_in into each row. Each block works out the carry into its chunk from the chunks before it, and applies the carries.
+//The last block of a row to finish (row_done counts them) then writes the carry out of the row, or for a subtraction the borrow,
+//if carry_out is not NULL, and does the finish of a Combine if finish is set.
+__global__ void __launch_bounds__(COMBINE_THREADS) k_carry(size_t n, size_t chunks, uint64_t* __restrict__ out, size_t stride, const uint8_t* __restrict__ limb_f,
+	const uint8_t* __restrict__ chunk_f, uint32_t carry_in, uint32_t* __restrict__ carry_out, unsigned int* __restrict__ row_done, int finish, int logT, int b, int cyclic,
+	uint32_t* __restrict__ out_size)
+{
+	__shared__ uint32_t scan[COMBINE_THREADS];
+	__shared__ int last;
+	const int tid = threadIdx.x;
+	const size_t row = blockIdx.x / chunks, chunk = blockIdx.x % chunks;
+	uint64_t* o = out + row * stride;
+	const uint8_t* f_row = limb_f + row * n;
+	const uint8_t* chunks_row = chunk_f + row * chunks;
+
+	//The carry into this chunk: the chunks before it, a range of them for each thread.
+	const size_t per = (chunk + COMBINE_THREADS - 1) / COMBINE_THREADS;
+	uint32_t before = CARRY_IDENTITY;
+	for (size_t k = tid * per; k < (tid + 1) * per && k < chunk; k++)
+	{
+		before = carry_compose(before, chunks_row[k]);
+	}
+	block_exclusive_carry_scan(before, scan);
+	const uint32_t chunk_in = carry_apply(scan[COMBINE_THREADS - 1], carry_in);
+	__syncthreads();
+
+	const size_t j0 = chunk * COMBINE_CHUNK + (size_t)tid * COMBINE_ITEMS;
+	uint32_t f[COMBINE_ITEMS];
+	uint32_t composed = CARRY_IDENTITY;
+#pragma unroll
+	for (int it = 0; it < COMBINE_ITEMS; it++)
+	{
+		const size_t j = j0 + it;
+		f[it] = (j < n) ? f_row[j] : CARRY_IDENTITY;
+		composed = carry_compose(composed, f[it]);
+	}
+	uint32_t prefix = block_exclusive_carry_scan(composed, scan);
+	uint32_t carry = carry_apply(prefix, chunk_in);
+#pragma unroll
+	for (int it = 0; it < COMBINE_ITEMS; it++)
+	{
+		const size_t j = j0 + it;
+		if (j < n)
+		{
+			o[j] += carry;
+			carry = carry_apply(f[it], carry);
+		}
+	}
+
+	if (carry_out == NULL && !finish)
+	{
+		return;
+	}
+	__threadfence();
+	__syncthreads();
+	if (tid == 0)
+	{
+		last = (atomicAdd(row_done + row, 1u) == (unsigned int)(chunks - 1));
+	}
+	__syncthreads();
+	if (!last)
+	{
+		return;
+	}
+	if (tid == 0)
+	{
+		row_done[row] = 0;
+	}
+	if (carry_out != NULL)
+	{
+		//The carry out of the row: all its chunks.
+		const size_t all = (chunks + COMBINE_THREADS - 1) / COMBINE_THREADS;
+		uint32_t total = CARRY_IDENTITY;
+		for (size_t k = tid * all; k < (tid + 1) * all && k < chunks; k++)
+		{
+			total = carry_compose(total, chunks_row[k]);
+		}
+		__syncthreads();
+		block_exclusive_carry_scan(total, scan);
+		if (tid == 0)
+		{
+			carry_out[row] = carry_apply(scan[COMBINE_THREADS - 1], carry_in) ^ carry_in;
+		}
+	}
+	if (finish)
+	{
+		combine_finish(logT, b, cyclic, o, stride, out_size + row);
 	}
 }
 
@@ -1020,23 +1095,6 @@ __global__ void __launch_bounds__(COMBINE_THREADS) k_add_limbs(const uint64_t* a
 	}
 }
 
-//One thread: the carries into the chunks of one number, from the carry in (1 for a subtraction), and the carry out, or for a
-//subtraction the borrow out, which is the carry out of a + ~b + 1 inverted.
-__global__ void k_add_chunks(uint8_t* __restrict__ chunk_f, size_t chunks, uint32_t carry_in, uint32_t* __restrict__ carry_out)
-{
-	uint32_t carry = carry_in;
-	for (size_t k = 0; k < chunks; k++)
-	{
-		uint32_t next = carry_apply(chunk_f[k], carry);
-		chunk_f[k] = (uint8_t)carry;
-		carry = next;
-	}
-	if (carry_out != NULL)
-	{
-		*carry_out = carry ^ carry_in;
-	}
-}
-
 //out = floor(in / 2^position) modulo 2^count (count 0: no limit), of in or of its complement (~in, with ones above in_limbs).
 //A negative position shifts to the left.
 __global__ void k_shift(const uint64_t* __restrict__ in, size_t in_limbs, long long position, uint64_t count, int complement, uint64_t* __restrict__ out, size_t out_limbs)
@@ -1071,38 +1129,19 @@ __global__ void k_shift(const uint64_t* __restrict__ in, size_t in_limbs, long l
 	}
 }
 
-//*limbs = the number of limbs of in without leading zeros (must be 0 before).
-__global__ void k_size(const uint64_t* __restrict__ in, size_t n, uint32_t* __restrict__ limbs)
+//One block: *limbs = the number of limbs of in without leading zeros, and *bits its size in bits (1 for 0), if bits is not NULL.
+__global__ void k_size(const uint64_t* __restrict__ in, size_t n, uint32_t* __restrict__ limbs, uint32_t* __restrict__ bits)
 {
-	__shared__ unsigned int block_max;
+	__shared__ unsigned int shared_max;
+	const size_t size = block_size(in, n, &shared_max);
 	if (threadIdx.x == 0)
 	{
-		block_max = 0;
-	}
-	__syncthreads();
-	unsigned int local = 0;
-	for (size_t j = (size_t)blockIdx.x * blockDim.x + threadIdx.x; j < n; j += (size_t)gridDim.x * blockDim.x)
-	{
-		if (in[j] != 0)
+		*limbs = (uint32_t)size;
+		if (bits != NULL)
 		{
-			local = (unsigned int)(j + 1);
+			*bits = (size == 0) ? 1 : (uint32_t)(64 * (size - 1) + (64 - __clzll((long long)in[size - 1])));
 		}
 	}
-	if (local != 0)
-	{
-		atomicMax(&block_max, local);
-	}
-	__syncthreads();
-	if (threadIdx.x == 0 && block_max != 0)
-	{
-		atomicMax(limbs, block_max);
-	}
-}
-
-__global__ void k_size_bits(const uint64_t* __restrict__ in, const uint32_t* __restrict__ limbs, uint32_t* __restrict__ bits)
-{
-	const uint32_t n = *limbs;
-	*bits = (n == 0) ? 1 : 64 * (n - 1) + (64 - __clzll((long long)in[n - 1]));
 }
 
 __global__ void k_set_word(uint32_t* p, uint32_t value)
@@ -1463,13 +1502,25 @@ Gpu_ntt::Gpu_ntt()
 	scratch_limbs = 0;
 	carry_scratch = NULL;
 	carry_bytes = 0;
+	row_done = NULL;
+	row_done_count = 0;
 
 	//The transforms of up to 4096 points need more than the default 48 KB of shared memory.
 	CUDA_CHECK(cudaFuncSetAttribute(kRow<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)row_smem(12)));
 	CUDA_CHECK(cudaFuncSetAttribute(kRow<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)row_smem(12)));
 	CUDA_CHECK(cudaFuncSetAttribute(kCol<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)col_smem(12)));
 	CUDA_CHECK(cudaFuncSetAttribute(kCol<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)col_smem(12)));
-	CUDA_CHECK(cudaFuncSetAttribute(k_combine_limbs<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(5 * sizeof(uint32_t) * COMBINE_SHARED_COEFFICIENTS)));
+	//The shared coefficients of the combine: as many as the GPU allows per block next to the rest of the block's shared memory
+	//(64 KB on compute capability 7.5, 99 KB on 8.6 and 8.9), up to COMBINE_SHARED_COEFFICIENTS.
+	int device_index = 0, optin = 48 * 1024;
+	CUDA_CHECK(cudaGetDevice(&device_index));
+	CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_index));
+	combine_coefficients = ((size_t)optin - 4096) / (5 * sizeof(uint32_t));
+	combine_coefficients = (combine_coefficients < COMBINE_SHARED_COEFFICIENTS) ? combine_coefficients : COMBINE_SHARED_COEFFICIENTS;
+	const int combine_shared = (int)(5 * sizeof(uint32_t) * combine_coefficients);
+	CUDA_CHECK(cudaFuncSetAttribute(k_combine_limbs<true, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, combine_shared));
+	CUDA_CHECK(cudaFuncSetAttribute(k_combine_limbs<true, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, combine_shared));
+	CUDA_CHECK(cudaFuncSetAttribute(k_combine_limbs<true, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, combine_shared));
 }
 
 Gpu_ntt::~Gpu_ntt()
@@ -1477,16 +1528,18 @@ Gpu_ntt::~Gpu_ntt()
 	cudaFree(table_memory);
 	cudaFree(scratch);
 	cudaFree(carry_scratch);
+	cudaFree(row_done);
 }
 
 void Gpu_ntt::Reserve_scratch(size_t limbs)
 {
 	if (limbs > scratch_limbs)
 	{
+		//With some room to spare: the sizes vary a little, and cudaFree waits for the whole GPU.
 		CUDA_CHECK(cudaDeviceSynchronize());
 		cudaFree(scratch);
-		CUDA_CHECK(cudaMalloc(&scratch, limbs * sizeof(uint64_t)));
-		scratch_limbs = limbs;
+		scratch_limbs = limbs + limbs / 8;
+		CUDA_CHECK(cudaMalloc(&scratch, scratch_limbs * sizeof(uint64_t)));
 	}
 }
 
@@ -1496,7 +1549,7 @@ void Gpu_ntt::Reserve_carry(size_t bytes)
 	{
 		CUDA_CHECK(cudaDeviceSynchronize());
 		cudaFree(carry_scratch);
-		carry_bytes = bytes;
+		carry_bytes = bytes + bytes / 8;
 		CUDA_CHECK(cudaMalloc(&carry_scratch, carry_bytes));
 	}
 }
@@ -1596,25 +1649,46 @@ void Gpu_ntt::Combine(const Ntt_plan& plan, uint32_t* X, size_t rows, bool cycli
 	uint8_t* limb_f = carry_scratch;
 	uint8_t* chunk_f = carry_scratch + rows * n_out;
 	const int logT = plan.log_length, b = plan.coefficient_bits;
-	if (chunk_coefficients(b) <= COMBINE_SHARED_COEFFICIENTS)
+	if (chunk_coefficients(b) <= combine_coefficients)
 	{
 		const size_t coefficients = (chunk_coefficients(b) < plan.Length()) ? chunk_coefficients(b) : plan.Length();
 		const size_t shared = 5 * sizeof(uint32_t) * coefficients;
-		k_combine_limbs<true><<<(unsigned)(rows * chunks), COMBINE_THREADS, shared, stream>>>(NULL, X, rows, plan.primes, tables, logT, b, chunks, out.limbs, out.stride, limb_f, chunk_f);
+		const unsigned grid = (unsigned)(rows * chunks);
+		switch (plan.primes)
+		{
+		case 3:
+			k_combine_limbs<true, 3><<<grid, COMBINE_THREADS, shared, stream>>>(NULL, X, rows, tables, logT, b, chunks, out.limbs, out.stride, limb_f, chunk_f);
+			break;
+		case 4:
+			k_combine_limbs<true, 4><<<grid, COMBINE_THREADS, shared, stream>>>(NULL, X, rows, tables, logT, b, chunks, out.limbs, out.stride, limb_f, chunk_f);
+			break;
+		default:
+			k_combine_limbs<true, 5><<<grid, COMBINE_THREADS, shared, stream>>>(NULL, X, rows, tables, logT, b, chunks, out.limbs, out.stride, limb_f, chunk_f);
+			break;
+		}
 	}
 	else
 	{
 		Reserve_scratch(rows * plan.Length() * 3);
-		k_crt<<<grid_size(rows * plan.Length(), 256), 256, 0, stream>>>(X, rows, logT, plan.primes, scratch, tables);
+		const unsigned crt_grid = grid_size(rows * plan.Length(), 256);
+		switch (plan.primes)
+		{
+		case 3:
+			k_crt<3><<<crt_grid, 256, 0, stream>>>(X, rows, logT, scratch, tables);
+			break;
+		case 4:
+			k_crt<4><<<crt_grid, 256, 0, stream>>>(X, rows, logT, scratch, tables);
+			break;
+		default:
+			k_crt<5><<<crt_grid, 256, 0, stream>>>(X, rows, logT, scratch, tables);
+			break;
+		}
 		CUDA_CHECK(cudaGetLastError());
-		k_combine_limbs<false><<<(unsigned)(rows * chunks), COMBINE_THREADS, 0, stream>>>(scratch, X, rows, plan.primes, tables, logT, b, chunks, out.limbs, out.stride, limb_f, chunk_f);
+		k_combine_limbs<false, 3><<<(unsigned)(rows * chunks), COMBINE_THREADS, 0, stream>>>(scratch, X, rows, tables, logT, b, chunks, out.limbs, out.stride, limb_f, chunk_f);
 	}
 	CUDA_CHECK(cudaGetLastError());
-	k_combine_chunks<<<grid_size(rows, 128), 128, 0, stream>>>(chunk_f, chunks, rows);
-	CUDA_CHECK(cudaGetLastError());
-	k_combine_carry<<<(unsigned)(rows * chunks), COMBINE_THREADS, 0, stream>>>(n_out, chunks, out.limbs, out.stride, limb_f, chunk_f);
-	CUDA_CHECK(cudaGetLastError());
-	k_combine_finish<<<(unsigned)rows, COMBINE_THREADS, 0, stream>>>(logT, b, cyclic ? 1 : 0, out.limbs, out.stride, out.size);
+	Reserve_rows(rows);
+	k_carry<<<(unsigned)(rows * chunks), COMBINE_THREADS, 0, stream>>>(n_out, chunks, out.limbs, out.stride, limb_f, chunk_f, 0, NULL, row_done, 1, logT, b, cyclic ? 1 : 0, out.size);
 	CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1683,24 +1757,27 @@ void Gpu_ntt::Add(uint64_t* out, size_t n, const uint64_t* a, size_t a_limbs, co
 	uint8_t* chunk_f = carry_scratch + n;
 	k_add_limbs<<<(unsigned)chunks, COMBINE_THREADS, 0, stream>>>(a, a_limbs, b, b_limbs, b_offset, b_value, subtract ? 1 : 0, n, out, limb_f, chunk_f);
 	CUDA_CHECK(cudaGetLastError());
-	k_add_chunks<<<1, 1, 0, stream>>>(chunk_f, chunks, subtract ? 1 : 0, carry);
-	CUDA_CHECK(cudaGetLastError());
-	k_combine_carry<<<(unsigned)chunks, COMBINE_THREADS, 0, stream>>>(n, chunks, out, 0, limb_f, chunk_f);
+	Reserve_rows(1);
+	k_carry<<<(unsigned)chunks, COMBINE_THREADS, 0, stream>>>(n, chunks, out, 0, limb_f, chunk_f, subtract ? 1 : 0, carry, row_done, 0, 0, 0, 0, NULL);
 	CUDA_CHECK(cudaGetLastError());
 }
 
 void Gpu_ntt::Size(const uint64_t* in, size_t n, uint32_t* limbs, uint32_t* bits, cudaStream_t stream)
 {
-	CUDA_CHECK(cudaMemsetAsync(limbs, 0, sizeof(uint32_t), stream));
-	if (n > 0)
+	k_size<<<1, 256, 0, stream>>>(in, n, limbs, bits);
+	CUDA_CHECK(cudaGetLastError());
+}
+
+//The counters of the blocks done in each row, for k_carry, which leaves them at 0.
+void Gpu_ntt::Reserve_rows(size_t rows)
+{
+	if (rows > row_done_count)
 	{
-		k_size<<<grid_size(n, 256), 256, 0, stream>>>(in, n, limbs);
-		CUDA_CHECK(cudaGetLastError());
-	}
-	if (bits != NULL)
-	{
-		k_size_bits<<<1, 1, 0, stream>>>(in, limbs, bits);
-		CUDA_CHECK(cudaGetLastError());
+		CUDA_CHECK(cudaDeviceSynchronize());
+		cudaFree(row_done);
+		row_done_count = rows + rows / 8;
+		CUDA_CHECK(cudaMalloc(&row_done, row_done_count * sizeof(unsigned int)));
+		CUDA_CHECK(cudaMemset(row_done, 0, row_done_count * sizeof(unsigned int)));
 	}
 }
 
