@@ -35,6 +35,11 @@ struct Gpu_ntt_tables
 #define CUDA_CHECK(call) cuda_check((call), #call, __FILE__, __LINE__)
 void cuda_check(cudaError_t error, const char* call, const char* file, int line);
 
+//The pointwise products of Gpu_ntt::Combine_products: Z[r] = B[r] C[r], Z[j] = C[2j] C[2j + 1] (the pairs of a product tree), or
+//Z[2j] = B[j] C[2j + 1] and Z[2j + 1] = B[j] C[2j] (a parent times the sibling, in a remainder tree), as Pointwise,
+//Pointwise_adjacent and Pointwise_swap.
+enum Gpu_products { PRODUCTS_PLAIN, PRODUCTS_ADJACENT, PRODUCTS_SWAP };
+
 class Gpu_ntt
 {
 public:
@@ -62,6 +67,10 @@ public:
 	//the carries, into out, whose stride must be at least Combine_limbs. Exact products, or products modulo 2^L - 1 from 0 to
 	//2^L - 2 if cyclic. Uses scratch space of rows T 3 limbs, which the class keeps.
 	void Combine(const Ntt_plan& plan, uint32_t* X, size_t rows, bool cyclic, Gpu_level& out, cudaStream_t stream);
+	//The same for the rows products of kind of the transforms B and C (B is not used for PRODUCTS_ADJACENT), which go to Z and are
+	//transformed back there: the products are done by the first pass of the inverse transforms. Z may be B for PRODUCTS_PLAIN.
+	void Combine_products(const Ntt_plan& plan, Gpu_products kind, const uint32_t* B, const uint32_t* C, uint32_t* Z, size_t rows, bool cyclic, Gpu_level& out,
+		cudaStream_t stream);
 
 	//out[r] = bits shift[r] up to precision[r] of in[r], minus one (modulo 2^(precision - shift)), as Ntt_product::Extract_middle,
 	//or 0 if y_size[r / y_div] is 0 (a middle product of y = 0).
@@ -114,4 +123,5 @@ private:
 	void Reserve_scratch(size_t limbs);
 	void Reserve_carry(size_t bytes);
 	void Reserve_rows(size_t rows);
+	void Combine_inverse(const Ntt_plan& plan, uint32_t* X, size_t rows, bool cyclic, Gpu_level& out, cudaStream_t stream);
 };

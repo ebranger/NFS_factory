@@ -137,9 +137,74 @@ __device__ __forceinline__ void get_index_set(int idx[8], int r, int qq, int sb)
 	}
 }
 
-//M-point transforms of contiguous rows: X[(q nrows + row) M + i].
-template <bool INV>
-__global__ void __launch_bounds__(NTT_THREADS) kRow(uint32_t* __restrict__ X, size_t nrows, int logM, Gpu_ntt_tables t)
+//Where the first pass of kRow or kCol takes its input. LOAD_X: from X, in place. Otherwise X is only written, and the input
+//comes from where the pass before it would have written it, so that the data goes through memory once less:
+//  LOAD_SPLIT: the coefficients of b bits of the numbers of a level (forward transforms, as k_split);
+//  LOAD_PLAIN, LOAD_ADJACENT, LOAD_SWAP: the pointwise products of transforms (inverse transforms, as Gpu_products).
+enum { LOAD_X, LOAD_SPLIT, LOAD_PLAIN, LOAD_ADJACENT, LOAD_SWAP };
+
+struct Ntt_source
+{
+	const uint64_t* limbs; //LOAD_SPLIT: the level
+	size_t stride;
+	const uint32_t* size;
+	int b;
+	const uint32_t* B; //the products: Z[r] = B[r] C[r], Z[j] = C[2j] C[2j + 1], or Z[2j] = B[j] C[2j + 1] and Z[2j + 1] = B[j] C[2j]
+	const uint32_t* C;
+	int log_rows; //kRow: the rows of each transform, 2^log_rows (the R of the four-step method, or 1)
+};
+
+//Coefficient i of b bits of the number a of n limbs (0 above it) modulo prime q, as a residue.
+__device__ __forceinline__ uint32_t split_value(const uint64_t* a, size_t n, uint64_t i, int b, int q, const Gpu_ntt_tables& t)
+{
+	const uint32_t p = t.p[q];
+	const uint64_t pos = i * (uint64_t)b;
+	const size_t li = (size_t)(pos >> 6);
+	const unsigned int shift = (unsigned int)(pos & 63);
+	uint64_t v = 0;
+	if (li < n)
+	{
+		v = a[li] >> shift;
+		if (shift != 0 && li + 1 < n)
+		{
+			v |= a[li + 1] << (64 - shift);
+		}
+		if (b < 64)
+		{
+			v &= (1ULL << b) - 1;
+		}
+	}
+	uint32_t hi = (uint32_t)(v >> 32), lo = (uint32_t)v;
+	while (lo >= p)
+	{
+		lo -= p;
+	}
+	return add_mod(mul_shoup(hi, t.two32[q], t.two32_shoup[q], p), lo, p);
+}
+
+//Element e of row row (of nrows, prime q) of the products of LOAD_PLAIN, LOAD_ADJACENT or LOAD_SWAP, rows of M elements.
+template <int LOAD>
+__device__ __forceinline__ uint32_t product_value(const Ntt_source& src, size_t nrows, size_t row, size_t M, int e, int q, uint32_t p, uint32_t pinv)
+{
+	const size_t sub = row & (((size_t)1 << src.log_rows) - 1), r = row >> src.log_rows;
+	if (LOAD == LOAD_PLAIN)
+	{
+		const size_t at = ((size_t)q * nrows + row) * M + e;
+		return mul_mont(src.B[at], src.C[at], p, pinv);
+	}
+	if (LOAD == LOAD_ADJACENT)
+	{
+		const size_t at = ((size_t)q * 2 * nrows + ((2 * r) << src.log_rows) + sub) * M + e;
+		return mul_mont(src.C[at], src.C[at + (M << src.log_rows)], p, pinv);
+	}
+	const size_t b_at = ((size_t)q * (nrows / 2) + ((r >> 1) << src.log_rows) + sub) * M + e;
+	const size_t c_at = ((size_t)q * nrows + ((r ^ 1) << src.log_rows) + sub) * M + e;
+	return mul_mont(src.B[b_at], src.C[c_at], p, pinv);
+}
+
+//M-point transforms of contiguous rows: X[(q nrows + row) M + i], with the input of the first pass as LOAD.
+template <bool INV, int LOAD>
+__global__ void __launch_bounds__(NTT_THREADS) kRow(uint32_t* __restrict__ X, size_t nrows, int logM, Gpu_ntt_tables t, Ntt_source src)
 {
 	extern __shared__ uint32_t sm[];
 	const int M = 1 << logM, tpr = M / 8, rows_per_block = TILE / M;
@@ -168,10 +233,32 @@ __global__ void __launch_bounds__(NTT_THREADS) kRow(uint32_t* __restrict__ X, si
 	get_index_set(idx, r, qq, sb);
 	if (active)
 	{
-#pragma unroll
-		for (int i = 0; i < 8; i++)
+		if (LOAD == LOAD_X)
 		{
-			v[i] = g[idx[i]];
+#pragma unroll
+			for (int i = 0; i < 8; i++)
+			{
+				v[i] = g[idx[i]];
+			}
+		}
+		else if (LOAD == LOAD_SPLIT)
+		{
+			const uint64_t* a = src.limbs + row * src.stride;
+			const size_t n = src.size[row];
+#pragma unroll
+			for (int i = 0; i < 8; i++)
+			{
+				v[i] = split_value(a, n, (uint64_t)idx[i], src.b, q, t);
+			}
+		}
+		else
+		{
+			const uint32_t pinv = t.p_inv[q];
+#pragma unroll
+			for (int i = 0; i < 8; i++)
+			{
+				v[i] = product_value<LOAD>(src, nrows, row, M, idx[i], q, p, pinv);
+			}
 		}
 	}
 	__syncthreads();
@@ -211,9 +298,10 @@ __global__ void __launch_bounds__(NTT_THREADS) kRow(uint32_t* __restrict__ X, si
 }
 
 //R-point transforms down the columns of each T = R C polynomial, with the four-step twist (after the forward pass, before the
-//inverse pass). COLS = 4096 / R columns per block, R / 8 threads per column.
-template <bool INV>
-__global__ void __launch_bounds__(NTT_THREADS) kCol(uint32_t* __restrict__ X, size_t rows, int logT, int logR, Gpu_ntt_tables t)
+//inverse pass). COLS = 4096 / R columns per block, R / 8 threads per column. With SPLIT (forward only), the input is split from
+//the numbers of the level of src, as k_split.
+template <bool INV, bool SPLIT>
+__global__ void __launch_bounds__(NTT_THREADS) kCol(uint32_t* __restrict__ X, size_t rows, int logT, int logR, Gpu_ntt_tables t, Ntt_source src)
 {
 	extern __shared__ uint32_t sm[];
 	const int R = 1 << logR, COLS = TILE / R, logC = logT - logR;
@@ -245,10 +333,23 @@ __global__ void __launch_bounds__(NTT_THREADS) kCol(uint32_t* __restrict__ X, si
 	int idx[8], r, sb;
 	pass_params(logR, 0, INV, r, sb);
 	get_index_set(idx, r, qq, sb);
-#pragma unroll
-	for (int i = 0; i < 8; i++)
+	if (SPLIT)
 	{
-		v[i] = g[(size_t)idx[i] * C];
+		const uint64_t* a = src.limbs + row * src.stride;
+		const size_t n = src.size[row];
+#pragma unroll
+		for (int i = 0; i < 8; i++)
+		{
+			v[i] = split_value(a, n, (uint64_t)idx[i] * C + l, src.b, q, t);
+		}
+	}
+	else
+	{
+#pragma unroll
+		for (int i = 0; i < 8; i++)
+		{
+			v[i] = g[(size_t)idx[i] * C];
+		}
 	}
 	if (INV) //untwist
 	{
@@ -321,58 +422,22 @@ unsigned int grid_size(size_t work, int threads)
 	return (unsigned int)((blocks < 65536) ? ((blocks > 0) ? blocks : 1) : 65536);
 }
 
-template <bool INV>
-void launch_row(const Gpu_ntt_tables& t, int primes, uint32_t* X, size_t nrows, int logM, cudaStream_t s)
+template <bool INV, int LOAD>
+void launch_row(const Gpu_ntt_tables& t, int primes, uint32_t* X, size_t nrows, int logM, const Ntt_source& src, cudaStream_t s)
 {
 	const size_t M = (size_t)1 << logM, rows_per_block = TILE / M;
 	dim3 grid((unsigned)((nrows + rows_per_block - 1) / rows_per_block), (unsigned)primes);
-	kRow<INV><<<grid, NTT_THREADS, row_smem(logM), s>>>(X, nrows, logM, t);
+	kRow<INV, LOAD><<<grid, NTT_THREADS, row_smem(logM), s>>>(X, nrows, logM, t, src);
 	CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool INV>
-void launch_col(const Gpu_ntt_tables& t, int primes, uint32_t* X, size_t rows, int logT, int logR, cudaStream_t s)
+template <bool INV, bool SPLIT>
+void launch_col(const Gpu_ntt_tables& t, int primes, uint32_t* X, size_t rows, int logT, int logR, const Ntt_source& src, cudaStream_t s)
 {
 	const size_t C = (size_t)1 << (logT - logR), COLS = TILE >> logR;
 	dim3 grid((unsigned)(rows * (C / COLS)), (unsigned)primes);
-	kCol<INV><<<grid, NTT_THREADS, col_smem(logR), s>>>(X, rows, logT, logR, t);
+	kCol<INV, SPLIT><<<grid, NTT_THREADS, col_smem(logR), s>>>(X, rows, logT, logR, t, src);
 	CUDA_CHECK(cudaGetLastError());
-}
-
-//The coefficients of b bits of the numbers of a level, modulo each prime, zero-padded to T.
-__global__ void k_split(const uint64_t* __restrict__ limbs, size_t stride, const uint32_t* __restrict__ size, size_t rows, int b, int logT, uint32_t* __restrict__ X, Gpu_ntt_tables t)
-{
-	const int q = blockIdx.y;
-	const uint32_t p = t.p[q];
-	const size_t T = (size_t)1 << logT, total = rows * T;
-	for (size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x; e < total; e += (size_t)gridDim.x * blockDim.x)
-	{
-		const size_t row = e >> logT, i = e & (T - 1);
-		const size_t n = size[row];
-		const uint64_t* a = limbs + row * stride;
-		const uint64_t pos = (uint64_t)i * b;
-		const size_t li = (size_t)(pos >> 6);
-		const unsigned int shift = (unsigned int)(pos & 63);
-		uint64_t v = 0;
-		if (li < n)
-		{
-			v = a[li] >> shift;
-			if (shift != 0 && li + 1 < n)
-			{
-				v |= a[li + 1] << (64 - shift);
-			}
-			if (b < 64)
-			{
-				v &= (1ULL << b) - 1;
-			}
-		}
-		uint32_t hi = (uint32_t)(v >> 32), lo = (uint32_t)v;
-		while (lo >= p)
-		{
-			lo -= p;
-		}
-		X[((size_t)q * rows + row) * T + i] = add_mod(mul_shoup(hi, t.two32[q], t.two32_shoup[q], p), lo, p);
-	}
 }
 
 __global__ void k_pointwise(uint32_t* __restrict__ X, const uint32_t* __restrict__ Y, size_t n, Gpu_ntt_tables t)
@@ -1536,10 +1601,15 @@ Gpu_ntt::Gpu_ntt()
 	CUDA_CHECK(cudaMemset(size_found, 0, 2 * sizeof(unsigned int)));
 
 	//The transforms of up to 4096 points need more than the default 48 KB of shared memory.
-	CUDA_CHECK(cudaFuncSetAttribute(kRow<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)row_smem(12)));
-	CUDA_CHECK(cudaFuncSetAttribute(kRow<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)row_smem(12)));
-	CUDA_CHECK(cudaFuncSetAttribute(kCol<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)col_smem(12)));
-	CUDA_CHECK(cudaFuncSetAttribute(kCol<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)col_smem(12)));
+	CUDA_CHECK(cudaFuncSetAttribute(kRow<false, LOAD_X>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)row_smem(12)));
+	CUDA_CHECK(cudaFuncSetAttribute(kRow<false, LOAD_SPLIT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)row_smem(12)));
+	CUDA_CHECK(cudaFuncSetAttribute(kRow<true, LOAD_X>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)row_smem(12)));
+	CUDA_CHECK(cudaFuncSetAttribute(kRow<true, LOAD_PLAIN>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)row_smem(12)));
+	CUDA_CHECK(cudaFuncSetAttribute(kRow<true, LOAD_ADJACENT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)row_smem(12)));
+	CUDA_CHECK(cudaFuncSetAttribute(kRow<true, LOAD_SWAP>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)row_smem(12)));
+	CUDA_CHECK(cudaFuncSetAttribute(kCol<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)col_smem(12)));
+	CUDA_CHECK(cudaFuncSetAttribute(kCol<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)col_smem(12)));
+	CUDA_CHECK(cudaFuncSetAttribute(kCol<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)col_smem(12)));
 	//The shared coefficients of the combine: as many as the GPU allows per block next to the rest of the block's shared memory
 	//(64 KB on compute capability 7.5, 99 KB on 8.6 and 8.9), up to COMBINE_SHARED_COEFFICIENTS.
 	int device_index = 0, optin = 48 * 1024;
@@ -1593,43 +1663,59 @@ size_t Gpu_ntt::Combine_limbs(const Ntt_plan& plan)
 void Gpu_ntt::Transform(const Ntt_plan& plan, uint32_t* X, size_t rows, cudaStream_t stream)
 {
 	const int logT = plan.log_length;
+	const Ntt_source none = {};
 	if (logT <= 12)
 	{
-		launch_row<false>(tables, plan.primes, X, rows, logT, stream);
+		launch_row<false, LOAD_X>(tables, plan.primes, X, rows, logT, none, stream);
 	}
 	else
 	{
 		const int logR = split_logR(logT);
-		launch_col<false>(tables, plan.primes, X, rows, logT, logR, stream);
-		launch_row<false>(tables, plan.primes, X, rows << logR, logT - logR, stream);
+		launch_col<false, false>(tables, plan.primes, X, rows, logT, logR, none, stream);
+		launch_row<false, LOAD_X>(tables, plan.primes, X, rows << logR, logT - logR, none, stream);
 	}
 }
 
 void Gpu_ntt::Inverse(const Ntt_plan& plan, uint32_t* X, size_t rows, cudaStream_t stream)
 {
 	const int logT = plan.log_length;
+	const Ntt_source none = {};
 	if (logT <= 12)
 	{
-		launch_row<true>(tables, plan.primes, X, rows, logT, stream);
+		launch_row<true, LOAD_X>(tables, plan.primes, X, rows, logT, none, stream);
 	}
 	else
 	{
 		const int logR = split_logR(logT);
-		launch_row<true>(tables, plan.primes, X, rows << logR, logT - logR, stream);
-		launch_col<true>(tables, plan.primes, X, rows, logT, logR, stream);
+		launch_row<true, LOAD_X>(tables, plan.primes, X, rows << logR, logT - logR, none, stream);
+		launch_col<true, false>(tables, plan.primes, X, rows, logT, logR, none, stream);
 	}
 }
 
+//The split of the numbers into coefficients is done by the first pass of the transform.
 void Gpu_ntt::Forward(const Ntt_plan& plan, const Gpu_level& in, uint32_t* X, cudaStream_t stream)
 {
 	if (in.count == 0)
 	{
 		return;
 	}
-	dim3 grid(grid_size(in.count * plan.Length(), 256), (unsigned)plan.primes);
-	k_split<<<grid, 256, 0, stream>>>(in.limbs, in.stride, in.size, in.count, plan.coefficient_bits, plan.log_length, X, tables);
-	CUDA_CHECK(cudaGetLastError());
-	Transform(plan, X, in.count, stream);
+	const int logT = plan.log_length;
+	Ntt_source src = {};
+	src.limbs = in.limbs;
+	src.stride = in.stride;
+	src.size = in.size;
+	src.b = plan.coefficient_bits;
+	if (logT <= 12)
+	{
+		launch_row<false, LOAD_SPLIT>(tables, plan.primes, X, in.count, logT, src, stream);
+	}
+	else
+	{
+		const int logR = split_logR(logT);
+		const Ntt_source none = {};
+		launch_col<false, true>(tables, plan.primes, X, in.count, logT, logR, src, stream);
+		launch_row<false, LOAD_X>(tables, plan.primes, X, in.count << logR, logT - logR, none, stream);
+	}
 }
 
 void Gpu_ntt::Pointwise(const Ntt_plan& plan, uint32_t* X, const uint32_t* Y, size_t rows, cudaStream_t stream)
@@ -1675,6 +1761,53 @@ void Gpu_ntt::Combine(const Ntt_plan& plan, uint32_t* X, size_t rows, bool cycli
 		exit(3);
 	}
 	Inverse(plan, X, rows, stream);
+	Combine_inverse(plan, X, rows, cyclic, out, stream);
+}
+
+//The products are done by the first pass of the inverse transform, which reads them from B and C instead of Z.
+void Gpu_ntt::Combine_products(const Ntt_plan& plan, Gpu_products kind, const uint32_t* B, const uint32_t* C, uint32_t* Z, size_t rows, bool cyclic, Gpu_level& out,
+	cudaStream_t stream)
+{
+	if (rows == 0)
+	{
+		return;
+	}
+	if (out.stride < Combine_limbs(plan))
+	{
+		fprintf(stderr, "Gpu_ntt::Combine_products: output stride %zu is less than %zu limbs\n", out.stride, Combine_limbs(plan));
+		exit(3);
+	}
+	const int logT = plan.log_length;
+	const int logR = (logT <= 12) ? 0 : split_logR(logT);
+	Ntt_source src = {};
+	src.B = B;
+	src.C = C;
+	src.log_rows = logR;
+	const size_t nrows = rows << logR;
+	const int logM = logT - logR;
+	switch (kind)
+	{
+	case PRODUCTS_PLAIN:
+		launch_row<true, LOAD_PLAIN>(tables, plan.primes, Z, nrows, logM, src, stream);
+		break;
+	case PRODUCTS_ADJACENT:
+		launch_row<true, LOAD_ADJACENT>(tables, plan.primes, Z, nrows, logM, src, stream);
+		break;
+	default:
+		launch_row<true, LOAD_SWAP>(tables, plan.primes, Z, nrows, logM, src, stream);
+		break;
+	}
+	if (logT > 12)
+	{
+		const Ntt_source none = {};
+		launch_col<true, false>(tables, plan.primes, Z, rows, logT, logR, none, stream);
+	}
+	Combine_inverse(plan, Z, rows, cyclic, out, stream);
+}
+
+//The CRT and the carries of Combine, after the inverse transforms.
+void Gpu_ntt::Combine_inverse(const Ntt_plan& plan, uint32_t* X, size_t rows, bool cyclic, Gpu_level& out, cudaStream_t stream)
+{
 	const size_t n_out = Combine_limbs(plan), chunks = (n_out + COMBINE_CHUNK - 1) / COMBINE_CHUNK;
 	Reserve_carry(rows * (n_out + chunks));
 	uint8_t* limb_f = carry_scratch;

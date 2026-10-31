@@ -98,8 +98,7 @@ private:
 		Gpu_level in = { limbs[0], stride, sizes, 2 };
 		Gpu_level out = { limbs[1], out_stride, sizes + 2, 1 };
 		gpu.Forward(plan, in, X, 0);
-		gpu.Pointwise_adjacent(plan, X, Y, 1, 0);
-		gpu.Combine(plan, Y, 1, cyclic, out, 0);
+		gpu.Combine_products(plan, PRODUCTS_ADJACENT, NULL, X, Y, 1, cyclic, out, 0);
 		uint32_t n;
 		CUDA_CHECK(cudaMemcpy(&n, sizes + 2, sizeof(uint32_t), cudaMemcpyDeviceToHost));
 		if (result->_mp_alloc < (int)n)
@@ -332,7 +331,6 @@ bool Gpu_root::Transform_pair(const Ntt_plan& plan, const uint64_t* a, const uin
 	Gpu_level lb = { const_cast<uint64_t*>(b), host_words[2], words + 2, 1 };
 	gpu->Forward(plan, la, X, 0);
 	gpu->Forward(plan, lb, Y, 0);
-	gpu->Pointwise(plan, X, Y, 1, 0);
 	return true;
 }
 
@@ -358,7 +356,7 @@ void Gpu_root::Multiply(Gpu_number& out, const uint64_t* a, size_t a_limbs, cons
 	Transform_pair(plan, a, b);
 	out.Resize(Gpu_ntt::Combine_limbs(plan));
 	Gpu_level o = { out.d, out.n, words + 4, 1 };
-	gpu->Combine(plan, X, 1, false, o, 0);
+	gpu->Combine_products(plan, PRODUCTS_PLAIN, X, Y, X, 1, false, o, 0);
 }
 
 //out = y * x modulo 2^L - 1, from 0 to 2^L - 2, with the plan of Gpu_tree_products::Product_mod. Returns L. out must not be x or y.
@@ -383,7 +381,7 @@ mp_bitcnt_t Gpu_root::Product_mod(Gpu_number& out, const uint64_t* y, size_t y_l
 	Transform_pair(plan, y, x);
 	out.Resize(Gpu_ntt::Combine_limbs(plan));
 	Gpu_level o = { out.d, out.n, words + 4, 1 };
-	gpu->Combine(plan, X, 1, true, o, 0);
+	gpu->Combine_products(plan, PRODUCTS_PLAIN, X, Y, X, 1, true, o, 0);
 	return plan.L();
 }
 
@@ -2261,8 +2259,7 @@ mp_bitcnt_t Gpu_tree_backend::Build_product_tree()
 			reserve(parent_transform, parent_transform_capacity, (size_t)p.primes * count * T);
 			Set_stride(parents, count, Gpu_ntt::Combine_limbs(p));
 			gpu->Forward(p, children.level, X, 0);
-			gpu->Pointwise_adjacent(p, X, parent_transform, count, 0);
-			gpu->Combine(p, parent_transform, count, false, parents.level, 0);
+			gpu->Combine_products(p, PRODUCTS_ADJACENT, NULL, X, parent_transform, count, false, parents.level, 0);
 		}
 		else
 		{
@@ -2340,8 +2337,7 @@ void Gpu_tree_backend::Remainder_tree()
 			scratch_level.stride = combine_limbs;
 			scratch_level.count = count;
 			gpu->Forward(p, parents.level, parent_transform, 0);
-			gpu->Pointwise_swap(p, parent_transform, nodes.transform, pair_transform, count / 2, 0);
-			gpu->Combine(p, pair_transform, count, true, scratch_level, 0);
+			gpu->Combine_products(p, PRODUCTS_SWAP, parent_transform, nodes.transform, pair_transform, count, true, scratch_level, 0);
 			gpu->Extract_middle(scratch_level, shift, precision, parents.level.size, 2, nodes.level, 0);
 		}
 		else
@@ -2582,8 +2578,7 @@ void gpu_product_list(const uint32_t* factors, size_t n, mpz_class& result)
 			parents.stride = Gpu_ntt::Combine_limbs(plan);
 			reserve(parents.limbs, limb_capacity[1 - cur], pairs * parents.stride);
 			gpu.Forward(plan, children, X, 0);
-			gpu.Pointwise_adjacent(plan, X, Y, pairs, 0);
-			gpu.Combine(plan, Y, pairs, false, parents, 0);
+			gpu.Combine_products(plan, PRODUCTS_ADJACENT, NULL, X, Y, pairs, false, parents, 0);
 		}
 		else
 		{
