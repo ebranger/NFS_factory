@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <utility>
 #include <algorithm>
+#include <mutex>
+#include <vector>
 
 static void gpu_start();
 
@@ -1055,6 +1057,709 @@ __global__ void k_rho(const uint64_t* __restrict__ c, size_t stride, const uint3
 	}
 }
 
+//Factoring of the smooth leaves for the output, one warp per leaf: the value of the leaf without its large primes is factored as by
+//factor_general of Smooth_factor.cpp: 2s and trial division (the small primes up to 128 bits, as factor_smooth, and below 2^16
+//above), then rho until the parts are primes, and primes below 2^32 by is_prime32. But each rho runs 32 walks at once, one per
+//lane with constants 1 to 32, and takes the factor of the first lane that finds one. The shortest of 32 walks is about sqrt(32)
+//times shorter than one, and the lanes do the same steps. The factors found are primes below 2^32, so the factorization is the
+//one that factor_general finds. A leaf that this does not factor (more than FACTOR_LIMBS limbs after its large primes, more than
+//FACTOR_MAX factors, or walks of more than FACTOR_RHO_LIMIT) is factored on the CPU.
+#define FACTOR_MAX 64 //the most factors of a value factored on the GPU
+#define FACTOR_LIMBS 4 //the most limbs of a value factored on the GPU, and of the leaves
+#define FACTOR_PENDING 24 //cofactors waiting to be split. After trial division, a value below 2^256 has at most 16 prime factors,
+                          //and one below 2^128 at most 17, so this is never reached.
+#define FACTOR_TRIAL_PRIMES 6541 //the odd primes below 2^16
+#define FACTOR_POOL_PER_LEAF 8 //the room for factors in a batch, per leaf at first (usually a few percent of the leaves are smooth)
+#define FACTOR_RHO_LIMIT (1 << 15) //the longest cycle length r of the walks before giving up, about 2^16 steps
+#define FULL_WARP 0xFFFFFFFFu
+
+//The factor of the lowest lane of the warp whose walk found one (found: the lanes that did), the same in all lanes.
+__device__ __forceinline__ uint64_t first_found(unsigned int found, uint64_t factor)
+{
+	return __shfl_sync(FULL_WARP, factor, __ffs(found) - 1);
+}
+
+//A nontrivial factor of the odd composite n < 2^64, by Pollard-Brent rho with a walk per lane, or 0 if none was found with cycle
+//lengths up to limit. Called by the whole warp, with the same n.
+__device__ uint64_t warp_rho64(uint64_t n, uint64_t limit)
+{
+	const uint64_t ninv = montgomery_inverse64(n);
+	uint64_t c = (threadIdx.x & 31) + 1;
+	uint64_t y = 2, x = y, q = 1;
+	for (uint64_t r = 1; r <= limit; r *= 2)
+	{
+		x = y;
+		for (uint64_t i = 0; i < r; i++)
+		{
+			y = rho_step64(y, c, n, ninv);
+		}
+		for (uint64_t k = 0; k < r; k += RHO_GCD_INTERVAL)
+		{
+			const uint64_t saved_y = y;
+			const uint64_t steps = (r - k < RHO_GCD_INTERVAL) ? r - k : RHO_GCD_INTERVAL;
+			for (uint64_t i = 0; i < steps; i++)
+			{
+				y = rho_step64(y, c, n, ninv);
+				q = montgomery_multiply64(q, (x > y) ? x - y : y - x, n, ninv);
+			}
+			uint64_t g = gcd64(q, n);
+			if (g == n || g == 0)
+			{
+				//Several factors were found at once, go back and take one step at a time.
+				uint64_t t = saved_y;
+				g = 1;
+				for (uint64_t i = 0; i < steps && g == 1; i++)
+				{
+					t = rho_step64(t, c, n, ninv);
+					g = gcd64((x > t) ? x - t : t - x, n);
+				}
+			}
+			const unsigned int found = __ballot_sync(FULL_WARP, g != 1 && g != n);
+			if (found != 0)
+			{
+				return first_found(found, g);
+			}
+			if (g != 1)
+			{
+				//This walk found all factors at once: a new one, with another constant.
+				c += 32;
+				x = y = 2;
+				q = 1;
+			}
+		}
+	}
+	return 0;
+}
+
+//x / d in place, for odd d that divides x (n limbs), by Hensel division. Returns the size of the quotient.
+__device__ int divide_exact(uint64_t* x, int n, uint64_t d)
+{
+	const uint64_t inverse = 0 - montgomery_inverse64(d); //1 / d mod 2^64
+	uint64_t borrow = 0;
+	for (int k = 0; k < n; k++)
+	{
+		const uint64_t a = x[k];
+		const uint64_t s = a - borrow;
+		const uint64_t q = s * inverse;
+		x[k] = q;
+		borrow = __umul64hi(q, d) + (a < borrow); //q d = s + 2^64 umulhi(q, d), as q d = s mod 2^64
+	}
+	while (n > 0 && x[n - 1] == 0)
+	{
+		n--;
+	}
+	return n;
+}
+
+//Strong probable prime test to base b, for odd n < 2^32 that b < 2^32 does not divide, with Montgomery arithmetic.
+__device__ bool sprp32(uint64_t n, uint64_t b)
+{
+	const uint64_t ninv = montgomery_inverse64(n);
+	const uint64_t one = (0 - n) % n; //2^64 mod n
+	const uint64_t minus_one = n - one;
+	const uint64_t base = b * one % n; //less than 2^64, as both are below 2^32
+	const int s = __ffsll((long long)(n - 1)) - 1;
+	const uint64_t d = (n - 1) >> s;
+	uint64_t x = one;
+	for (int i = 63 - __clzll((long long)d); i >= 0; i--)
+	{
+		x = montgomery_multiply64(x, x, n, ninv);
+		if ((d >> i) & 1)
+		{
+			x = montgomery_multiply64(x, base, n, ninv);
+		}
+	}
+	if (x == one || x == minus_one)
+	{
+		return true;
+	}
+	for (int i = 1; i < s; i++)
+	{
+		x = montgomery_multiply64(x, x, n, ninv);
+		if (x == minus_one)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+//is_prime32 (Miller-Rabin with the bases 2, 7 and 61, exact below 2^32), with Montgomery arithmetic, for odd n < 2^32.
+__device__ bool is_odd_prime32(uint64_t n)
+{
+	if (n < 3)
+	{
+		return false;
+	}
+	const uint64_t bases[3] = { 2, 7, 61 };
+	for (int b = 0; b < 3; b++)
+	{
+		if (n == bases[b])
+		{
+			return true;
+		}
+		if (n % bases[b] == 0 || !sprp32(n, bases[b]))
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+//Numbers of up to FACTOR_LIMBS limbs, with their size n (the top limb nonzero, 0 limbs for 0), for the values of more than 128 bits.
+
+//Whether odd p divides x, with inverse = 1 / p mod 2^64: the Hensel division of divide_exact leaves no borrow exactly then.
+__device__ __forceinline__ bool divisible(const uint64_t* x, int n, uint64_t p, uint64_t inverse)
+{
+	uint64_t borrow = 0;
+	for (int k = 0; k < n; k++)
+	{
+		const uint64_t a = x[k];
+		const uint64_t q = (a - borrow) * inverse;
+		borrow = __umul64hi(q, p) + (a < borrow);
+	}
+	return borrow == 0;
+}
+
+//c / d in place, for odd d of dn limbs that divides c (cn limbs), by Hensel division. Returns the size of the quotient.
+__device__ int divide_exact_limbs(uint64_t* c, int cn, const uint64_t* d, int dn)
+{
+	if (dn == 1)
+	{
+		return divide_exact(c, cn, d[0]);
+	}
+	const uint64_t inverse = 0 - montgomery_inverse64(d[0]);
+	const int qn = cn - dn + 1;
+	uint64_t q[FACTOR_LIMBS];
+	for (int i = 0; i < qn; i++)
+	{
+		const uint64_t qi = c[i] * inverse;
+		q[i] = qi;
+		//c -= qi d 2^(64 i)
+		uint64_t borrow = 0;
+		for (int j = 0; j < dn && i + j < cn; j++)
+		{
+			const uint64_t lo = qi * d[j], hi = __umul64hi(qi, d[j]);
+			const uint64_t a = c[i + j];
+			const uint64_t r = a - lo;
+			const uint64_t b1 = (a < lo);
+			c[i + j] = r - borrow;
+			borrow = hi + b1 + (r < borrow);
+		}
+		for (int j = i + dn; j < cn; j++)
+		{
+			const uint64_t a = c[j];
+			c[j] = a - borrow;
+			borrow = (a < borrow);
+		}
+	}
+	for (int i = 0; i < qn; i++)
+	{
+		c[i] = q[i];
+	}
+	int n = qn;
+	while (n > 0 && c[n - 1] == 0)
+	{
+		n--;
+	}
+	return n;
+}
+
+//x >>= bits, for bits < 64 n, with the limbs above the new size zero. Returns the new size.
+__device__ int shift_right_limbs(uint64_t* x, int n, int bits)
+{
+	const int words = bits / 64, b = bits % 64;
+	for (int k = 0; k + words < n; k++)
+	{
+		const uint64_t low = x[k + words] >> b;
+		const uint64_t high = (b != 0 && k + words + 1 < n) ? x[k + words + 1] << (64 - b) : 0;
+		x[k] = low | high;
+	}
+	for (int k = (n - words > 0) ? n - words : 0; k < n; k++)
+	{
+		x[k] = 0;
+	}
+	n -= words;
+	while (n > 0 && x[n - 1] == 0)
+	{
+		n--;
+	}
+	return n;
+}
+
+//The N-limb arithmetic of rho, modulo an odd n of N limbs (the top one nonzero), for numbers below n.
+
+//hi:t = a b + t + carry, the new carry being hi.
+__device__ __forceinline__ void multiply_add(uint64_t a, uint64_t b, uint64_t& t, uint64_t& carry)
+{
+	uint64_t lo = a * b, hi = __umul64hi(a, b);
+	lo += t;
+	hi += (lo < t);
+	lo += carry;
+	hi += (lo < carry);
+	t = lo;
+	carry = hi;
+}
+
+//x >= n
+template <int N> __device__ __forceinline__ bool at_least(const uint64_t* x, const uint64_t* n)
+{
+	for (int k = N - 1; k > 0; k--)
+	{
+		if (x[k] != n[k])
+		{
+			return x[k] > n[k];
+		}
+	}
+	return x[0] >= n[0];
+}
+
+//x -= n, returning the borrow.
+template <int N> __device__ __forceinline__ uint64_t subtract_limbs(uint64_t* x, const uint64_t* n)
+{
+	uint64_t borrow = 0;
+	for (int k = 0; k < N; k++)
+	{
+		const uint64_t a = x[k];
+		const uint64_t r = a - n[k];
+		const uint64_t b1 = (a < n[k]);
+		x[k] = r - borrow;
+		borrow = b1 + (r < borrow);
+	}
+	return borrow;
+}
+
+//a = a b / 2^(64 N) mod n, by Montgomery multiplication (CIOS).
+template <int N> __device__ void montgomery_multiply_limbs(uint64_t* a, const uint64_t* b, const uint64_t* n, uint64_t ninv)
+{
+	uint64_t t[N + 1];
+	for (int k = 0; k <= N; k++)
+	{
+		t[k] = 0;
+	}
+	for (int i = 0; i < N; i++)
+	{
+		//t += a b_i
+		uint64_t carry = 0;
+		for (int j = 0; j < N; j++)
+		{
+			multiply_add(a[j], b[i], t[j], carry);
+		}
+		t[N] += carry;
+		uint64_t top = (t[N] < carry);
+		//t = (t + m n) / 2^64, where m makes the lowest limb zero.
+		const uint64_t m = t[0] * ninv;
+		carry = 0;
+		multiply_add(m, n[0], t[0], carry);
+		for (int j = 1; j < N; j++)
+		{
+			multiply_add(m, n[j], t[j], carry);
+			t[j - 1] = t[j];
+		}
+		t[N - 1] = t[N] + carry;
+		t[N] = top + (t[N - 1] < carry);
+	}
+	if (t[N] != 0 || at_least<N>(t, n))
+	{
+		subtract_limbs<N>(t, n);
+	}
+	for (int k = 0; k < N; k++)
+	{
+		a[k] = t[k];
+	}
+}
+
+//y = y^2 + c mod n
+template <int N> __device__ __forceinline__ void rho_step_limbs(uint64_t* y, uint64_t c, const uint64_t* n, uint64_t ninv)
+{
+	montgomery_multiply_limbs<N>(y, y, n, ninv);
+	uint64_t carry = c;
+	for (int k = 0; k < N; k++)
+	{
+		y[k] += carry;
+		carry = (y[k] < carry);
+	}
+	if (carry != 0 || at_least<N>(y, n))
+	{
+		subtract_limbs<N>(y, n);
+	}
+}
+
+//d = |a - b|
+template <int N> __device__ __forceinline__ void difference_limbs(const uint64_t* a, const uint64_t* b, uint64_t* d)
+{
+	for (int k = 0; k < N; k++)
+	{
+		d[k] = a[k];
+	}
+	if (subtract_limbs<N>(d, b) != 0)
+	{
+		for (int k = 0; k < N; k++)
+		{
+			d[k] = b[k];
+		}
+		subtract_limbs<N>(d, a);
+	}
+}
+
+//b = gcd(a, b) for odd b, by the binary algorithm. a is changed.
+template <int N> __device__ void gcd_limbs(uint64_t* a, uint64_t* b)
+{
+	for (;;)
+	{
+		int k = 0;
+		while (k < N && a[k] == 0)
+		{
+			k++;
+		}
+		if (k == N)
+		{
+			return;
+		}
+		shift_right_limbs(a, N, 64 * k + __ffsll((long long)a[k]) - 1);
+		if (!at_least<N>(a, b))
+		{
+			for (int i = 0; i < N; i++)
+			{
+				const uint64_t t = a[i];
+				a[i] = b[i];
+				b[i] = t;
+			}
+		}
+		subtract_limbs<N>(a, b);
+	}
+}
+
+template <int N> __device__ __forceinline__ bool equal_limbs(const uint64_t* a, const uint64_t* b)
+{
+	bool same = true;
+	for (int k = 0; k < N; k++)
+	{
+		same &= (a[k] == b[k]);
+	}
+	return same;
+}
+
+template <int N> __device__ __forceinline__ bool is_one(const uint64_t* a)
+{
+	bool one = (a[0] == 1);
+	for (int k = 1; k < N; k++)
+	{
+		one &= (a[k] == 0);
+	}
+	return one;
+}
+
+//warp_rho64 for an odd composite n of N limbs, with the factor in f (N limbs, zero above its size). Returns false if no factor
+//was found.
+template <int N> __device__ bool warp_rho_limbs(const uint64_t* n, uint64_t limit, uint64_t* f)
+{
+	const uint64_t ninv = montgomery_inverse64(n[0]);
+	uint64_t c = (threadIdx.x & 31) + 1;
+	uint64_t y[N], x[N], q[N], saved[N], d[N], g[N];
+	for (int k = 0; k < N; k++)
+	{
+		y[k] = x[k] = q[k] = 0;
+	}
+	y[0] = x[0] = 2;
+	q[0] = 1;
+	for (uint64_t r = 1; r <= limit; r *= 2)
+	{
+		for (int k = 0; k < N; k++)
+		{
+			x[k] = y[k];
+		}
+		for (uint64_t i = 0; i < r; i++)
+		{
+			rho_step_limbs<N>(y, c, n, ninv);
+		}
+		for (uint64_t s = 0; s < r; s += RHO_GCD_INTERVAL)
+		{
+			for (int k = 0; k < N; k++)
+			{
+				saved[k] = y[k];
+			}
+			const uint64_t steps = (r - s < RHO_GCD_INTERVAL) ? r - s : RHO_GCD_INTERVAL;
+			for (uint64_t i = 0; i < steps; i++)
+			{
+				rho_step_limbs<N>(y, c, n, ninv);
+				difference_limbs<N>(x, y, d);
+				montgomery_multiply_limbs<N>(q, d, n, ninv);
+			}
+			for (int k = 0; k < N; k++)
+			{
+				d[k] = q[k];
+				g[k] = n[k];
+			}
+			gcd_limbs<N>(d, g);
+			if (equal_limbs<N>(g, n))
+			{
+				//Several factors were found at once, go back and take one step at a time.
+				for (uint64_t i = 0; i < steps && (i == 0 || is_one<N>(g)); i++)
+				{
+					rho_step_limbs<N>(saved, c, n, ninv);
+					difference_limbs<N>(x, saved, d);
+					for (int k = 0; k < N; k++)
+					{
+						g[k] = n[k];
+					}
+					gcd_limbs<N>(d, g);
+				}
+			}
+			const bool one = is_one<N>(g), all = equal_limbs<N>(g, n);
+			const unsigned int found = __ballot_sync(FULL_WARP, !one && !all);
+			if (found != 0)
+			{
+				for (int k = 0; k < N; k++)
+				{
+					f[k] = first_found(found, g[k]);
+				}
+				return true;
+			}
+			if (!one)
+			{
+				//This walk found all factors at once: a new one, with another constant.
+				c += 32;
+				for (int k = 0; k < N; k++)
+				{
+					y[k] = x[k] = q[k] = 0;
+				}
+				y[0] = x[0] = 2;
+				q[0] = 1;
+			}
+		}
+	}
+	return false;
+}
+
+//The odd primes below 2^16 for the trial division of the values of more than two limbs, and their inverses modulo 2^64.
+__device__ uint64_t factor_trial[2 * FACTOR_TRIAL_PRIMES];
+
+//The factors of the value x of n limbs (at most FACTOR_LIMBS, changed), by the whole warp (see above), in f by lane 0, in
+//increasing order. Returns their number, or -1 if it was not factored.
+__device__ int warp_factor(uint64_t* x, int n, uint32_t* f, uint64_t limit)
+{
+	const int lane = threadIdx.x & 31;
+	if (n == 0)
+	{
+		return -1;
+	}
+	int count = 0;
+	int twos = 0;
+	while (x[twos / 64] == 0)
+	{
+		twos += 64;
+	}
+	twos += __ffsll((long long)x[twos / 64]) - 1;
+	if (twos > FACTOR_MAX)
+	{
+		return -1;
+	}
+	for (int k = 0; k < twos; k++)
+	{
+		if (lane == 0)
+		{
+			f[count] = 2;
+		}
+		count++;
+	}
+	if (twos > 0)
+	{
+		n = shift_right_limbs(x, n, twos);
+	}
+
+	//Trial division by the first 32 odd primes (up to 137), a lane each, and above two limbs by the odd primes below 2^16 until the
+	//rest has two limbs.
+	for (int first = 0; first < FACTOR_TRIAL_PRIMES && (first == 0 || n > 2); first += 32)
+	{
+		const int k = first + lane;
+		unsigned int divides = __ballot_sync(FULL_WARP, k < FACTOR_TRIAL_PRIMES && divisible(x, n, factor_trial[2 * k], factor_trial[2 * k + 1]));
+		while (divides != 0)
+		{
+			const int i = first + __ffs(divides) - 1;
+			divides &= divides - 1;
+			const uint64_t p = factor_trial[2 * i], inverse = factor_trial[2 * i + 1];
+			do
+			{
+				if (count >= FACTOR_MAX)
+				{
+					return -1;
+				}
+				if (lane == 0)
+				{
+					f[count] = (uint32_t)p;
+				}
+				count++;
+				n = divide_exact(x, n, p);
+			} while (divisible(x, n, p, inverse));
+		}
+	}
+
+	//Split the rest. All cofactors are odd, and have no prime factors below 137.
+	uint64_t pending[FACTOR_PENDING][FACTOR_LIMBS];
+	int pending_size[FACTOR_PENDING];
+	int num_pending = 0;
+	if (!(n == 1 && x[0] == 1))
+	{
+		for (int k = 0; k < FACTOR_LIMBS; k++)
+		{
+			pending[0][k] = (k < n) ? x[k] : 0;
+		}
+		pending_size[0] = n;
+		num_pending = 1;
+	}
+	while (num_pending > 0)
+	{
+		num_pending--;
+		uint64_t c[FACTOR_LIMBS];
+		for (int k = 0; k < FACTOR_LIMBS; k++)
+		{
+			c[k] = pending[num_pending][k];
+		}
+		const int cn = pending_size[num_pending];
+		if (cn == 1 && c[0] < (1ULL << 32) && is_odd_prime32(c[0]))
+		{
+			if (count >= FACTOR_MAX)
+			{
+				return -1;
+			}
+			if (lane == 0)
+			{
+				f[count] = (uint32_t)c[0];
+			}
+			count++;
+			continue;
+		}
+		if (num_pending + 2 > FACTOR_PENDING)
+		{
+			return -1;
+		}
+		uint64_t d[FACTOR_LIMBS] = { 0, 0, 0, 0 };
+		bool found;
+		if (cn == 1)
+		{
+			d[0] = warp_rho64(c[0], limit);
+			found = (d[0] != 0);
+		}
+		else if (cn == 2)
+		{
+			found = warp_rho_limbs<2>(c, limit, d);
+		}
+		else if (cn == 3)
+		{
+			found = warp_rho_limbs<3>(c, limit, d);
+		}
+		else
+		{
+			found = warp_rho_limbs<4>(c, limit, d);
+		}
+		if (!found)
+		{
+			return -1;
+		}
+		int dn = cn;
+		while (d[dn - 1] == 0)
+		{
+			dn--;
+		}
+		const int en = divide_exact_limbs(c, cn, d, dn);
+		for (int k = 0; k < FACTOR_LIMBS; k++)
+		{
+			pending[num_pending][k] = d[k];
+			pending[num_pending + 1][k] = (k < en) ? c[k] : 0;
+		}
+		pending_size[num_pending] = dn;
+		pending_size[num_pending + 1] = en;
+		num_pending += 2;
+	}
+
+	if (lane == 0)
+	{
+		for (int i = 1; i < count; i++)
+		{
+			const uint32_t y = f[i];
+			int j = i - 1;
+			while (j >= 0 && f[j] > y)
+			{
+				f[j + 1] = f[j];
+				j--;
+			}
+			f[j + 1] = y;
+		}
+	}
+	return count;
+}
+
+//The leaves to factor: LEAF_SMOOTH, except the unused leaves (1), in any order.
+__global__ void k_list_smooth(const unsigned char* __restrict__ classes, const uint64_t* __restrict__ leaves, size_t stride, const uint32_t* __restrict__ size,
+	size_t count, uint32_t* __restrict__ list, uint32_t* __restrict__ list_count)
+{
+	for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < count; i += (size_t)gridDim.x * blockDim.x)
+	{
+		if (classes[i] == LEAF_SMOOTH && !(size[i] == 1 && leaves[i * stride] == 1))
+		{
+			list[atomicAdd(list_count, 1u)] = (uint32_t)i;
+		}
+	}
+}
+
+#define FACTOR_BLOCK 128 //threads in a block of k_factor_smooth
+
+//The factors of the listed leaves without their large primes, a warp each: factor_count[j] of them for list[j] (or -1 if it is
+//left to the CPU), from factor_offset[j] in the pool, which has room for pool_capacity. pool_used counts the room they need, also
+//beyond pool_capacity: those that do not fit are left to the CPU.
+__global__ void __launch_bounds__(FACTOR_BLOCK) k_factor_smooth(const uint32_t* __restrict__ list, const uint32_t* __restrict__ list_count, const uint64_t* __restrict__ leaves,
+	size_t stride, const uint32_t* __restrict__ size, const uint64_t* __restrict__ lp, int* __restrict__ factor_count, uint32_t* __restrict__ factor_offset,
+	uint32_t* __restrict__ pool, uint32_t* __restrict__ pool_used, uint32_t pool_capacity)
+{
+	__shared__ uint32_t found[FACTOR_BLOCK / 32][FACTOR_MAX];
+	uint32_t* f = found[threadIdx.x / 32];
+	const uint32_t count = *list_count;
+	const uint32_t warps = gridDim.x * (FACTOR_BLOCK / 32);
+	for (uint32_t j = blockIdx.x * (FACTOR_BLOCK / 32) + threadIdx.x / 32; j < count; j += warps)
+	{
+		const uint32_t i = list[j];
+		int n = (int)size[i];
+		int result = -1;
+		if (n <= FACTOR_LIMBS)
+		{
+			uint64_t x[FACTOR_LIMBS];
+			for (int k = 0; k < FACTOR_LIMBS; k++)
+			{
+				x[k] = (k < n) ? leaves[(size_t)i * stride + k] : 0;
+			}
+			for (int k = 0; k < 2; k++)
+			{
+				const uint64_t p = lp[2 * (size_t)i + k];
+				if (p > 1)
+				{
+					n = divide_exact(x, n, p);
+				}
+			}
+			result = warp_factor(x, n, f, FACTOR_RHO_LIMIT);
+		}
+		if ((threadIdx.x & 31) == 0)
+		{
+			uint32_t offset = 0;
+			if (result > 0)
+			{
+				offset = atomicAdd(pool_used, (uint32_t)result);
+				if (offset + result > pool_capacity)
+				{
+					result = -1;
+				}
+				for (int k = 0; k < result; k++)
+				{
+					pool[offset + k] = f[k];
+				}
+			}
+			factor_count[j] = result;
+			factor_offset[j] = offset;
+		}
+		__syncwarp();
+	}
+}
+
 } //namespace
 
 class Gpu_tree_backend : public Cpu_tree_backend
@@ -1069,6 +1774,8 @@ public:
 	bool Set_leaf_check(const Leaf_check& check);
 	const unsigned char* Leaf_classes();
 	const unsigned long long* Leaf_large_primes();
+	bool Leaf_factors_ready();
+	int Leaf_factors(int index, const unsigned int** factors);
 
 private:
 	//The nodes of a depth: the product tree, and then the fractions of the remainder tree.
@@ -1109,6 +1816,17 @@ private:
 	cudaEvent_t classified, rho_done; //k_rho of the batch, which the thread that checks the batch waits for (Leaf_classes)
 	bool rho_pending;
 	void Finish_rho();
+	//The factoring of the smooth leaves, after k_rho on rho_stream: the leaves (factor_list, after their count and the room their
+	//factors need in the pool), and for each its number of factors and their offset in the pool (factor_primes).
+	uint32_t* factor_list;
+	int* factor_counts;
+	uint32_t *factor_offsets, *factor_primes;
+	size_t factor_list_capacity, factor_counts_capacity, factor_offsets_capacity, factor_primes_capacity;
+	uint32_t factor_pool; //the room in the pool for this batch: FACTOR_POOL_PER_LEAF per leaf, or what the last batch needed
+	cudaEvent_t factored;
+	bool factors_pending, factors_valid;
+	std::vector<uint32_t> host_factor_list, host_factor_offsets, host_factor_primes;
+	std::vector<int> host_factor_counts, host_factor_entry; //host_factor_entry: the entry of each leaf in the list, or -1
 	std::vector<unsigned char> host_classes;
 	std::vector<unsigned long long> host_large_primes;
 	std::vector<Depth> depth_data;
@@ -1124,8 +1842,46 @@ private:
 	std::vector<uint32_t> host_sizes, host_words;
 };
 
+//The table of factor_trial, once.
+static void set_trial_primes()
+{
+	static std::once_flag done;
+	std::call_once(done, []
+	{
+		const uint32_t limit = 1 << 16;
+		std::vector<bool> composite(limit, false);
+		std::vector<uint64_t> table;
+		for (uint32_t i = 3; i < limit; i += 2)
+		{
+			if (composite[i])
+			{
+				continue;
+			}
+			uint64_t inverse = i; //1 / i mod 2^64, by Newton iteration from 3 bits
+			for (int k = 0; k < 5; k++)
+			{
+				inverse *= 2 - i * inverse;
+			}
+			table.push_back(i);
+			table.push_back(inverse);
+			for (uint32_t j = i * i; j < limit; j += 2 * i)
+			{
+				composite[j] = true;
+			}
+		}
+		if (table.size() != 2 * FACTOR_TRIAL_PRIMES)
+		{
+			fprintf(stderr, "Gpu_tree_backend: %zu odd primes below 2^16\n", table.size() / 2);
+			exit(3);
+		}
+		CUDA_CHECK(cudaMemcpyToSymbol(factor_trial, table.data(), table.size() * sizeof(uint64_t)));
+	});
+}
+
 Gpu_tree_backend::Gpu_tree_backend(int levels, int max_bits_in_input) : Cpu_tree_backend(new Gpu_tree_products, levels, max_bits_in_input, false)
 {
+	gpu_start();
+	set_trial_primes();
 	gpu = &static_cast<Gpu_tree_products*>(products)->gpu;
 	root = new Gpu_root(gpu);
 	depth_data.resize(levels);
@@ -1166,6 +1922,13 @@ Gpu_tree_backend::Gpu_tree_backend(int levels, int max_bits_in_input) : Cpu_tree
 	CUDA_CHECK(cudaEventCreateWithFlags(&classified, cudaEventDisableTiming));
 	CUDA_CHECK(cudaEventCreateWithFlags(&rho_done, cudaEventDisableTiming));
 	rho_pending = false;
+	factor_list = NULL;
+	factor_counts = NULL;
+	factor_offsets = factor_primes = NULL;
+	factor_list_capacity = factor_counts_capacity = factor_offsets_capacity = factor_primes_capacity = 0;
+	factor_pool = 0;
+	CUDA_CHECK(cudaEventCreateWithFlags(&factored, cudaEventDisableTiming));
+	factors_pending = factors_valid = false;
 }
 
 Gpu_tree_backend::~Gpu_tree_backend()
@@ -1190,6 +1953,15 @@ Gpu_tree_backend::~Gpu_tree_backend()
 	{
 		cudaEventSynchronize(rho_done);
 	}
+	if (factors_pending)
+	{
+		cudaEventSynchronize(factored);
+	}
+	cudaEventDestroy(factored);
+	cudaFree(factor_list);
+	cudaFree(factor_counts);
+	cudaFree(factor_offsets);
+	cudaFree(factor_primes);
 	cudaEventDestroy(rho_done);
 	cudaEventDestroy(classified);
 	cudaStreamDestroy(rho_stream);
@@ -1229,6 +2001,55 @@ const unsigned long long* Gpu_tree_backend::Leaf_large_primes()
 {
 	Finish_rho();
 	return classes_valid ? host_large_primes.data() : NULL;
+}
+
+//The factors of the smooth leaves, in the thread that checks the batch, which waits for them when it writes the relations.
+bool Gpu_tree_backend::Leaf_factors_ready()
+{
+	if (!factors_pending)
+	{
+		return factors_valid;
+	}
+	gpu_start();
+	CUDA_CHECK(cudaEventSynchronize(factored));
+	uint32_t header[2]; //the number of leaves listed, and the room their factors need
+	CUDA_CHECK(cudaMemcpy(header, factor_list, sizeof(header), cudaMemcpyDeviceToHost));
+	const uint32_t count = header[0];
+	host_factor_list.resize(count);
+	host_factor_counts.resize(count);
+	host_factor_offsets.resize(count);
+	host_factor_primes.resize((header[1] < factor_pool) ? header[1] : factor_pool);
+	if (count > 0)
+	{
+		CUDA_CHECK(cudaMemcpy(host_factor_list.data(), factor_list + 2, count * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+		CUDA_CHECK(cudaMemcpy(host_factor_counts.data(), factor_counts, count * sizeof(int), cudaMemcpyDeviceToHost));
+		CUDA_CHECK(cudaMemcpy(host_factor_offsets.data(), factor_offsets, count * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+		CUDA_CHECK(cudaMemcpy(host_factor_primes.data(), factor_primes, host_factor_primes.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+	}
+	if (header[1] > factor_pool)
+	{
+		//The pool was too small, and the CPU factors the leaves that did not fit. Room for all of them in the next batch.
+		factor_pool = header[1] + header[1] / 4;
+	}
+	host_factor_entry.assign(num_leaves, -1);
+	for (uint32_t j = 0; j < count; j++)
+	{
+		host_factor_entry[host_factor_list[j]] = (int)j;
+	}
+	factors_pending = false;
+	factors_valid = true;
+	return true;
+}
+
+int Gpu_tree_backend::Leaf_factors(int index, const unsigned int** factors)
+{
+	const int j = factors_valid ? host_factor_entry[index] : -1;
+	if (j < 0)
+	{
+		return -1;
+	}
+	*factors = host_factor_primes.data() + host_factor_offsets[j];
+	return host_factor_counts[j];
 }
 
 void Gpu_tree_backend::Set_stride(Depth& d, size_t count, size_t stride)
@@ -1455,6 +2276,7 @@ void Gpu_tree_backend::Leaf_cofactors()
 		if (gpu->Leaf_cofactors(parents.level, parents.bits, leaves.level, leaves.bits, (int)leaf_limbs, (uint32_t)guard, MAX_SQUARINGS_IN_CHECK, cofactors, 0))
 		{
 			classes_valid = checking;
+			factors_pending = factors_valid = false;
 			if (checking)
 			{
 				reserve(classes, classes_capacity, (size_t)num_leaves);
@@ -1499,12 +2321,28 @@ void Gpu_tree_backend::Leaf_cofactors()
 				CUDA_CHECK(cudaGetLastError());
 				CUDA_CHECK(cudaEventRecord(rho_done, rho_stream));
 				rho_pending = true;
+
+				//Then the factoring of the smooth leaves for the output, after rho on the same stream (a warp per leaf).
+				factor_pool = (factor_pool > FACTOR_POOL_PER_LEAF * (uint32_t)num_leaves) ? factor_pool : FACTOR_POOL_PER_LEAF * (uint32_t)num_leaves;
+				reserve(factor_list, factor_list_capacity, (size_t)num_leaves + 2);
+				reserve(factor_counts, factor_counts_capacity, (size_t)num_leaves);
+				reserve(factor_offsets, factor_offsets_capacity, (size_t)num_leaves);
+				reserve(factor_primes, factor_primes_capacity, (size_t)factor_pool);
+				CUDA_CHECK(cudaMemsetAsync(factor_list, 0, 2 * sizeof(uint32_t), rho_stream));
+				k_list_smooth<<<grid_size_leaves(num_leaves), 128, 0, rho_stream>>>(classes, leaves.level.limbs, leaves.level.stride, leaves.level.size, num_leaves,
+					factor_list + 2, factor_list);
+				k_factor_smooth<<<1024, FACTOR_BLOCK, 0, rho_stream>>>(factor_list + 2, factor_list, leaves.level.limbs, leaves.level.stride, leaves.level.size,
+					large_primes, factor_counts, factor_offsets, factor_primes, factor_list + 1, factor_pool);
+				CUDA_CHECK(cudaGetLastError());
+				CUDA_CHECK(cudaEventRecord(factored, rho_stream));
+				factors_pending = true;
 			}
 			return;
 		}
 	}
 	//Large leaves: on the CPU, from the fractions of their parents. Their cofactors are not checked here.
 	classes_valid = false;
+	factors_pending = factors_valid = false;
 	Download(levels - 2);
 	Cpu_tree_backend::Leaf_cofactors();
 }

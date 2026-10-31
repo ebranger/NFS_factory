@@ -1024,8 +1024,16 @@ Batch_smooth::relation_status Batch_smooth::Format_relation(Batch_slot& s, int i
 		}
 	}
 
-	//run Pollard rho factoring on the remaining part of the relation. Since it is smooth Pollard rho should be a decent choice.
-	if (num_factors == 0 && value > 1)
+	//The factors of the rest, which the tree may have found already (as factor_general would). Otherwise Pollard rho: since the
+	//rest is smooth, it is a decent choice.
+	const unsigned int* tree_factors = NULL;
+	const int num_tree_factors = (s.tree_factors && num_factors == 0) ? s.tree->Leaf_factors(index, &tree_factors) : -1;
+	if (num_tree_factors >= 0)
+	{
+		num_factors = num_tree_factors;
+		copy(tree_factors, tree_factors + num_factors, factors);
+	}
+	else if (num_factors == 0 && value > 1)
 	{
 		num_factors = factor_general(factors, value.get_mpz_t(), MAX_FACTORS_IN_RELATION);
 	}
@@ -1097,6 +1105,7 @@ void Batch_smooth::Output_solutions(Batch_slot& s)
 
 	s.relation_texts.resize(num_relations_per_batch);
 	s.relation_result.resize(num_relations_per_batch);
+	s.tree_factors = !three_lp_stage && s.tree->Leaf_factors_ready();
 	parallel_for(s.entries, 16, [&](int index)
 	{
 		if (s.is_smooth[index])

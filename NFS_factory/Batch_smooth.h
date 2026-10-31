@@ -32,6 +32,7 @@ struct Batch_slot
 	long long sequence; //the number of the batch
 	long long position[2]; //the read position of its last relation, as given by Set_read_position
 	size_t root_bits; //of the product tree
+	bool tree_factors; //the tree factored the smooth relations of the batch (Tree_backend::Leaf_factors)
 	mpz_class temp_number;
 	vector<unsigned char> leaf_result; //cofactor_result of each leaf
 	vector<string> relation_texts;

@@ -72,6 +72,13 @@ public:
 	virtual bool Set_leaf_check(const Leaf_check& check) { return false; }
 	virtual const unsigned char* Leaf_classes() { return NULL; }
 	virtual const unsigned long long* Leaf_large_primes() { return NULL; }
+
+	//The prime factors of the LEAF_SMOOTH leaves for the output, if the backend finds them (the GPU, in the background after the
+	//checks): Leaf_factors_ready waits for them, and returns false if there are none for this batch. Leaf_factors then gives the
+	//factors of leaf i without its large primes, in increasing order, and returns their number, or -1 if the leaf was not factored.
+	//Leaf_factors is thread safe.
+	virtual bool Leaf_factors_ready() { return false; }
+	virtual int Leaf_factors(int index, const unsigned int** factors) { return -1; }
 };
 
 //A tree backend with the given number of levels (at least 2), for leaves of up to max_bits_in_input bits (to set up the memory).
