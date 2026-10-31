@@ -16,6 +16,10 @@ using namespace std;
 #define BRUTE_FORCE_LIMIT 100 //For primes below this, roots are found by trying all values.
 #define SMALL_PRIME_POWERS "10821610800" //The smallest primes are included to a higher power.
 
+#ifdef NFS_GPU
+void gpu_product_list(const uint32* factors, size_t n, mpz_class& result); //Gpu_tree_backend.cu
+#endif
+
 //Find all primes up to max_prime, using a segmented sieve of Eratosthenes over the odd numbers.
 static void find_primes(uint32 max_prime, vector<uint32>& primes)
 {
@@ -382,7 +386,7 @@ static void multiply_list(const uint32* factors, size_t n, mpz_class& result)
 	result = left * right;
 }
 
-void setup_prime_product(Polynomial* poly, uint32 maxprime, mpz_class* prime_product)
+void setup_prime_product(Polynomial* poly, uint32 maxprime, mpz_class* prime_product, bool use_gpu)
 {
 	uint32 square_limit = uint32(sqrt((double)maxprime));
 	uint32 fourth_power_limit = uint32(sqrt(sqrt((double)maxprime)));
@@ -432,14 +436,13 @@ void setup_prime_product(Polynomial* poly, uint32 maxprime, mpz_class* prime_pro
 	vector<uint32> primes;
 	find_primes(maxprime, primes);
 
-	//The primes that can divide the norm, with small primes repeated to include them to higher powers.
-	vector<uint32> factors;
-	size_t num_dividing_primes = 0;
-	uint32 f[MAX_POLY_DEGREE + 1];
-
-	for (size_t n = 0; n < primes.size(); n++)
+	//Whether each prime can divide the norm.
+	vector<char> divides(primes.size());
+#pragma omp parallel for schedule(dynamic, 4096)
+	for (long long n = 0; n < (long long)primes.size(); n++)
 	{
 		uint32 p = primes[n];
+		uint32 f[MAX_POLY_DEGREE + 1];
 
 		for (int i = 0; i <= d; i++)
 		{
@@ -468,8 +471,16 @@ void setup_prime_product(Polynomial* poly, uint32 maxprime, mpz_class* prime_pro
 		{
 			can_divide = has_root(f, d, p);
 		}
+		divides[n] = can_divide ? 1 : 0;
+	}
 
-		if (can_divide)
+	//The primes that can divide the norm, with small primes repeated to include them to higher powers.
+	vector<uint32> factors;
+	size_t num_dividing_primes = 0;
+	for (size_t n = 0; n < primes.size(); n++)
+	{
+		uint32 p = primes[n];
+		if (divides[n])
 		{
 			num_dividing_primes++;
 			factors.push_back(p);
@@ -485,7 +496,16 @@ void setup_prime_product(Polynomial* poly, uint32 maxprime, mpz_class* prime_pro
 		}
 	}
 
-	multiply_list(factors.data(), factors.size(), *prime_product);
+#ifdef NFS_GPU
+	if (use_gpu)
+	{
+		gpu_product_list(factors.data(), factors.size(), *prime_product);
+	}
+	else
+#endif
+	{
+		multiply_list(factors.data(), factors.size(), *prime_product);
+	}
 	*prime_product = *prime_product * (small_primes * small_primes);
 
 	cout << num_dividing_primes << " of the " << primes.size() << " primes up to " << maxprime << " can divide the norm." << endl;

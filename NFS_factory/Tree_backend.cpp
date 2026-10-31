@@ -7,8 +7,6 @@
 #define WRAPAROUND_MIN_LIMBS 512 //Use wraparound products in the remainder tree for nodes of at least this many limbs. Tuned on an i7-14700F.
 #define TREE_NTT_MIN_LIMBS 512 //The NTT backend multiplies with the NTT when the product has at least this many limbs, and with MPIR below
 //(where MPIR is faster, and the exact product is the same).
-#define INVERSE_EXACT_LIMBS 2000 //Inverses of up to this many limbs are computed exactly by MPIR.
-#define INVERSE_MARGIN (1 << 12) //Subtracted from the Newton inverse, which can be a few units too large.
 
 //An approximation of B^(2n) / a, where a has n limbs and its top bit set, as B^n plus n limbs. It is within a few units of
 //floor((B^(2n) - 1) / a), but can be on either side of it.
@@ -179,7 +177,7 @@ Cpu_tree_backend::Cpu_tree_backend(Tree_products* products, int levels, int max_
 	//Allocate enough memory for every node, so that the numbers do not have to grow during the run.
 	node.resize(2 * num_leaves - 1);
 	node_bits.resize(2 * num_leaves - 1);
-	remainder.resize(num_leaves);
+	cofactor.resize(num_leaves);
 	mp_bitcnt_t bits = max_bits_in_input;
 	for (int depth = levels - 1; depth >= 0; depth--)
 	{
@@ -202,9 +200,9 @@ mpz_class* Cpu_tree_backend::Leaf(int index)
 	return &node[first_leaf + index];
 }
 
-mpz_class* Cpu_tree_backend::Leaf_remainder(int index)
+mpz_class* Cpu_tree_backend::Leaf_cofactor(int index)
 {
-	return &remainder[index];
+	return &cofactor[index];
 }
 
 mp_bitcnt_t Cpu_tree_backend::Build_product_tree()
@@ -431,15 +429,16 @@ void Cpu_tree_backend::Remainder_pair(int i)
 }
 
 //At a leaf N_i, the fraction y (scaled by 2^(N_i bits + guard)) times N_i is P mod N_i, scaled by 2^guard. The truncations only
-//made y smaller, by less than the guard bits allow, so rounding up gives P mod N_i. It is then squared modulo N_i.
-void Cpu_tree_backend::Leaf_remainders()
+//made y smaller, by less than the guard bits allow, so rounding up gives P mod N_i. It is then squared modulo N_i, and the
+//cofactor is N_i / gcd(N_i, Q).
+void Cpu_tree_backend::Leaf_cofactors()
 {
 #pragma omp parallel for schedule(dynamic, 256)
 	for (int i = first_leaf; i < first_leaf + num_leaves; i++)
 	{
 		const int parent = (i - 1) / 2;
 		const int sibling = (i % 2 == 1) ? i + 1 : i - 1;
-		mpz_ptr q = remainder[i - first_leaf].get_mpz_t();
+		mpz_ptr q = cofactor[i - first_leaf].get_mpz_t();
 		mpz_srcptr n = node[i].get_mpz_t();
 
 		Truncated_product(q, node[parent].get_mpz_t(), node[sibling].get_mpz_t(), node_bits[parent] - node_bits[i], node_bits[parent] + guard);
@@ -453,6 +452,10 @@ void Cpu_tree_backend::Leaf_remainders()
 			mpz_mul(q, q, q);
 			mpz_tdiv_r(q, q, n);
 		}
+
+		mpz_class common;
+		mpz_gcd(common.get_mpz_t(), n, q);
+		mpz_divexact(q, n, common.get_mpz_t());
 	}
 }
 

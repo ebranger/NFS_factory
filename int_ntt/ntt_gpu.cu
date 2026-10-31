@@ -626,13 +626,13 @@ __global__ void k_combine_chunks(uint8_t* __restrict__ chunk_f, size_t chunks, s
 	}
 }
 
-__global__ void __launch_bounds__(COMBINE_THREADS) k_combine_carry(int logT, int b, size_t chunks, uint64_t* __restrict__ out, size_t stride, const uint8_t* __restrict__ limb_f,
+//The carries applied to rows of n_out limbs, from the carry functions of the limbs and the carries into the chunks.
+__global__ void __launch_bounds__(COMBINE_THREADS) k_combine_carry(size_t n_out, size_t chunks, uint64_t* __restrict__ out, size_t stride, const uint8_t* __restrict__ limb_f,
 	const uint8_t* __restrict__ chunk_carry)
 {
 	__shared__ uint32_t scan[COMBINE_THREADS];
 	const size_t row = blockIdx.x / chunks, chunk = blockIdx.x % chunks;
 	uint64_t* o = out + row * stride;
-	const size_t n_out = combine_limbs(logT, b);
 	const uint8_t* f_row = limb_f + row * n_out;
 	const size_t j0 = chunk * COMBINE_CHUNK + (size_t)threadIdx.x * COMBINE_ITEMS;
 	uint32_t f[COMBINE_ITEMS];
@@ -900,6 +900,418 @@ __global__ void k_bits(const uint64_t* __restrict__ limbs, size_t stride, const 
 	}
 }
 
+//out = a + b or a - b (as a + ~b + 1) over n limbs, chunk by chunk as k_combine_limbs: the sums without carries in, the carry
+//function of each limb, and of each chunk. b is b_limbs limbs at limb b_offset, or if b is NULL, the limb b_value at b_offset.
+__global__ void __launch_bounds__(COMBINE_THREADS) k_add_limbs(const uint64_t* a, size_t a_limbs, const uint64_t* b, size_t b_limbs, size_t b_offset, uint64_t b_value,
+	int subtract, size_t n, uint64_t* out, uint8_t* __restrict__ limb_f, uint8_t* __restrict__ chunk_f)
+{
+	__shared__ uint32_t scan[COMBINE_THREADS];
+	const size_t j0 = (size_t)blockIdx.x * COMBINE_CHUNK + (size_t)threadIdx.x * COMBINE_ITEMS;
+	uint32_t composed = CARRY_IDENTITY;
+	for (int it = 0; it < COMBINE_ITEMS; it++)
+	{
+		const size_t j = j0 + it;
+		if (j < n)
+		{
+			const uint64_t x = (a != NULL && j < a_limbs) ? a[j] : 0;
+			uint64_t y;
+			if (b != NULL)
+			{
+				y = (j >= b_offset && j - b_offset < b_limbs) ? b[j - b_offset] : 0;
+			}
+			else
+			{
+				y = (j == b_offset) ? b_value : 0;
+			}
+			y = subtract ? ~y : y;
+			const uint64_t s = x + y;
+			const uint32_t g = (s < x);
+			const uint32_t f = g | ((g | (s == ~0ULL ? 1u : 0u)) << 1);
+			out[j] = s;
+			limb_f[j] = (uint8_t)f;
+			composed = carry_compose(composed, f);
+		}
+	}
+	block_exclusive_carry_scan(composed, scan);
+	if (threadIdx.x == COMBINE_THREADS - 1)
+	{
+		chunk_f[blockIdx.x] = (uint8_t)scan[COMBINE_THREADS - 1];
+	}
+}
+
+//One thread: the carries into the chunks of one number, from the carry in (1 for a subtraction), and the carry out, or for a
+//subtraction the borrow out, which is the carry out of a + ~b + 1 inverted.
+__global__ void k_add_chunks(uint8_t* __restrict__ chunk_f, size_t chunks, uint32_t carry_in, uint32_t* __restrict__ carry_out)
+{
+	uint32_t carry = carry_in;
+	for (size_t k = 0; k < chunks; k++)
+	{
+		uint32_t next = carry_apply(chunk_f[k], carry);
+		chunk_f[k] = (uint8_t)carry;
+		carry = next;
+	}
+	if (carry_out != NULL)
+	{
+		*carry_out = carry ^ carry_in;
+	}
+}
+
+//out = floor(in / 2^position) modulo 2^count (count 0: no limit), of in or of its complement (~in, with ones above in_limbs).
+//A negative position shifts to the left.
+__global__ void k_shift(const uint64_t* __restrict__ in, size_t in_limbs, long long position, uint64_t count, int complement, uint64_t* __restrict__ out, size_t out_limbs)
+{
+	const uint64_t flip = complement ? ~0ULL : 0;
+	for (size_t j = (size_t)blockIdx.x * blockDim.x + threadIdx.x; j < out_limbs; j += (size_t)gridDim.x * blockDim.x)
+	{
+		const long long bit = 64 * (long long)j + position;
+		const long long w = (bit >= 0) ? bit / 64 : -((-bit + 63) / 64);
+		const unsigned int s = (unsigned int)(bit - 64 * w);
+		uint64_t lo = (w >= 0 && w < (long long)in_limbs) ? in[w] ^ flip : (w >= 0 ? flip : 0);
+		uint64_t v = lo >> s;
+		if (s != 0)
+		{
+			const long long w1 = w + 1;
+			uint64_t hi = (w1 >= 0 && w1 < (long long)in_limbs) ? in[w1] ^ flip : (w1 >= 0 ? flip : 0);
+			v |= hi << (64 - s);
+		}
+		if (count != 0)
+		{
+			const uint64_t bottom = 64 * (uint64_t)j;
+			if (bottom >= count)
+			{
+				v = 0;
+			}
+			else if (count - bottom < 64)
+			{
+				v &= (1ULL << (count - bottom)) - 1;
+			}
+		}
+		out[j] = v;
+	}
+}
+
+//*limbs = the number of limbs of in without leading zeros (must be 0 before).
+__global__ void k_size(const uint64_t* __restrict__ in, size_t n, uint32_t* __restrict__ limbs)
+{
+	__shared__ unsigned int block_max;
+	if (threadIdx.x == 0)
+	{
+		block_max = 0;
+	}
+	__syncthreads();
+	unsigned int local = 0;
+	for (size_t j = (size_t)blockIdx.x * blockDim.x + threadIdx.x; j < n; j += (size_t)gridDim.x * blockDim.x)
+	{
+		if (in[j] != 0)
+		{
+			local = (unsigned int)(j + 1);
+		}
+	}
+	if (local != 0)
+	{
+		atomicMax(&block_max, local);
+	}
+	__syncthreads();
+	if (threadIdx.x == 0 && block_max != 0)
+	{
+		atomicMax(limbs, block_max);
+	}
+}
+
+__global__ void k_size_bits(const uint64_t* __restrict__ in, const uint32_t* __restrict__ limbs, uint32_t* __restrict__ bits)
+{
+	const uint32_t n = *limbs;
+	*bits = (n == 0) ? 1 : 64 * (n - 1) + (64 - __clzll((long long)in[n - 1]));
+}
+
+__global__ void k_set_word(uint32_t* p, uint32_t value)
+{
+	*p = value;
+}
+
+//Small numbers in one thread, as arrays of limbs with a size.
+__device__ __forceinline__ int limbs_normalize(const uint64_t* a, int n)
+{
+	while (n > 0 && a[n - 1] == 0)
+	{
+		n--;
+	}
+	return n;
+}
+
+//out = bits shift up to shift + count of a (n limbs), in out_limbs = ceil(count / 64) limbs. Returns the size without leading zeros.
+__device__ int limbs_bits(const uint64_t* a, int n, uint64_t shift, uint64_t count, uint64_t* out)
+{
+	const int out_limbs = (int)((count + 63) >> 6);
+	const int first = (int)(shift >> 6);
+	const unsigned int s = (unsigned int)(shift & 63);
+	for (int j = 0; j < out_limbs; j++)
+	{
+		const int k = first + j;
+		uint64_t v = (k < n) ? a[k] >> s : 0;
+		if (s != 0 && k + 1 < n)
+		{
+			v |= a[k + 1] << (64 - s);
+		}
+		out[j] = v;
+	}
+	if ((count & 63) != 0 && out_limbs > 0)
+	{
+		out[out_limbs - 1] &= (1ULL << (count & 63)) - 1;
+	}
+	return limbs_normalize(out, out_limbs);
+}
+
+//a = a >> s in place, for a nonzero shift; returns the new size.
+__device__ int limbs_shift_right(uint64_t* a, int n, unsigned int s)
+{
+	const int w = (int)(s >> 6);
+	const unsigned int b = s & 63;
+	for (int j = 0; j + w < n; j++)
+	{
+		uint64_t v = a[j + w] >> b;
+		if (b != 0 && j + w + 1 < n)
+		{
+			v |= a[j + w + 1] << (64 - b);
+		}
+		a[j] = v;
+	}
+	for (int j = (n - w > 0) ? n - w : 0; j < n; j++)
+	{
+		a[j] = 0;
+	}
+	return limbs_normalize(a, n);
+}
+
+//a = a << s, into n limbs (the result must fit); returns the new size.
+__device__ int limbs_shift_left(uint64_t* a, int na, int n, unsigned int s)
+{
+	const int w = (int)(s >> 6);
+	const unsigned int b = s & 63;
+	for (int j = n - 1; j >= 0; j--)
+	{
+		const int k = j - w;
+		uint64_t v = (k >= 0 && k < na) ? a[k] << b : 0;
+		if (b != 0 && k - 1 >= 0 && k - 1 < na)
+		{
+			v |= a[k - 1] >> (64 - b);
+		}
+		a[j] = v;
+	}
+	return limbs_normalize(a, n);
+}
+
+__device__ unsigned int limbs_ctz(const uint64_t* a, int n)
+{
+	for (int j = 0; j < n; j++)
+	{
+		if (a[j] != 0)
+		{
+			return 64 * j + (unsigned int)(__ffsll((long long)a[j]) - 1);
+		}
+	}
+	return 0;
+}
+
+__device__ int limbs_compare(const uint64_t* a, int na, const uint64_t* b, int nb)
+{
+	if (na != nb)
+	{
+		return (na > nb) ? 1 : -1;
+	}
+	for (int j = na - 1; j >= 0; j--)
+	{
+		if (a[j] != b[j])
+		{
+			return (a[j] > b[j]) ? 1 : -1;
+		}
+	}
+	return 0;
+}
+
+//a = a - b, for a >= b; returns the new size.
+__device__ int limbs_subtract(uint64_t* a, int na, const uint64_t* b, int nb)
+{
+	uint64_t borrow = 0;
+	for (int j = 0; j < na; j++)
+	{
+		const uint64_t y = (j < nb) ? b[j] : 0;
+		const uint64_t d = a[j] - y;
+		const uint64_t borrow2 = (a[j] < y) | (d < borrow);
+		a[j] = d - borrow;
+		borrow = borrow2;
+	}
+	return limbs_normalize(a, na);
+}
+
+//q = n / g for odd g dividing n, by Hensel division from the bottom limb; n is destroyed. Returns the size of q.
+__device__ int limbs_divexact_odd(uint64_t* n, int nn, const uint64_t* g, int ng, uint64_t* q)
+{
+	uint64_t inv = g[0]; //the inverse of g[0] modulo 2^64, by Newton's iteration from 3 bits
+	for (int i = 0; i < 5; i++)
+	{
+		inv *= 2 - g[0] * inv;
+	}
+	for (int j = 0; j < nn; j++)
+	{
+		const uint64_t qj = n[j] * inv;
+		q[j] = qj;
+		//n -= qj g B^j
+		uint64_t carry = 0, borrow = 0;
+		for (int k = 0; j + k < nn; k++)
+		{
+			uint64_t lo = 0, hi = 0;
+			if (k < ng)
+			{
+				lo = qj * g[k];
+				hi = __umul64hi(qj, g[k]);
+			}
+			lo += carry;
+			hi += (lo < carry);
+			carry = hi;
+			const uint64_t x = n[j + k];
+			const uint64_t d = x - lo;
+			const uint64_t borrow2 = (x < lo) | (d < borrow);
+			n[j + k] = d - borrow;
+			borrow = borrow2;
+			if (k >= ng && carry == 0 && borrow == 0)
+			{
+				break;
+			}
+		}
+	}
+	return limbs_normalize(q, nn);
+}
+
+constexpr int LEAF_MAX_SQUARINGS = 2;
+
+//The cofactor of each leaf N of the scaled remainder tree, one thread per leaf: from the fraction y of its parent (scaled by
+//2^(parent bits + guard)) and its sibling x, r = P mod N = round(((y x) mod 2^(parent bits + guard)) >> (parent bits - N bits)
+//times N / 2^(N bits + guard)), as Cpu_tree_backend::Leaf_cofactors, and then N / gcd(N, r^(2^squarings)). K is the most limbs
+//of a leaf, and a parent fraction has at most 2K + 1.
+template <int K>
+__global__ void __launch_bounds__(128) k_leaf_cofactors(const uint64_t* __restrict__ y, size_t y_stride, const uint32_t* __restrict__ y_size, const uint32_t* __restrict__ y_bits,
+	const uint64_t* __restrict__ x, size_t x_stride, const uint32_t* __restrict__ x_size, const uint32_t* __restrict__ x_bits, size_t count, uint32_t guard, int squarings,
+	uint64_t* __restrict__ out, size_t out_stride, uint32_t* __restrict__ out_size)
+{
+	constexpr int V = K << LEAF_MAX_SQUARINGS; //r^(2^squarings)
+	for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < count; i += (size_t)gridDim.x * blockDim.x)
+	{
+		uint64_t product[3 * K + 1], q[K + 2], a[V], b[V], c[K + 1];
+		const size_t parent = i / 2, sibling = i ^ 1;
+		const uint32_t nb = x_bits[i], pb = y_bits[parent];
+		const uint64_t* N = x + i * x_stride;
+		const int n_size = (int)x_size[i];
+
+		//r = P mod N
+		int size = (int)school_multiply(y + parent * y_stride, y_size[parent], x + sibling * x_stride, x_size[sibling], product);
+		size = limbs_bits(product, size, pb - nb, nb + guard, q);
+		size = (int)school_multiply(q, size, N, n_size, product);
+		size = limbs_bits(product, size, nb, guard + 64 * (K + 1), q);
+		uint64_t carry = (1ULL << guard) - 1;
+		for (int j = 0; j < K + 2 && carry != 0; j++)
+		{
+			q[j] += carry;
+			carry = (q[j] < carry);
+		}
+		size = limbs_bits(q, K + 2, guard, 64 * K, a);
+
+		//v = r^(2^squarings), in b
+		for (int s = 0; s < squarings; s++)
+		{
+			size = (int)school_multiply(a, size, a, size, b);
+			for (int j = 0; j < size; j++)
+			{
+				a[j] = b[j];
+			}
+		}
+		for (int j = 0; j < size; j++)
+		{
+			b[j] = a[j];
+		}
+		int vb = size;
+
+		//g = gcd(N, v) by the binary algorithm, in a
+		for (int j = 0; j < n_size; j++)
+		{
+			a[j] = N[j];
+		}
+		int va = n_size;
+		if (vb != 0 && va != 0)
+		{
+			const unsigned int za = limbs_ctz(a, va), zb = limbs_ctz(b, vb);
+			const unsigned int z = (za < zb) ? za : zb;
+			if (za != 0)
+			{
+				va = limbs_shift_right(a, va, za);
+			}
+			if (zb != 0)
+			{
+				vb = limbs_shift_right(b, vb, zb);
+			}
+			uint64_t *u = a, *v = b;
+			int nu = va, nv = vb;
+			for (;;)
+			{
+				//u and v odd
+				const int order = limbs_compare(u, nu, v, nv);
+				if (order == 0)
+				{
+					break;
+				}
+				if (order > 0)
+				{
+					uint64_t* t = u;
+					u = v;
+					v = t;
+					int tn = nu;
+					nu = nv;
+					nv = tn;
+				}
+				nv = limbs_subtract(v, nv, u, nu);
+				nv = limbs_shift_right(v, nv, limbs_ctz(v, nv));
+			}
+			if (u != a)
+			{
+				for (int j = 0; j < nu; j++)
+				{
+					a[j] = u[j];
+				}
+			}
+			va = nu;
+			if (z != 0)
+			{
+				for (int j = va; j < K + 1 && j < V; j++)
+				{
+					a[j] = 0;
+				}
+				va = limbs_shift_left(a, va, K, z);
+			}
+		}
+		//else gcd(N, 0) = N, already in a
+
+		//c = N / g: the common power of 2 removed, then Hensel division by the odd part.
+		for (int j = 0; j < n_size; j++)
+		{
+			b[j] = N[j];
+		}
+		int nn = n_size;
+		const unsigned int zg = limbs_ctz(a, va);
+		if (zg != 0)
+		{
+			va = limbs_shift_right(a, va, zg);
+			nn = limbs_shift_right(b, nn, zg);
+		}
+		const int c_size = limbs_divexact_odd(b, nn, a, va, c);
+		uint64_t* o = out + i * out_stride;
+		for (int j = 0; j < K; j++)
+		{
+			o[j] = (j < c_size) ? c[j] : 0;
+		}
+		out_size[i] = (uint32_t)c_size;
+	}
+}
+
 } //namespace
 
 Gpu_ntt::Gpu_ntt()
@@ -996,6 +1408,17 @@ void Gpu_ntt::Reserve_scratch(size_t limbs)
 	}
 }
 
+void Gpu_ntt::Reserve_carry(size_t bytes)
+{
+	if (bytes > carry_bytes)
+	{
+		CUDA_CHECK(cudaDeviceSynchronize());
+		cudaFree(carry_scratch);
+		carry_bytes = bytes;
+		CUDA_CHECK(cudaMalloc(&carry_scratch, carry_bytes));
+	}
+}
+
 size_t Gpu_ntt::Combine_limbs(const Ntt_plan& plan)
 {
 	return combine_limbs(plan.log_length, plan.coefficient_bits);
@@ -1088,13 +1511,7 @@ void Gpu_ntt::Combine(const Ntt_plan& plan, uint32_t* X, size_t rows, bool cycli
 	Inverse(plan, X, rows, stream);
 	Reserve_scratch(rows * plan.Length() * 3);
 	const size_t n_out = Combine_limbs(plan), chunks = (n_out + COMBINE_CHUNK - 1) / COMBINE_CHUNK;
-	if (rows * (n_out + chunks) > carry_bytes)
-	{
-		CUDA_CHECK(cudaDeviceSynchronize());
-		cudaFree(carry_scratch);
-		carry_bytes = rows * (n_out + chunks);
-		CUDA_CHECK(cudaMalloc(&carry_scratch, carry_bytes));
-	}
+	Reserve_carry(rows * (n_out + chunks));
 	uint8_t* limb_f = carry_scratch;
 	uint8_t* chunk_f = carry_scratch + rows * n_out;
 	const int logT = plan.log_length, b = plan.coefficient_bits;
@@ -1104,7 +1521,7 @@ void Gpu_ntt::Combine(const Ntt_plan& plan, uint32_t* X, size_t rows, bool cycli
 	CUDA_CHECK(cudaGetLastError());
 	k_combine_chunks<<<grid_size(rows, 128), 128, 0, stream>>>(chunk_f, chunks, rows);
 	CUDA_CHECK(cudaGetLastError());
-	k_combine_carry<<<(unsigned)(rows * chunks), COMBINE_THREADS, 0, stream>>>(logT, b, chunks, out.limbs, out.stride, limb_f, chunk_f);
+	k_combine_carry<<<(unsigned)(rows * chunks), COMBINE_THREADS, 0, stream>>>(n_out, chunks, out.limbs, out.stride, limb_f, chunk_f);
 	CUDA_CHECK(cudaGetLastError());
 	k_combine_finish<<<(unsigned)rows, COMBINE_THREADS, 0, stream>>>(logT, b, cyclic ? 1 : 0, out.limbs, out.stride, out.size);
 	CUDA_CHECK(cudaGetLastError());
@@ -1150,4 +1567,94 @@ void Gpu_ntt::Bits(const Gpu_level& in, uint32_t* bits, cudaStream_t stream)
 	}
 	k_bits<<<grid_size(in.count, 256), 256, 0, stream>>>(in.limbs, in.stride, in.size, in.count, bits);
 	CUDA_CHECK(cudaGetLastError());
+}
+
+void Gpu_ntt::Shift(uint64_t* out, size_t out_limbs, const uint64_t* in, size_t in_limbs, long long position, uint64_t count, bool complement, cudaStream_t stream)
+{
+	if (out_limbs == 0)
+	{
+		return;
+	}
+	k_shift<<<grid_size(out_limbs, 256), 256, 0, stream>>>(in, in_limbs, position, count, complement ? 1 : 0, out, out_limbs);
+	CUDA_CHECK(cudaGetLastError());
+}
+
+void Gpu_ntt::Add(uint64_t* out, size_t n, const uint64_t* a, size_t a_limbs, const uint64_t* b, size_t b_limbs, size_t b_offset, uint64_t b_value, bool subtract,
+	uint32_t* carry, cudaStream_t stream)
+{
+	if (n == 0)
+	{
+		return;
+	}
+	const size_t chunks = (n + COMBINE_CHUNK - 1) / COMBINE_CHUNK;
+	Reserve_carry(n + chunks);
+	uint8_t* limb_f = carry_scratch;
+	uint8_t* chunk_f = carry_scratch + n;
+	k_add_limbs<<<(unsigned)chunks, COMBINE_THREADS, 0, stream>>>(a, a_limbs, b, b_limbs, b_offset, b_value, subtract ? 1 : 0, n, out, limb_f, chunk_f);
+	CUDA_CHECK(cudaGetLastError());
+	k_add_chunks<<<1, 1, 0, stream>>>(chunk_f, chunks, subtract ? 1 : 0, carry);
+	CUDA_CHECK(cudaGetLastError());
+	k_combine_carry<<<(unsigned)chunks, COMBINE_THREADS, 0, stream>>>(n, chunks, out, 0, limb_f, chunk_f);
+	CUDA_CHECK(cudaGetLastError());
+}
+
+void Gpu_ntt::Size(const uint64_t* in, size_t n, uint32_t* limbs, uint32_t* bits, cudaStream_t stream)
+{
+	CUDA_CHECK(cudaMemsetAsync(limbs, 0, sizeof(uint32_t), stream));
+	if (n > 0)
+	{
+		k_size<<<grid_size(n, 256), 256, 0, stream>>>(in, n, limbs);
+		CUDA_CHECK(cudaGetLastError());
+	}
+	if (bits != NULL)
+	{
+		k_size_bits<<<1, 1, 0, stream>>>(in, limbs, bits);
+		CUDA_CHECK(cudaGetLastError());
+	}
+}
+
+void Gpu_ntt::Set_word(uint32_t* p, uint32_t value, cudaStream_t stream)
+{
+	k_set_word<<<1, 1, 0, stream>>>(p, value);
+	CUDA_CHECK(cudaGetLastError());
+}
+
+int Gpu_ntt::Leaf_kernel_limbs(int max_limbs)
+{
+	static const int K[] = { 2, 3, 4, 6, 8 };
+	for (int k : K)
+	{
+		if (max_limbs <= k)
+		{
+			return k;
+		}
+	}
+	return 0;
+}
+
+bool Gpu_ntt::Leaf_cofactors(const Gpu_level& y, const uint32_t* y_bits, const Gpu_level& x, const uint32_t* x_bits, int max_limbs, uint32_t guard, int squarings, Gpu_level& out,
+	cudaStream_t stream)
+{
+	const int K = Leaf_kernel_limbs(max_limbs);
+	if (K == 0 || squarings < 0 || squarings > LEAF_MAX_SQUARINGS || guard == 0 || guard >= 64 || out.stride < (size_t)K)
+	{
+		return false;
+	}
+	if (x.count == 0)
+	{
+		return true;
+	}
+	const unsigned int grid = grid_size(x.count, 128);
+#define LEAF_CASE(k) case k: k_leaf_cofactors<k><<<grid, 128, 0, stream>>>(y.limbs, y.stride, y.size, y_bits, x.limbs, x.stride, x.size, x_bits, x.count, guard, squarings, out.limbs, out.stride, out.size); break;
+	switch (K)
+	{
+		LEAF_CASE(2)
+		LEAF_CASE(3)
+		LEAF_CASE(4)
+		LEAF_CASE(6)
+		LEAF_CASE(8)
+	}
+#undef LEAF_CASE
+	CUDA_CHECK(cudaGetLastError());
+	return true;
 }

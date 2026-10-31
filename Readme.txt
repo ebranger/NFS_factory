@@ -37,7 +37,7 @@ At the end of a run, <output file name>.status holds a summary for scripts, one 
 
 A typical use is a driver script that runs NFS_factory on a list of relation files with -rels set to the number of relations still needed, and then runs the filtering, linear algebra and square root. With one relation file per run instead, the driver adds up the relations found from the status files.
 
-The GPU build (NFS_factory_gpu, see "Compiling the code.txt") does the product and remainder trees on an NVIDIA GPU and is meant to be run as one process, on a list of relation files. The CPU build runs one relation file per process as before, typically as several processes in parallel.
+The GPU build (NFS_factory_gpu, see "Compiling the code.txt") does the product and remainder trees, and the cofactors of the relation values at their leaves, on an NVIDIA GPU, and is meant to be run as one process, on a list of relation files. The CPU build runs one relation file per process as before, typically as several processes in parallel.
 
 The polynomial file contains the polynomial pair and factorization parameters in a GGNFS format, and NFS_factory needs the polynomial pair, rlim/alim, lbpr/lbpa and mfbr/mfba to run. The batch smoothness checking will test the relations for all primes up to rlim/alim, and any remiainder is checked if it is a single large prime if it is less than lbpr/lbpa, or double-large prime if it is less than mfbr/mfba (or 2 lbpr/lbpa, if mfbr/mfba is larger, see "Three large primes" below). One more parameter is required to control which polynomial should be checked for smoothness. Batch smoothness checking is done on the rational side if “side: 0” is specified in the polynomial file, and on the algebraic side if “side: 1” is specified.
 

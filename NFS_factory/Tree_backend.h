@@ -46,9 +46,11 @@ public:
 	virtual void Scaled_root(mpz_srcptr prime_product) = 0;
 	virtual void Remainder_tree() = 0;
 
-	//(P mod N_i)^(2^MAX_SQUARINGS_IN_CHECK) mod N_i for every leaf, which Leaf_remainder then gives. The leaves are unchanged.
-	virtual void Leaf_remainders() = 0;
-	virtual mpz_class* Leaf_remainder(int index) = 0;
+	//The cofactor N_i / gcd(N_i, (P mod N_i)^(2^MAX_SQUARINGS_IN_CHECK)) of every leaf, which Leaf_cofactor then gives: the part of
+	//N_i without the primes of P (that occur to at most the power 2^MAX_SQUARINGS_IN_CHECK), 1 if N_i is smooth. The leaves are
+	//unchanged.
+	virtual void Leaf_cofactors() = 0;
+	virtual mpz_class* Leaf_cofactor(int index) = 0;
 };
 
 //A tree backend with the given number of levels (at least 2), for leaves of up to max_bits_in_input bits (to set up the memory).
@@ -79,6 +81,8 @@ private:
 };
 
 #define INVERSE_MAX_ERROR (1 << 16)
+#define INVERSE_EXACT_LIMBS 2000 //Inverses of up to this many limbs are computed exactly by MPIR.
+#define INVERSE_MARGIN (1 << 12) //Subtracted from the Newton inverse, which can be a few units too large.
 
 //The tree computations on the CPU, with the products of a Tree_products.
 class Cpu_tree_backend : public Tree_backend
@@ -91,8 +95,8 @@ public:
 	mp_bitcnt_t Build_product_tree();
 	void Scaled_root(mpz_srcptr prime_product);
 	void Remainder_tree();
-	void Leaf_remainders();
-	mpz_class* Leaf_remainder(int index);
+	void Leaf_cofactors();
+	mpz_class* Leaf_cofactor(int index);
 
 protected:
 	//The products of the nodes at a depth from their children, and the fractions of the nodes at a depth from their parents'.
@@ -110,7 +114,7 @@ protected:
 	int num_leaves;
 	mp_bitcnt_t guard; //guard bits of the fixed-point fractions.
 	std::vector<mpz_class> node;
-	std::vector<mpz_class> remainder; //of the leaves
+	std::vector<mpz_class> cofactor; //of the leaves
 	std::vector<mp_bitcnt_t> node_bits; //sizes of the product tree nodes, which set the scale of the fractions.
 	mpz_class shifted, inverse, root_remainder, quotient, temp, part, pair_result[2]; //temporaries.
 };

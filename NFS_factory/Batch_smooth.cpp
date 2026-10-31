@@ -75,7 +75,7 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	prime_product = new mpz_class();
 	*prime_product = 1;
 
-	Setup_prime_product(fblim);
+	Setup_prime_product(fblim, backend == TREE_BACKEND_GPU);
 	max_batch_prime = fblim;
 
 	//For handling 2lp cofactorization.
@@ -155,7 +155,7 @@ Batch_smooth::~Batch_smooth(void)
 }
 
 //Setup the primorials to be used.
-void Batch_smooth::Setup_prime_product(long long smooth_bound)
+void Batch_smooth::Setup_prime_product(long long smooth_bound, bool use_gpu)
 {
 	//So apparently mpir knows primorials. Problem solved!
 
@@ -167,7 +167,7 @@ void Batch_smooth::Setup_prime_product(long long smooth_bound)
 	}
 
 	//Only the primes that can divide the norms are included, with small primes to higher powers.
-	setup_prime_product(poly, (uint32)smooth_bound, prime_product);
+	setup_prime_product(poly, (uint32)smooth_bound, prime_product, use_gpu);
 
 	size_t size = mpz_sizeinbase(prime_product->get_mpz_t(), 2);
 	cout << "Size of prime product: " << size << " bits." << endl;
@@ -669,28 +669,24 @@ void Batch_smooth::Run_batch_check()
 	tree->Remainder_tree();
 	t = profile_add(PROF_REMAINDER_TREE, t);
 
-	//Q = (P mod N)^2 mod N for each relation value N. Without cofactorization, N is smooth if Q is 0. With it, the part of N
-	//without the primes of P is N / gcd(N, Q), which is then checked for large primes. The leaves are done in parallel (with the
-	//threads option), and the steps that are not thread safe afterwards, in leaf order.
-	tree->Leaf_remainders();
+	//The cofactor of each relation value N: N / gcd(N, (P mod N)^2), the part of N without the primes of P. Without cofactorization,
+	//N is smooth if it is 1. With it, it is checked for large primes. The cofactors are checked in parallel (with the threads
+	//option), and the steps that are not thread safe afterwards, in leaf order.
+	tree->Leaf_cofactors();
 	leaf_result.resize(num_relations_per_batch);
 #pragma omp parallel for schedule(dynamic, 256)
 	for (int index = 0; index < num_relations_per_batch; index++)
 	{
-		mpz_class& Q = *tree->Leaf_remainder(index);
+		mpz_class& Q = *tree->Leaf_cofactor(index);
 
 		if (do_cofactorization == true)
 		{
-			mpz_srcptr value = tree->Leaf(index)->get_mpz_t();
-			mpz_class common;
-			mpz_gcd(common.get_mpz_t(), value, Q.get_mpz_t());
-			mpz_divexact(Q.get_mpz_t(), value, common.get_mpz_t());
 			leaf_result[index] = (unsigned char)Classify_cofactor(Q, index);
 		}
 		else
 		{
-			//Do not do 2lp testing. If Q = 0 then the relation is smooth
-			leaf_result[index] = (unsigned char)((Q > 0) ? COFACTOR_NOT_SMOOTH : COFACTOR_SMOOTH);
+			//Do not do 2lp testing. If the cofactor is 1 then the relation is smooth
+			leaf_result[index] = (unsigned char)((Q > 1) ? COFACTOR_NOT_SMOOTH : COFACTOR_SMOOTH);
 		}
 	}
 	t = profile_add(PROF_LEAVES, t);
@@ -706,12 +702,12 @@ void Batch_smooth::Run_batch_check()
 			{
 				candidate_cofactor.emplace_back();
 			}
-			candidate_cofactor[candidate_index.size()] = *tree->Leaf_remainder(index);
+			candidate_cofactor[candidate_index.size()] = *tree->Leaf_cofactor(index);
 			candidate_index.push_back(index);
 			is_smooth[index] = false;
 			break;
 		case COFACTOR_TINYQS:
-			if (!Split_with_tinyqs(*tree->Leaf_remainder(index), index))
+			if (!Split_with_tinyqs(*tree->Leaf_cofactor(index), index))
 			{
 				is_smooth[index] = false;
 			}

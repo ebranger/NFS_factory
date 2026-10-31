@@ -78,6 +78,28 @@ public:
 	//The size in bits of each number of a level (1 for 0, as mpz_sizeinbase).
 	void Bits(const Gpu_level& in, uint32_t* bits, cudaStream_t stream);
 
+	//Single numbers in device memory, as a number of limbs (zero above the value). out may not overlap in, except as noted.
+	//out = floor(in / 2^position) modulo 2^count (no limit if count is 0), in out_limbs limbs. position < 0 shifts to the left.
+	//With complement, of ~in instead, with ones above in_limbs: ~in modulo 2^count is 2^count - 1 - in.
+	void Shift(uint64_t* out, size_t out_limbs, const uint64_t* in, size_t in_limbs, long long position, uint64_t count, bool complement, cudaStream_t stream);
+	//out = a + b, or a - b, modulo 2^(64 n). a has a_limbs limbs (NULL for 0). b has b_limbs limbs at limb b_offset, or if b is
+	//NULL, b is b_value at limb b_offset. The carry (borrow) out goes to *carry on the device, if not NULL. out can be a, and b if
+	//b_offset is 0.
+	void Add(uint64_t* out, size_t n, const uint64_t* a, size_t a_limbs, const uint64_t* b, size_t b_limbs, size_t b_offset, uint64_t b_value, bool subtract,
+		uint32_t* carry, cudaStream_t stream);
+	//*limbs = the number of limbs of in without leading zeros, and *bits its size in bits (1 for 0, as mpz_sizeinbase) if not NULL.
+	void Size(const uint64_t* in, size_t n, uint32_t* limbs, uint32_t* bits, cudaStream_t stream);
+	void Set_word(uint32_t* p, uint32_t value, cudaStream_t stream);
+
+	//The cofactors of the leaves x of a scaled remainder tree, one thread per leaf, as Cpu_tree_backend::Leaf_cofactors: leaf i,
+	//N, has the fraction of its parent at y[i / 2] (scaled by 2^(y_bits[i / 2] + guard), with y_bits the bits of the parents in the
+	//product tree) and its sibling at x[i ^ 1]. out[i] = N / gcd(N, (P mod N)^(2^squarings)). The leaves have at most max_limbs
+	//limbs, and out's stride must be at least Leaf_kernel_limbs(max_limbs). False, with nothing done, if the leaves are too large
+	//(Leaf_kernel_limbs is 0) or squarings more than 2.
+	bool Leaf_cofactors(const Gpu_level& y, const uint32_t* y_bits, const Gpu_level& x, const uint32_t* x_bits, int max_limbs, uint32_t guard, int squarings, Gpu_level& out,
+		cudaStream_t stream);
+	static int Leaf_kernel_limbs(int max_limbs);
+
 private:
 	Gpu_ntt_tables tables;
 	void* table_memory;
@@ -86,4 +108,5 @@ private:
 	uint8_t* carry_scratch; //the carry functions of the limbs and chunks of Combine
 	size_t carry_bytes;
 	void Reserve_scratch(size_t limbs);
+	void Reserve_carry(size_t bytes);
 };

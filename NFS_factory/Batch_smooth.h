@@ -48,7 +48,7 @@ private:
 	unsigned long long* lp1;
 	unsigned long long* lp2;
 
-	void Setup_prime_product(long long smooth_bound);
+	void Setup_prime_product(long long smooth_bound, bool use_gpu);
 	void Setup_memory(int tree_levels, int max_bits_in_input, tree_backend_kind backend);
 
 	void Output_solutions();
