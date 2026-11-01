@@ -5,12 +5,18 @@ Check that the polynomials match the input number. At currently I assume that th
 A Linux build (CMake). The code has fallbacks for the Windows-specific parts (free host memory, file positions), but the
 binary relation files are read with fread there, without the read-ahead of the Windows build, and it has not been built or tested.
 
-A relation file format with only the (a,b) pairs. A binary relation is about 50 bytes, 84 % of them the saved primes of the
-other side, which are only needed for the relations found smooth (under 1 %). The saved lists hold all primes of at least 1000
-of the other side's norm, in ascending order, so they can be rebuilt by factoring the norm of the smooth relations on the GPU
-(the factoring of the leaves handles up to 256 bits). With 8 bytes per relation, the SNFS-240 relations (2.2 TB) would take
-0.35 TB, and a run from a hard disk would be limited by the GPU instead of the disk, about twice as fast. Needs a converter
-from the current format, and the CPU build would keep the current format (rebuilding the other side on the CPU is too slow).
+The 3LP candidate file (3lp: save) holds a in 32 bits, as the .bin format, so the candidates of relations with |a| of 2^31 or
+more (from .ab or text files) are skipped and counted. With 3lp: auto they are checked. A candidate format with a 64-bit a
+would keep them.
+
+The factoring of the other side's norms for .ab files: on the GPU it runs with the factoring of the leaves (about 11 ms per batch
+for the 229-bit rational norms of SNFS-240, most of it rho for the five or so primes between 2^24 and 2^29), which the check
+thread waits for; the runs were as fast as from .bin files in the page cache, but a GPU that checks relations faster could
+notice it. Trial division beyond 2^16 or more slots for the checks could help. The CPU build factors them on the CPU (a
+one-thread SNFS-220 run was about 30 % slower than from the .bin file).
+
+A validating converter to .ab (finding the right a for the relations of old .bin files whose |a| is 2^31 or more, which needs the
+polynomial) exists outside the repository; Utilities\RelationsToBinaryFormat converts without checking.
 
 The 3LP second stage runs in the thread that checks the batches of the first stage, which waits for it, and the candidates in
 an unfinished second stage batch are not part of the resume position: if a run is interrupted, they are lost.
@@ -32,8 +38,8 @@ factoring of the relations) or an earlier start would help.
 The prime product of the 3LP second stage (all primes below 2^lbp) takes about 1.3 s to set up on the CPU (the root tests of
 28 million primes). Only noticeable on short runs.
 
-On the CPU still: the polynomial values (about 2 ms per batch per tree thread), the other side's factor list with format cado,
-relation values of more than 256 bits, and tinyqs.
+On the CPU still: the polynomial values (about 2 ms per batch per tree thread), the check of the saved factor lists of the
+relations found, relation values of more than 256 bits, other side norms of more than 256 bits, and tinyqs.
 
 With -rels, a run stops after the batches in progress, so it finds a few more relations than asked for, more with a larger
 pipeline.

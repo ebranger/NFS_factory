@@ -81,6 +81,15 @@ public:
 	virtual bool Set_leaf_factoring() { return false; }
 	virtual bool Leaf_factors_ready() { return false; }
 	virtual int Leaf_factors(int index, const unsigned int** factors) { return -1; }
+
+	//With the leaf factoring, also find the prime factors of the other side of the smooth relations (the side that is not batch
+	//checked), if the backend can; false if it cannot. coefficients: the polynomial F of that side, from c_0. For a batch whose
+	//relations are given with Set_relations (a and b of the first count leaves) before Leaf_cofactors, Other_factors then gives the
+	//prime factors of |F(a, b)| of leaf i in increasing order (after Leaf_factors_ready), and returns their number, or -1 if they
+	//were not found. Other_factors is thread safe.
+	virtual bool Set_other_side(const std::vector<mpz_class>& coefficients) { return false; }
+	virtual void Set_relations(const long long* a, const long long* b, int count) {}
+	virtual int Other_factors(int index, const unsigned int** factors) { return -1; }
 };
 
 //A tree backend with the given number of levels (at least 2), for leaves of up to max_bits_in_input bits (to set up the memory).

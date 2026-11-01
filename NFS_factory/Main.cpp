@@ -51,6 +51,9 @@ using namespace std;
 #define MAX_BINARY_PRIMES 32 //Maximum number of primes in one relation in a binary relation file. More than this is treated as a corrupt file.
 #define READ_BUFFER_SIZE (16 * 1024 * 1024) //Binary relation files are read in blocks of this size.
 #define READ_AHEAD_BLOCKS 4 //Reads of READ_BUFFER_SIZE in flight at once (Windows): a hard disk then reads at full speed.
+#define AB_HEADER_BYTES 16 //The (a,b)-only relation format (.ab): see read_batch_from_ab_file.
+#define AB_RECORD_BYTES 12
+#define AB_VERSION 1
 #define STAGE2_ONLY_TREE_LEVELS 22 //Default maximum number of levels in the remainder tree of a run on a 3LP candidate file. Such runs are few, so they can use more memory than the runs on relation files.
 
 struct nfs_parameters {
@@ -800,7 +803,8 @@ public:
 		Close();
 	}
 
-	bool Open(const string& name)
+	//Read the file from byte offset on.
+	bool Open(const string& name, long long offset = 0)
 	{
 #ifdef _WIN32
 		handle = CreateFileA(name.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
@@ -808,7 +812,7 @@ public:
 		{
 			return false;
 		}
-		next_offset = 0;
+		next_offset = (unsigned long long)offset;
 		current = 0;
 		position = size = 0;
 		finished = false;
@@ -822,6 +826,10 @@ public:
 		return true;
 #else
 		file = fopen(name.c_str(), "rb");
+		if (file != NULL && offset > 0)
+		{
+			fseeko(file, (off_t)offset, SEEK_SET);
+		}
 		return file != NULL;
 #endif
 	}
@@ -1070,6 +1078,105 @@ read_result read_batch_from_binary_file(string filename, Batch_smooth* batch, nf
 	return stopped ? READ_STOPPED : READ_END;
 }
 
+//Read relations from a file of only a and b (.ab), from record skip_records on. The file starts with a header of AB_HEADER_BYTES:
+//"NFAB", (uint)version (AB_VERSION), (uint)the side whose primes the relations were sieved and saved for (0 rational, 1 algebraic,
+//2 not known), and (uint)flags (bit 0: the relations were validated when the file was made). Then (int64)a, (uint32)b per relation,
+//AB_RECORD_BYTES: a takes 64 bits, since the sievers' a can reach 2^31 and more, which the binary format cannot hold.
+//The factor list of the side that is not batch checked is rebuilt from its norm for the relations found smooth (on the GPU in the
+//GPU build), so the side in the header must not be the checked side.
+read_result read_batch_from_ab_file(string filename, Batch_smooth* batch, nfs_parameters* param, run_progress& progress, long long skip_records)
+{
+	unsigned int header[AB_HEADER_BYTES / sizeof(unsigned int)];
+	FILE* f = fopen(filename.c_str(), "rb");
+	if (f == NULL)
+	{
+		cout << "Failed to open input relation file " << filename << endl;
+		return READ_FAILED;
+	}
+	const bool header_read = fread(header, AB_HEADER_BYTES, 1, f) == 1;
+	fclose(f);
+	if (!header_read || memcmp(header, "NFAB", 4) != 0 || header[1] != AB_VERSION)
+	{
+		cout << filename << " is not a relation file of only a and b (.ab) of version " << AB_VERSION << "." << endl;
+		return READ_FAILED;
+	}
+	if (header[2] == (unsigned int)param->smoothness_checking_side)
+	{
+		cout << "The relations of " << filename << " were sieved for side " << header[2] << ", which is the side to check here (side in the polynomial file)." << endl;
+		return READ_FAILED;
+	}
+
+	long long relation_num = 0;
+	long long skipped_relations = 0;
+	long long records = skip_records; //relations read, those done by an earlier run included
+	bool stopped = false;
+
+	//The relations done by an earlier run are skipped by starting after them.
+	read_buffer input;
+	if (!input.file.Open(filename, AB_HEADER_BYTES + AB_RECORD_BYTES * skip_records))
+	{
+		cout << "Failed to open input relation file " << filename << endl;
+		return READ_FAILED;
+	}
+	input.data.resize(READ_BUFFER_SIZE);
+	input.position = 0;
+	input.filled = 0;
+
+	while (input.ensure(AB_RECORD_BYTES))
+	{
+		long long a;
+		unsigned int b;
+		const unsigned char* record = input.data.data() + input.position;
+		memcpy(&a, record, sizeof(long long));
+		memcpy(&b, record + 8, sizeof(unsigned int));
+		input.position += AB_RECORD_BYTES;
+		records++;
+
+		if (!relation_in_range(a, b, param))
+		{
+			skipped_relations++;
+			continue;
+		}
+
+		progress.Adding(records);
+		batch->Add_number_binary(a, b, NULL, 0);
+		relation_num++;
+
+		if (progress.Relation_added(records, param))
+		{
+			stopped = true;
+			break;
+		}
+	}
+
+	const bool partial = !stopped && input.filled > input.position;
+	input.file.Close();
+
+	if (!stopped)
+	{
+		progress.done_records = records;
+	}
+
+	if (partial)
+	{
+		cout << "The relation file " << filename << " ends with part of a relation, which was skipped." << endl;
+	}
+
+	if (skipped_relations > 0)
+	{
+		cout << "Skipped " << skipped_relations << " relations with a or b larger than maxa or maxb." << endl;
+	}
+
+	return stopped ? READ_STOPPED : READ_END;
+}
+
+//Whether name ends with suffix.
+static bool ends_with(const string& name, const char* suffix)
+{
+	const size_t n = strlen(suffix);
+	return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
+}
+
 int main(int argc, char* argv[])
 {
 	//NFS_factory <polynomial file> <relation file> <output file> [-rels N]
@@ -1140,6 +1247,8 @@ int main(int argc, char* argv[])
 		cout << "same relation file or list. A summary is written to <output file>.status at the end. -threads sets the number of" << endl;
 		cout << "threads for checking the cofactors and factoring the relations found (default 1 in the CPU build, 8 in the GPU build)." << endl;
 		cout << "-gpu selects the GPU of the GPU build, numbered from 0 (default 0)." << endl;
+		cout << "Relation files: text (a,b:rational primes:algebraic primes), binary (.bin), or only a and b (.ab), whose factor list of the" << endl;
+		cout << "side that is not checked is rebuilt for the relations found (on the GPU in the GPU build). A .3lp file holds 3LP candidates." << endl;
 		return 0;
 	}
 	omp_set_num_threads(threads);
@@ -1298,13 +1407,10 @@ int main(int argc, char* argv[])
 
 	if (param->cado_format)
 	{
-		//CADO-NFS needs all primes on both sides, so print everything and rebuild the factor list of the other side.
+		//CADO-NFS needs all primes on both sides, so print everything and rebuild the factor list of the other side of every relation.
+		//Otherwise it is rebuilt only for the relations read without one (.ab files).
 		param->print_limit = 1;
 		cout << "Writing relations in CADO-NFS format, with all primes on both sides." << endl;
-	}
-	else
-	{
-		other_poly = NULL;
 	}
 
 	time = clock();
@@ -1313,11 +1419,11 @@ int main(int argc, char* argv[])
 	{
 		//The cofactors are less than 2^(3 lbp). The tree size is limited by 3lptreelevels instead of treelevels.
 		cout << "Checking 3LP candidates against all primes up to 2^" << lbp << "." << endl;
-		batch = new Batch_smooth(lim, lbp, mfb, 3 * lbp, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels_3lp, param->backend, true);
+		batch = new Batch_smooth(lim, lbp, mfb, 3 * lbp, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->cado_format, param->tree_levels_3lp, param->backend, true);
 	}
 	else
 	{
-		batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels, param->backend, false, param->pipeline);
+		batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->cado_format, param->tree_levels, param->backend, false, param->pipeline);
 	}
 
 	if (three_lp)
@@ -1339,7 +1445,7 @@ int main(int argc, char* argv[])
 		else
 		{
 			cout << "Checking 3LP candidates of up to " << mfb << " bits against all primes up to 2^" << lbp << " during the run." << endl;
-			second_stage = new Batch_smooth(lim, lbp, mfb, 3 * lbp, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->tree_levels, param->backend, true);
+			second_stage = new Batch_smooth(lim, lbp, mfb, 3 * lbp, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->cado_format, param->tree_levels, param->backend, true);
 		}
 
 		if (!batch->Set_three_lp_handling(second_stage, candidate_filename))
@@ -1394,6 +1500,11 @@ int main(int argc, char* argv[])
 		{
 			//3LP candidates saved by an earlier run, with a .3lp extension.
 			result = read_batch_from_binary_file(file, batch, param, true, progress, skip_records);
+		}
+		else if (ends_with(file, ".ab"))
+		{
+			//Only a and b, with a .ab extension.
+			result = read_batch_from_ab_file(file, batch, param, progress, skip_records);
 		}
 		else if (file.find(".bin") == string::npos)
 		{

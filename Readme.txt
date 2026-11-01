@@ -23,7 +23,7 @@ Once enough relations have been stored, it is time for NFS_factory to start work
 
 NFS_factory <polynomial file name> <saved relation file name> <output file name> [-rels N] [-threads N] [-gpu N]
 
-The polynomial file describes the polynomial used for the current factorization, in GGNFS format with a few extra options, detailed below. The relation file contains the NFS relations stored by the sieving procedure, and accepts either the GGNFS/msieve relation format, or a binary format I have used to save some space. The program will run until all relations in the file have been processed. All found relations are appended to the output file specified.
+The polynomial file describes the polynomial used for the current factorization, in GGNFS format with a few extra options, detailed below. The relation file contains the NFS relations stored by the sieving procedure, in the GGNFS/msieve relation format, or one of two binary formats that save space (see "Relation file formats" below). The program will run until all relations in the file have been processed. All found relations are appended to the output file specified.
 
 Several relation files can be processed in one run, which sets up the prime products only once and keeps filling the same remainder tree across the files:
 
@@ -43,10 +43,24 @@ The GPU build (NFS_factory_gpu, see "Compiling the code.txt") does the product a
 
 -gpu N selects the GPU of the GPU build, numbered from 0 (default 0); the one used is printed at the start. The GPU build needs a CUDA GPU of compute capability 7.5 or later, and stops with a message saying so if there is none; on such a computer, use the CPU build.
 
+Relation file formats
+---------------------
+
+The format of a relation file is chosen from its name:
+- .bin: the binary format, (int)a, (uint)b, (uint)number of primes, (uint)primes per relation, all 32-bit. The primes are those of the side that is not batch checked (normally the rational side, shared by all numbers of the relation set), which are printed for the relations found. About 50 bytes per relation for SNFS-240, 84 % of it the primes.
+- .ab: only a and b. A header of 16 bytes ("NFAB", then (uint)version 1, (uint)the side whose primes the relations were saved for, and (uint)flags, bit 0 set if the relations were validated), followed by (int64)a, (uint32)b per relation: 12 bytes. The factor list of the side that is not batch checked is rebuilt from its norm for the relations found (on the GPU in the GPU build, along with the factoring of the checked side; the CPU build factors those norms on the CPU, which made a one-thread SNFS-220 run about 30 % slower, and costs more for larger norms). The output is the same as from the .bin file of the same relations. a has 64 bits since the siever's a can reach 2^31 and more, which the .bin format cannot hold.
+- .3lp: 3LP candidates (see "Three large primes").
+- anything else: the GGNFS/msieve text format, a,b:rational primes:algebraic primes.
+The list of a run can mix the formats.
+
+The .ab format is meant for relation sets that are read from a hard disk: for SNFS-240, a .bin file is read at about 225 MB/s from a hard disk, which then limits the GPU build, while the same relations as a .ab file are a quarter of the size, and the GPU is the limit again (about 1.4 times faster with the polynomial of a 2026 SNFS-240 run with 3LP, and about twice as fast with parameters where the GPU checks more relations per second). From an SSD, or the page cache, both formats run at the same speed. The full SNFS-240 relation set takes 0.53 TB as .ab files, instead of 2.2 TB.
+
+Utilities\RelationsToBinaryFormat converts text and .bin files to .ab files. Binary files written by older versions of it can hold relations whose |a| is 2^31 or more with a wrong a (2^32 too large or too small): their factor lists do not match the norms, and NFS_factory leaves such relations out of the output (it checks the saved factor list of every relation it finds against the norm), but cannot find them. Converting such a file to .ab needs the polynomial to find the right a for each relation.
+
 The polynomial file contains the polynomial pair and factorization parameters in a GGNFS format, and NFS_factory needs the polynomial pair, rlim/alim, lbpr/lbpa and mfbr/mfba to run. The batch smoothness checking will test the relations for all primes up to rlim/alim, and any remiainder is checked if it is a single large prime if it is less than lbpr/lbpa, or double-large prime if it is less than mfbr/mfba (or 2 lbpr/lbpa, if mfbr/mfba is larger, see "Three large primes" below). One more parameter is required to control which polynomial should be checked for smoothness. Batch smoothness checking is done on the rational side if “side: 0” is specified in the polynomial file, and on the algebraic side if “side: 1” is specified.
 
 A few optional parameters can also be given in the polynomial file:
-- format: msieve (default) or cado. With "format: cado" all primes are printed on both sides of each relation, with multiplicity, as CADO-NFS requires. The factor list of the side that is not batch checked is then rebuilt from its norm, and relations where the stored factors do not match the norm are skipped. With "format: msieve" that factor list is printed as it was read, and small primes are left out, since msieve finds them itself.
+- format: msieve (default) or cado. With "format: cado" all primes are printed on both sides of each relation, with multiplicity, as CADO-NFS requires. The factor list of the side that is not batch checked is then rebuilt from its norm, and relations where the stored factors do not match the norm are skipped. With "format: msieve" that factor list is printed as it was read (rebuilt for .ab files), after checking that its primes divide the norm, and small primes are left out, since msieve finds them itself.
 - print: primes smaller than this are not printed for the batch checked side (default 1000, which msieve handles). Not needed with "format: cado".
 - maxa, maxb: relations with |a| larger than maxa, or b larger than maxb, are skipped. There is no limit by default.
 - maxrels: stop after this many relations have been read from the relation file. Useful for testing and timing.
@@ -67,7 +81,7 @@ With mfbr/mfba larger than 2 lbpr/lbpa (at most 3 lbpr/lbpa), relations with thr
 
 The second stage costs less per candidate when its tree is full, and a run on a small relation file may end with a small, and therefore expensive, last batch of candidates. Saving the candidates and checking them together avoids that. A run on a candidate file can also use a larger tree, since such runs are few and do not run in parallel with many others: up to 3lptreelevels (default 22) levels. For lpba 29, 22 levels hold about 2 million candidates, needs about 2 GB of memory, and was about 20 % faster on the second stage than 20 levels.
 
-The candidate file has the binary relation format, with the remainder added to each relation as two 64-bit numbers (low 64 bits first).
+The candidate file has the binary relation format, with the remainder added to each relation as two 64-bit numbers (low 64 bits first). Candidates from .ab files are saved without primes, and the factor list of their other side is rebuilt when they are checked. Candidates whose |a| is 2^31 or more do not fit, and are counted as skipped.
 
 The largest candidates are the least likely to be products of three primes below 2^lbpr/2^lbpa, so mfbr/mfba a few bits less than 3 lbpr/lbpa keeps most of the 3LP relations for a much smaller cost. For an SNFS-240 polynomial with lpba 29 and alim 2^29/20, a sample of 8.4 million relations gave:
 
@@ -84,7 +98,7 @@ The cost does not include setting up the prime product of the second stage, abou
 
 At the end of a run, the program prints how the time was spent on the different steps, and the peak memory use.
 
-Lines in a GGNFS/msieve relation file that cannot be parsed are skipped and counted, as is an incomplete last line, which a siever that is stopped may leave behind. A binary relation file that ends in the middle of a relation is also detected.
+Lines in a GGNFS/msieve relation file that cannot be parsed are skipped and counted, as is an incomplete last line, which a siever that is stopped may leave behind. A binary or .ab relation file that ends in the middle of a relation is also detected.
 
 Once NFS_factory has processed and found enough relations, msieve or CADO-NFS is needed for the postprocessing, and this code was made with msieve in mind.
 

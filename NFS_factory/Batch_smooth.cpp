@@ -26,7 +26,7 @@ using namespace std;
 static void append_prime(string& list, unsigned long long prime);
 
 //Initialize the batch smoothness class
-Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, int max_tree_levels, tree_backend_kind backend, bool three_lp_stage, int pipeline)
+Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, bool rebuild_other_side, int max_tree_levels, tree_backend_kind backend, bool three_lp_stage, int pipeline)
 {
 	long long max_prime_limit = 1LL << lbp;
 
@@ -52,6 +52,7 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 
 	poly = input_poly;
 	other_poly = other_side_poly;
+	rebuild_all = rebuild_other_side && other_side_poly != NULL;
 	profile = three_lp_stage ? profile_cycles_3lp : profile_cycles;
 
 	if (poly->poly_is_binomial_SNFS_deg4())
@@ -158,6 +159,21 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	{
 		s->tree->Set_leaf_factoring();
 	}
+	//The other side's norms too, if the tree can.
+	other_side_on_tree = false;
+	if (other_poly != NULL)
+	{
+		vector<mpz_class> coefficients;
+		for (int i = 0; i <= other_poly->get_degree(); i++)
+		{
+			coefficients.push_back(other_poly->get_coefficient((uint8)i));
+		}
+		other_side_on_tree = true;
+		for (Batch_slot* s : slots)
+		{
+			other_side_on_tree = s->tree->Set_other_side(coefficients) && other_side_on_tree;
+		}
+	}
 
 	if (pipelined)
 	{
@@ -258,6 +274,7 @@ Batch_slot* Batch_smooth::New_slot(int tree_levels, int max_bits_in_input, tree_
 		s->is_smooth[i] = false;
 	}
 	s->binary_lists = false;
+	s->rebuilds_other_side = false;
 	s->entries = 0;
 	s->sequence = 0;
 	s->position[0] = s->position[1] = 0;
@@ -293,6 +310,7 @@ bool Batch_smooth::Add_number(long long a_val, long long b_val, const char* rela
 	s.is_smooth[s.entries] = true; //Until the batch check shows otherwise.
 	strcpy(s.list_of_factors[s.entries], relation_factor_list);
 	s.binary_lists = false;
+	s.rebuilds_other_side = s.rebuilds_other_side || rebuild_all;
 
 	s.entries++;
 
@@ -321,8 +339,12 @@ bool Batch_smooth::Add_number_binary(long long a_val, long long b_val, const uns
 	//The saved list holds the number of primes, followed by the primes.
 	unsigned int* saved = reinterpret_cast<unsigned int*>(s.list_of_factors[s.entries]);
 	saved[0] = num_primes;
-	memcpy(saved + 1, primes, num_primes * sizeof(unsigned int));
+	if (num_primes > 0)
+	{
+		memcpy(saved + 1, primes, num_primes * sizeof(unsigned int));
+	}
 	s.binary_lists = true;
+	s.rebuilds_other_side = s.rebuilds_other_side || rebuild_all || num_primes == 0;
 
 	s.entries++;
 
@@ -462,6 +484,13 @@ void Batch_smooth::Get_saved_list(Batch_slot& s, int index, string& list)
 	{
 		append_prime(list, saved[i]);
 	}
+}
+
+//Whether a relation was added from a binary file without a factor list of the other side (a file of only a and b). An empty list
+//in a text file is printed as it is: such files often hold the primes of one side only.
+bool Batch_smooth::Saved_list_missing(Batch_slot& s, int index)
+{
+	return s.binary_lists && reinterpret_cast<const unsigned int*>(s.list_of_factors[index])[0] == 0;
 }
 
 //The saved factor list of the other side of a relation, as numbers.
@@ -761,6 +790,12 @@ void Batch_smooth::Run_trees(Batch_slot& s)
 	s.tree->Remainder_tree();
 	t = profile_add(profile, PROF_REMAINDER_TREE, t);
 
+	//The relations, for factoring the other side with the leaves.
+	if (other_side_on_tree && s.rebuilds_other_side)
+	{
+		s.tree->Set_relations(s.a_vals, s.b_vals, s.entries);
+	}
+
 	s.tree->Leaf_cofactors();
 	profile_add(profile, PROF_LEAVES, t);
 }
@@ -925,24 +960,91 @@ static void append_prime(string& list, unsigned long long prime)
 	list += hex;
 }
 
-//Rebuild the factor list of the side that was not batch checked, with all primes and their multiplicities, as CADO-NFS requires.
-//The saved list is checked against the norm, and primes left out by the siever (typically small ones) are added.
-//Returns false if a saved prime does not divide the norm, or if the norm could not be fully factored.
+//Rebuild the factor list of the side that was not batch checked from its norm, with all primes of at least min_saved_prime_limit and
+//their multiplicities. The saved list, if any, is checked against the norm, and primes left out by the siever (typically small ones)
+//are added. The norm was usually factored by the tree (on the GPU), and otherwise it is factored here. Returns false if a saved prime
+//does not divide the norm, or if the norm could not be fully factored.
 bool Batch_smooth::Complete_other_side(Batch_slot& s, int index, string& list)
+{
+	vector<unsigned long long> primes;
+	Get_saved_primes(s, index, primes);
+
+	const unsigned int* tree_primes = NULL;
+	const int num_tree_primes = s.tree_factors ? s.tree->Other_factors(index, &tree_primes) : -1;
+	if (num_tree_primes >= 0)
+	{
+		//All primes of the norm: the saved ones must be among them, as often as they are listed.
+		sort(primes.begin(), primes.end());
+		vector<unsigned long long> all(tree_primes, tree_primes + num_tree_primes);
+		if (!includes(all.begin(), all.end(), primes.begin(), primes.end()))
+		{
+			return false;
+		}
+		primes.swap(all);
+	}
+	else
+	{
+		mpz_class norm;
+		other_poly->evaluate_polynomial_homogenous(&norm, s.a_vals[index], s.b_vals[index]);
+		mpz_abs(norm.get_mpz_t(), norm.get_mpz_t());
+
+		if (norm == 0)
+		{
+			return false;
+		}
+
+		//Divide out the primes from the saved list, once per time they are listed.
+		for (size_t j = 0; j < primes.size(); j++)
+		{
+			if (primes[j] < 2 || !mpz_divisible_ui_p(norm.get_mpz_t(), (mpir_ui)primes[j]))
+			{
+				return false;
+			}
+			mpz_divexact_ui(norm.get_mpz_t(), norm.get_mpz_t(), (mpir_ui)primes[j]);
+		}
+
+		//Factor whatever is left, which also finds any higher multiplicities of the listed primes.
+		if (norm > 1)
+		{
+			unsigned int other_side_factor_list[MAX_FACTORS_IN_RELATION];
+			int num_other_factors = factor_general(other_side_factor_list, norm.get_mpz_t(), MAX_FACTORS_IN_RELATION);
+
+			if (num_other_factors < 0)
+			{
+				return false;
+			}
+
+			for (int j = 0; j < num_other_factors; j++)
+			{
+				primes.push_back(other_side_factor_list[j]);
+			}
+		}
+
+		sort(primes.begin(), primes.end());
+	}
+
+	list.clear();
+	for (size_t j = 0; j < primes.size(); j++)
+	{
+		if (primes[j] >= (unsigned long long)min_saved_prime_limit)
+		{
+			append_prime(list, primes[j]);
+		}
+	}
+	return true;
+}
+
+//Whether the primes of the saved factor list of the other side divide its norm, as often as they are listed.
+bool Batch_smooth::Saved_list_divides(Batch_slot& s, int index)
 {
 	mpz_class norm;
 	other_poly->evaluate_polynomial_homogenous(&norm, s.a_vals[index], s.b_vals[index]);
-	mpz_abs(norm.get_mpz_t(), norm.get_mpz_t());
-
 	if (norm == 0)
 	{
 		return false;
 	}
-
 	vector<unsigned long long> primes;
 	Get_saved_primes(s, index, primes);
-
-	//Divide out the primes from the saved list, once per time they are listed.
 	for (size_t j = 0; j < primes.size(); j++)
 	{
 		if (primes[j] < 2 || !mpz_divisible_ui_p(norm.get_mpz_t(), (mpir_ui)primes[j]))
@@ -950,31 +1052,6 @@ bool Batch_smooth::Complete_other_side(Batch_slot& s, int index, string& list)
 			return false;
 		}
 		mpz_divexact_ui(norm.get_mpz_t(), norm.get_mpz_t(), (mpir_ui)primes[j]);
-	}
-
-	//Factor whatever is left, which also finds any higher multiplicities of the listed primes.
-	if (norm > 1)
-	{
-		unsigned int other_side_factor_list[MAX_FACTORS_IN_RELATION];
-		int num_other_factors = factor_general(other_side_factor_list, norm.get_mpz_t(), MAX_FACTORS_IN_RELATION);
-
-		if (num_other_factors < 0)
-		{
-			return false;
-		}
-
-		for (int j = 0; j < num_other_factors; j++)
-		{
-			primes.push_back(other_side_factor_list[j]);
-		}
-	}
-
-	sort(primes.begin(), primes.end());
-
-	list.clear();
-	for (size_t j = 0; j < primes.size(); j++)
-	{
-		append_prime(list, primes[j]);
 	}
 	return true;
 }
@@ -1064,7 +1141,7 @@ Batch_smooth::relation_status Batch_smooth::Format_relation(Batch_slot& s, int i
 		//Typically: one factor is too big for an uint32. An incomplete relation is useless, so skip it.
 		return RELATION_FACTORING_FAILED;
 	}
-	if (other_poly != NULL)
+	if (other_poly != NULL && (rebuild_all || Saved_list_missing(s, index)))
 	{
 		if (!Complete_other_side(s, index, other_side_list))
 		{
@@ -1073,6 +1150,12 @@ Batch_smooth::relation_status Batch_smooth::Format_relation(Batch_slot& s, int i
 	}
 	else
 	{
+		//The saved list must divide the norm: a relation whose a or b was stored wrongly (such as a of 2^31 or more in the int32
+		//of a binary file) was checked with the wrong value, and is left out.
+		if (other_poly != NULL && !Saved_list_divides(s, index))
+		{
+			return RELATION_OTHER_SIDE_FAILED;
+		}
 		Get_saved_list(s, index, other_side_list);
 	}
 
@@ -1199,6 +1282,7 @@ void Batch_smooth::Output_solutions(Batch_slot& s)
 	}
 	num_relations_found += num_good;
 	s.entries = 0;
+	s.rebuilds_other_side = false;
 }
 
 void Batch_smooth::Set_read_position(long long first, long long second)

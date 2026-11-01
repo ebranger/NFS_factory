@@ -33,6 +33,7 @@ struct Batch_slot
 	long long position[2]; //the read position of its last relation, as given by Set_read_position
 	size_t root_bits; //of the product tree
 	bool tree_factors; //the tree factored the smooth relations of the batch (Tree_backend::Leaf_factors)
+	bool rebuilds_other_side; //the factor list of the other side is rebuilt for some of the relations (see Batch_smooth)
 	mpz_class temp_number;
 	vector<unsigned char> leaf_result; //cofactor_result of each leaf
 	vector<string> relation_texts;
@@ -44,15 +45,18 @@ struct Batch_slot
 class Batch_smooth
 {
 public:
-	//other_side_poly: if not NULL, the factor list of the side that is not batch checked is rebuilt from its norm, with all primes and their multiplicities (as CADO-NFS requires).
-	//If NULL, that factor list is printed as it was read.
+	//other_side_poly: the polynomial of the side that is not batch checked. The factor list of that side is rebuilt from its norm, with
+	//all primes and their multiplicities, for every relation if rebuild_other_side (as CADO-NFS requires), and otherwise for the
+	//relations that were added without one (Add_number_binary with no primes, from a file of only a and b); the others are printed as
+	//they were read, if they divide the norm. The primes below print_limit are left out. On the GPU, the norms are factored with the
+	//relation values.
 	//backend: the implementation of the tree computations.
 	//three_lp_stage: if true, this is the 3LP second stage. Its inputs are the cofactors given with Add_candidate, which are checked against all primes below 2^lbp (fblim and mfb are not used).
 	//pipeline: the number of batches in progress at once (see Batch_slot), each with its own tree, or 0 for the default of the
 	//backend (default_pipeline). 1 checks each batch when it is full, in the calling thread. With more, the batches are checked in a pipeline of threads while the next ones are read: the
 	//polynomial values and the trees (by up to four threads, as the trees use the GPU), and then the cofactors and the output (one
 	//thread, in the order of the batches, so that the output does not depend on the pipeline). The second stage always uses 1.
-	Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, int max_tree_levels, tree_backend_kind backend, bool three_lp_stage = false, int pipeline = 1);
+	Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, bool rebuild_other_side, int max_tree_levels, tree_backend_kind backend, bool three_lp_stage = false, int pipeline = 1);
 	~Batch_smooth(void);
 	void Finish(); //Check the remaining relations, and any 3LP candidates in the second stage. Call once, after the last relation.
 	bool Add_number(long long a_val, long long b_val, const char* relation_factor_list);
@@ -78,6 +82,7 @@ public:
 private:
 	mpz_class* prime_product;
 	void Get_saved_list(Batch_slot& s, int index, string& list);
+	bool Saved_list_missing(Batch_slot& s, int index);
 	void Get_saved_primes(Batch_slot& s, int index, vector<unsigned long long>& primes);
 
 	void Setup_prime_product(long long smooth_bound, bool use_gpu);
@@ -94,6 +99,7 @@ private:
 	enum relation_status { RELATION_WRITTEN, RELATION_FACTORING_FAILED, RELATION_OTHER_SIDE_FAILED };
 	relation_status Format_relation(Batch_slot& s, int index, string& relation_text);
 	bool Complete_other_side(Batch_slot& s, int index, string& list);
+	bool Saved_list_divides(Batch_slot& s, int index);
 
 	string save_filename;
 	FILE* output; //open from the first batch on; flushed after each batch, so that its size is that of the relations written
@@ -106,7 +112,9 @@ private:
 	int min_saved_prime_limit;
 
 	Polynomial* poly;
-	Polynomial* other_poly; // NULL unless the other side's factor list should be rebuilt.
+	Polynomial* other_poly; //for rebuilding the other side's factor list
+	bool rebuild_all; //for every relation, not only those without a saved list
+	bool other_side_on_tree; //the tree factors the other side (Tree_backend::Set_other_side)
 
 	bool using_snfs_deg4_binomial;
 	bool binomial_fits; //the coefficients of the binomial fit in 63 bits, for Binomial_value_native.

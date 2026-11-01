@@ -1848,6 +1848,105 @@ __global__ void __launch_bounds__(FACTOR_BLOCK) k_factor_smooth(const uint32_t* 
 	}
 }
 
+#define OTHER_MAX_DEGREE 8 //the largest degree of the other side's polynomial on the GPU
+#define OTHER_WIDTH 8 //limbs of the two's complement numbers in which the other side's norms are computed
+
+//x *= u modulo 2^(64 OTHER_WIDTH), which is the two's complement product as long as it fits.
+__device__ __forceinline__ void multiply_scalar_wide(uint64_t* x, uint64_t u)
+{
+	uint64_t carry = 0;
+	for (int k = 0; k < OTHER_WIDTH; k++)
+	{
+		const uint64_t lo = x[k] * u, hi = __umul64hi(x[k], u);
+		x[k] = lo + carry;
+		carry = hi + (x[k] < lo);
+	}
+}
+
+__device__ __forceinline__ void negate_wide(uint64_t* x)
+{
+	uint64_t carry = 1;
+	for (int k = 0; k < OTHER_WIDTH; k++)
+	{
+		x[k] = ~x[k] + carry;
+		carry = (x[k] < carry);
+	}
+}
+
+//The norms |F(a, b)| = |sum c_k a^k b^(d - k)| of the other side of the listed leaves (ab: a and b of each leaf; coefficients: of
+//OTHER_WIDTH limbs each, two's complement, from c_0), as numbers of up to FACTOR_LIMBS limbs (values, at the stride FACTOR_LIMBS, and
+//sizes, by leaf). Norms that may not fit in OTHER_WIDTH limbs (from the sizes of a, b and the coefficients), or do not fit in
+//FACTOR_LIMBS, get the size FACTOR_LIMBS + 1, which k_factor_smooth leaves to the CPU.
+__global__ void k_other_norms(const uint32_t* __restrict__ list, const uint32_t* __restrict__ list_count, const int64_t* __restrict__ ab,
+	const uint64_t* __restrict__ coefficients, int degree, int coefficient_bits, uint64_t* __restrict__ values, uint32_t* __restrict__ sizes)
+{
+	const uint32_t count = *list_count;
+	for (uint32_t j = blockIdx.x * blockDim.x + threadIdx.x; j < count; j += gridDim.x * blockDim.x)
+	{
+		const uint32_t i = list[j];
+		const int64_t a = ab[2 * (size_t)i], b = ab[2 * (size_t)i + 1];
+		const uint64_t abs_a = (uint64_t)((a < 0) ? -a : a), abs_b = (uint64_t)((b < 0) ? -b : b);
+		const uint64_t larger = (abs_a > abs_b) ? abs_a : abs_b;
+		const int larger_bits = 64 - __clzll((long long)larger);
+		if (coefficient_bits + degree * larger_bits + 4 > 64 * OTHER_WIDTH - 1)
+		{
+			sizes[i] = FACTOR_LIMBS + 1;
+			continue;
+		}
+		uint64_t sum[OTHER_WIDTH], term[OTHER_WIDTH];
+		for (int k = 0; k < OTHER_WIDTH; k++)
+		{
+			sum[k] = 0;
+		}
+		for (int e = 0; e <= degree; e++)
+		{
+			for (int k = 0; k < OTHER_WIDTH; k++)
+			{
+				term[k] = coefficients[e * OTHER_WIDTH + k];
+			}
+			for (int k = 0; k < e; k++)
+			{
+				multiply_scalar_wide(term, abs_a);
+			}
+			for (int k = e; k < degree; k++)
+			{
+				multiply_scalar_wide(term, abs_b);
+			}
+			if (((a < 0) && (e & 1)) != ((b < 0) && ((degree - e) & 1)))
+			{
+				negate_wide(term);
+			}
+			uint64_t carry = 0;
+			for (int k = 0; k < OTHER_WIDTH; k++)
+			{
+				const uint64_t s = sum[k] + term[k];
+				const uint64_t c1 = (s < term[k]);
+				sum[k] = s + carry;
+				carry = c1 + (sum[k] < s);
+			}
+		}
+		if (sum[OTHER_WIDTH - 1] >> 63)
+		{
+			negate_wide(sum);
+		}
+		int n = OTHER_WIDTH;
+		while (n > 0 && sum[n - 1] == 0)
+		{
+			n--;
+		}
+		if (n > FACTOR_LIMBS)
+		{
+			sizes[i] = FACTOR_LIMBS + 1;
+			continue;
+		}
+		for (int k = 0; k < FACTOR_LIMBS; k++)
+		{
+			values[(size_t)i * FACTOR_LIMBS + k] = sum[k];
+		}
+		sizes[i] = (uint32_t)n;
+	}
+}
+
 //The cofactors that the CPU still needs after the checks (LEAF_CANDIDATE, LEAF_TINYQS and LEAF_CHECK_ON_CPU), gathered for the
 //copy to the host, in any order: their leaves (list, after their count), sizes and limbs (K each).
 __global__ void k_gather_cofactors(const unsigned char* __restrict__ classes, const uint64_t* __restrict__ cofactors, const uint32_t* __restrict__ size, int K,
@@ -1886,6 +1985,9 @@ public:
 	bool Set_leaf_factoring();
 	bool Leaf_factors_ready();
 	int Leaf_factors(int index, const unsigned int** factors);
+	bool Set_other_side(const std::vector<mpz_class>& coefficients);
+	void Set_relations(const long long* a, const long long* b, int count);
+	int Other_factors(int index, const unsigned int** factors);
 
 private:
 	//The nodes of a depth: the product tree, and then the fractions of the remainder tree.
@@ -1939,6 +2041,24 @@ private:
 	void Start_factoring(int K);
 	std::vector<uint32_t> host_factor_list, host_factor_offsets, host_factor_primes;
 	std::vector<int> host_factor_counts, host_factor_entry; //host_factor_entry: the entry of each leaf in the list, or -1
+	//The other side of the smooth leaves, factored after them: its polynomial (Set_other_side), a and b of the leaves (other_ab, from
+	//host_ab, for a batch given with Set_relations), the norms (by leaf), and their factors (by entry in the list of smooth leaves),
+	//as for the leaves.
+	bool other_side; //Set_other_side was called
+	int other_degree, other_coefficient_bits;
+	uint64_t* other_coefficients;
+	int64_t* other_ab;
+	size_t other_ab_capacity;
+	Pinned<int64_t> host_ab;
+	bool other_given; //Set_relations for this batch
+	bool other_pending, other_valid; //the factoring of the other side was started, and its factors are there (for this batch)
+	uint64_t* other_values;
+	uint32_t *other_sizes, *other_offsets, *other_primes, *other_used;
+	int* other_counts;
+	size_t other_values_capacity, other_sizes_capacity, other_offsets_capacity, other_primes_capacity, other_counts_capacity;
+	uint32_t other_pool;
+	std::vector<uint32_t> host_other_offsets, host_other_primes;
+	std::vector<int> host_other_counts;
 	Pinned<unsigned char> host_classes;
 	Pinned<unsigned long long> host_large_primes;
 	//The cofactors that the CPU needs, gathered on the GPU (k_gather_cofactors): their leaves (after their count), sizes and limbs.
@@ -2051,6 +2171,14 @@ Gpu_tree_backend::Gpu_tree_backend(int levels, int max_bits_in_input) : Cpu_tree
 	factor_pool = 0;
 	CUDA_CHECK(cudaEventCreateWithFlags(&factored, cudaEventDisableTiming));
 	factors_pending = factors_valid = false;
+	other_side = other_given = other_pending = other_valid = false;
+	other_degree = other_coefficient_bits = 0;
+	other_coefficients = other_values = NULL;
+	other_ab = NULL;
+	other_sizes = other_offsets = other_primes = other_used = NULL;
+	other_counts = NULL;
+	other_ab_capacity = other_values_capacity = other_sizes_capacity = other_offsets_capacity = other_primes_capacity = other_counts_capacity = 0;
+	other_pool = 0;
 }
 
 Gpu_tree_backend::~Gpu_tree_backend()
@@ -2087,6 +2215,14 @@ Gpu_tree_backend::~Gpu_tree_backend()
 	cudaFree(factor_counts);
 	cudaFree(factor_offsets);
 	cudaFree(factor_primes);
+	cudaFree(other_coefficients);
+	cudaFree(other_ab);
+	cudaFree(other_values);
+	cudaFree(other_sizes);
+	cudaFree(other_offsets);
+	cudaFree(other_primes);
+	cudaFree(other_used);
+	cudaFree(other_counts);
 	cudaEventDestroy(rho_done);
 	cudaEventDestroy(classified);
 	cudaStreamDestroy(rho_stream);
@@ -2154,6 +2290,29 @@ void Gpu_tree_backend::Start_factoring(int K)
 	k_factor_smooth<<<1024, FACTOR_BLOCK, 0, rho_stream>>>(factor_list + 2, factor_list, leaves.level.limbs, leaves.level.stride, leaves.level.size,
 		checking ? large_primes : NULL, factor_counts, factor_offsets, factor_primes, factor_list + 1, factor_pool);
 	CUDA_CHECK(cudaGetLastError());
+	if (other_given)
+	{
+		//The other side of the same leaves: their norms, factored as the leaves. The pool starts at one factor per leaf, for a few
+		//percent of the leaves being smooth, and grows as the leaves' pool does.
+		other_pool = (other_pool > (uint32_t)num_leaves) ? other_pool : (uint32_t)num_leaves;
+		reserve(other_values, other_values_capacity, (size_t)num_leaves * FACTOR_LIMBS);
+		reserve(other_sizes, other_sizes_capacity, (size_t)num_leaves);
+		reserve(other_counts, other_counts_capacity, (size_t)num_leaves);
+		reserve(other_offsets, other_offsets_capacity, (size_t)num_leaves);
+		reserve(other_primes, other_primes_capacity, (size_t)other_pool);
+		if (other_used == NULL)
+		{
+			CUDA_CHECK(cudaMalloc(&other_used, sizeof(uint32_t)));
+		}
+		CUDA_CHECK(cudaMemsetAsync(other_used, 0, sizeof(uint32_t), rho_stream));
+		k_other_norms<<<grid_size_leaves(num_leaves), 128, 0, rho_stream>>>(factor_list + 2, factor_list, other_ab, other_coefficients, other_degree,
+			other_coefficient_bits, other_values, other_sizes);
+		k_factor_smooth<<<1024, FACTOR_BLOCK, 0, rho_stream>>>(factor_list + 2, factor_list, other_values, FACTOR_LIMBS, other_sizes, NULL, other_counts,
+			other_offsets, other_primes, other_used, other_pool);
+		CUDA_CHECK(cudaGetLastError());
+		other_pending = true;
+		other_given = false;
+	}
 	CUDA_CHECK(cudaEventRecord(factored, rho_stream));
 	factors_pending = true;
 }
@@ -2191,6 +2350,27 @@ bool Gpu_tree_backend::Leaf_factors_ready()
 	{
 		host_factor_entry[host_factor_list[j]] = (int)j;
 	}
+	other_valid = other_pending;
+	if (other_pending)
+	{
+		uint32_t used = 0;
+		CUDA_CHECK(cudaMemcpy(&used, other_used, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+		host_other_counts.resize(count);
+		host_other_offsets.resize(count);
+		host_other_primes.resize((used < other_pool) ? used : other_pool);
+		if (count > 0)
+		{
+			CUDA_CHECK(cudaMemcpy(host_other_counts.data(), other_counts, count * sizeof(int), cudaMemcpyDeviceToHost));
+			CUDA_CHECK(cudaMemcpy(host_other_offsets.data(), other_offsets, count * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+			CUDA_CHECK(cudaMemcpy(host_other_primes.data(), other_primes, host_other_primes.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+		}
+		if (used > other_pool)
+		{
+			//As for the leaves: the CPU factors the norms that did not fit, and the next batch has room for all.
+			other_pool = used + used / 4;
+		}
+		other_pending = false;
+	}
 	factors_pending = false;
 	factors_valid = true;
 	return true;
@@ -2205,6 +2385,82 @@ int Gpu_tree_backend::Leaf_factors(int index, const unsigned int** factors)
 	}
 	*factors = host_factor_primes.data() + host_factor_offsets[j];
 	return host_factor_counts[j];
+}
+
+//The polynomial of the other side, as numbers of OTHER_WIDTH limbs in two's complement, if it is small enough: k_other_norms then
+//computes the norms for a and b of up to (64 OTHER_WIDTH - 5 - coefficient bits) / degree bits.
+bool Gpu_tree_backend::Set_other_side(const std::vector<mpz_class>& coefficients)
+{
+	const int degree = (int)coefficients.size() - 1;
+	if (degree < 1 || degree > OTHER_MAX_DEGREE || !factoring)
+	{
+		return false;
+	}
+	int bits = 0;
+	std::vector<uint64_t> words((size_t)(degree + 1) * OTHER_WIDTH, 0);
+	for (int e = 0; e <= degree; e++)
+	{
+		mpz_srcptr c = coefficients[e].get_mpz_t();
+		const int c_bits = (int)mpz_sizeinbase(c, 2);
+		if (c_bits + degree * 32 + 4 > 64 * OTHER_WIDTH - 1)
+		{
+			return false; //too large even for a and b of 32 bits
+		}
+		bits = (c_bits > bits) ? c_bits : bits;
+		uint64_t* x = &words[(size_t)e * OTHER_WIDTH];
+		for (size_t k = 0; k < mpz_size(c); k++)
+		{
+			x[k] = mpz_getlimbn(c, k);
+		}
+		if (mpz_sgn(c) < 0)
+		{
+			uint64_t carry = 1;
+			for (int k = 0; k < OTHER_WIDTH; k++)
+			{
+				x[k] = ~x[k] + carry;
+				carry = (x[k] < carry);
+			}
+		}
+	}
+	gpu_start();
+	cudaFree(other_coefficients);
+	CUDA_CHECK(cudaMalloc(&other_coefficients, words.size() * sizeof(uint64_t)));
+	CUDA_CHECK(cudaMemcpy(other_coefficients, words.data(), words.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
+	other_degree = degree;
+	other_coefficient_bits = bits;
+	other_side = true;
+	return true;
+}
+
+//a and b of the leaves of this batch, copied to the GPU on the stream of the thread, before Leaf_cofactors starts the factoring.
+void Gpu_tree_backend::Set_relations(const long long* a, const long long* b, int count)
+{
+	if (!other_side)
+	{
+		return;
+	}
+	gpu_start();
+	host_ab.resize(2 * (size_t)num_leaves);
+	for (int i = 0; i < count; i++)
+	{
+		host_ab[2 * (size_t)i] = a[i];
+		host_ab[2 * (size_t)i + 1] = b[i];
+	}
+	memset(host_ab.data() + 2 * (size_t)count, 0, 2 * (size_t)(num_leaves - count) * sizeof(int64_t));
+	reserve(other_ab, other_ab_capacity, 2 * (size_t)num_leaves);
+	CUDA_CHECK(cudaMemcpyAsync(other_ab, host_ab.data(), 2 * (size_t)num_leaves * sizeof(int64_t), cudaMemcpyHostToDevice, 0));
+	other_given = true;
+}
+
+int Gpu_tree_backend::Other_factors(int index, const unsigned int** factors)
+{
+	const int j = (factors_valid && other_valid) ? host_factor_entry[index] : -1;
+	if (j < 0)
+	{
+		return -1;
+	}
+	*factors = host_other_primes.data() + host_other_offsets[j];
+	return host_other_counts[j];
 }
 
 void Gpu_tree_backend::Set_stride(Depth& d, size_t count, size_t stride)
@@ -2443,7 +2699,7 @@ void Gpu_tree_backend::Leaf_cofactors()
 		if (gpu->Leaf_cofactors(parents.level, parents.bits, leaves.level, leaves.bits, (int)leaf_limbs, (uint32_t)guard, MAX_SQUARINGS_IN_CHECK, cofactors, 0))
 		{
 			classes_valid = checking;
-			factors_pending = factors_valid = false;
+			factors_pending = factors_valid = other_valid = false;
 			if (checking)
 			{
 				reserve(classes, classes_capacity, (size_t)num_leaves);
@@ -2516,7 +2772,7 @@ void Gpu_tree_backend::Leaf_cofactors()
 	}
 	//Large leaves: on the CPU, from the fractions of their parents. Their cofactors are not checked here.
 	classes_valid = false;
-	factors_pending = factors_valid = false;
+	factors_pending = factors_valid = other_valid = other_given = false;
 	Download(levels - 2);
 	Cpu_tree_backend::Leaf_cofactors();
 }
