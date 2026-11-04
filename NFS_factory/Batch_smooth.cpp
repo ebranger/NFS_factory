@@ -112,6 +112,7 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	save_filename = filename;
 	output = NULL;
 	num_relations_found = 0;
+	num_relations_checked = 0;
 	num_factoring_failures = 0;
 	num_other_side_failures = 0;
 	min_saved_prime_limit = print_limit; //Do not print primes less than this. Msieve reconstructs primes less than 1000, CADO needs all primes (so set this to 1 to print everything).
@@ -454,18 +455,18 @@ void Batch_smooth::Finish()
 
 	if (three_lp_max_bits > 0)
 	{
-		cout << "Found " << num_candidates << " 3LP candidates";
+		string text = "Found " + to_string(num_candidates) + " 3LP candidates";
 		if (num_candidates_skipped > 0)
 		{
-			cout << " (and skipped " << num_candidates_skipped << " with a, b or saved primes too large for the candidate format)";
+			text += " (and skipped " + to_string(num_candidates_skipped) + " with a, b or saved primes too large for the candidate format)";
 		}
-		cout << "." << endl;
+		console_message(text + ".");
 	}
 
 	if (second_stage != NULL)
 	{
 		second_stage->Finish();
-		cout << "The 3LP second stage found " << second_stage->Get_num_relations_found() << " relations." << endl;
+		console_message("The 3LP second stage found " + to_string(second_stage->Get_num_relations_found()) + " relations.");
 	}
 }
 
@@ -806,7 +807,10 @@ void Batch_smooth::Run_trees(Batch_slot& s)
 void Batch_smooth::Run_checks(Batch_slot& s)
 {
 	unsigned long long t = profile_now();
-	cout << "Size of top node of product tree: " << s.root_bits << " bits." << endl;
+	if (verbose_output)
+	{
+		console_message("Size of top node of product tree: " + to_string(s.root_bits) + " bits.");
+	}
 
 	s.leaf_result.resize(num_relations_per_batch);
 	const unsigned char* classes = s.tree->Leaf_classes();
@@ -1272,13 +1276,14 @@ void Batch_smooth::Output_solutions(Batch_slot& s)
 
 	profile_add(profile, PROF_WRITE, t);
 
-	if (three_lp_stage)
+	if (verbose_output)
 	{
-		cout << "Ran a 3LP batch of " << s.entries << " candidates, found " << num_good << " relations" << endl;
+		console_message(three_lp_stage ? "Ran a 3LP batch of " + to_string(s.entries) + " candidates, found " + to_string(num_good) + " relations" :
+			"Ran a batch, found " + to_string(num_good) + " smooth numbers");
 	}
-	else
+	if (!three_lp_stage)
 	{
-		cout << "Ran a batch, found " << num_good << " smooth numbers" << endl;
+		num_relations_checked += s.entries;
 	}
 	num_relations_found += num_good;
 	s.entries = 0;
@@ -1299,6 +1304,16 @@ void Batch_smooth::Set_batch_done(function<void(const long long position[2], lon
 unsigned long long Batch_smooth::Get_reader_blocked_cycles()
 {
 	return reader_blocked;
+}
+
+long long Batch_smooth::Get_num_3lp_relations_found()
+{
+	return (second_stage != NULL) ? second_stage->Get_num_relations_found() : 0;
+}
+
+long long Batch_smooth::Get_num_relations_checked()
+{
+	return num_relations_checked;
 }
 
 long long Batch_smooth::Get_num_relations_found()

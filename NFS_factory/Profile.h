@@ -5,6 +5,7 @@
 
 #include <intrin.h>
 #include <atomic>
+#include <string>
 
 enum profile_phase {
 	PROF_SETUP,           //prime product and memory setup
@@ -50,3 +51,12 @@ inline unsigned long long profile_add(profile_phase phase, unsigned long long st
 }
 
 void print_profile(unsigned long long total_cycles);
+
+//The output during a run: a status line, which on a console is rewritten in place (at most twice a second), and otherwise written
+//as a line of its own at most once a minute, and messages, which are printed above the status line. Thread safe.
+extern bool verbose_output; //also print a line for each batch (-verbose)
+bool console_is_terminal();
+void console_status(const std::string& text);
+void console_message(const std::string& text);
+//The last status line, always written, after which messages are printed as usual.
+void console_end_status(const std::string& text);

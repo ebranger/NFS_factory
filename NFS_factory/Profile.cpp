@@ -1,6 +1,10 @@
 #include "Profile.h"
 #include <iostream>
 #include <iomanip>
+#include <mutex>
+#include <chrono>
+#include <io.h>
+#include <stdio.h>
 #include <windows.h>
 #include <psapi.h>
 
@@ -27,8 +31,10 @@ static const char* phase_names[PROF_NUM_PHASES] = {
 	"Checks, for the trees"
 };
 
-//Print the time spent in each phase, as a share of the total, and the peak memory use. When the batches are checked in a
-//pipeline, the phases overlap, and their shares can add up to more than 100 %.
+//Print the time spent in each phase, as a share of the time of the whole run, and the peak memory use. The time of a phase is
+//added up over the threads that do it: when the batches are checked in a pipeline, several threads work at once (up to four
+//batches in the trees, the reader and the thread of the checks), so a phase can take more than 100 %, and the shares add up to
+//more than 100 %.
 void print_profile(unsigned long long total_cycles)
 {
 	unsigned long long accounted = 0;
@@ -37,7 +43,17 @@ void print_profile(unsigned long long total_cycles)
 		accounted += profile_cycles[i];
 	}
 
-	cout << endl << "Time profile (Gcycles, share of total):" << endl;
+	bool waits = false;
+	for (int i = PROF_FIRST_WAIT; i < PROF_NUM_PHASES; i++)
+	{
+		waits = waits || profile_cycles[i] > 0;
+	}
+
+	cout << endl << "Time profile (Gcycles, share of the time of the run):" << endl;
+	if (waits)
+	{
+		cout << "The time of each step is added up over the threads doing it at once, so a step can take more than 100 %." << endl;
+	}
 	cout << fixed << setprecision(1);
 
 	for (int i = 0; i < PROF_FIRST_WAIT; i++)
@@ -55,7 +71,7 @@ void print_profile(unsigned long long total_cycles)
 
 	if (profile_cycles[PROF_3LP] > 0)
 	{
-		cout << "3LP second stage (Gcycles, share of total):" << endl;
+		cout << "3LP second stage (Gcycles, share of the time of the run):" << endl;
 		for (int i = 0; i < PROF_FIRST_WAIT; i++)
 		{
 			if (profile_cycles_3lp[i] > 0)
@@ -65,14 +81,11 @@ void print_profile(unsigned long long total_cycles)
 		}
 	}
 
-	bool waits = false;
-	for (int i = PROF_FIRST_WAIT; i < PROF_NUM_PHASES; i++)
-	{
-		waits = waits || profile_cycles[i] > 0;
-	}
 	if (waits)
 	{
-		cout << "Waits of the batch pipeline (Gcycles, share of total):" << endl;
+		//The thread of the checks takes the batches in order, so it is the limit when it seldom waits for the trees. The trees (up
+		//to four threads) are the limit when the reader waits for a slot and the checks wait for the trees.
+		cout << "Waits of the batch pipeline (Gcycles, share of the time of the run):" << endl;
 		for (int i = PROF_FIRST_WAIT; i < PROF_NUM_PHASES; i++)
 		{
 			cout << "  " << left << setw(25) << phase_names[i] << right << setw(8) << profile_cycles[i] / 1e9 << setw(7) << 100.0 * profile_cycles[i] / total_cycles << " %" << endl;
@@ -87,4 +100,93 @@ void print_profile(unsigned long long total_cycles)
 
 	cout.unsetf(ios::fixed);
 	cout << setprecision(6);
+}
+
+bool verbose_output = false;
+
+static mutex console_lock;
+static string status_text; //on the console
+static size_t status_width = 0; //of the status line on the console, 0 if none is shown
+static long long last_status = -1000000; //ms
+
+static long long console_ms()
+{
+	return chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+bool console_is_terminal()
+{
+	static const bool terminal = _isatty(_fileno(stdout)) != 0;
+	return terminal;
+}
+
+//Rewrite the status line on the console. With console_lock.
+static void draw_status()
+{
+	cout << '\r' << status_text;
+	if (status_text.size() < status_width)
+	{
+		cout << string(status_width - status_text.size(), ' ');
+	}
+	cout << flush;
+	status_width = (status_text.size() > status_width) ? status_text.size() : status_width;
+}
+
+void console_status(const string& text)
+{
+	lock_guard<mutex> guard(console_lock);
+	const long long now = console_ms();
+	if (now - last_status < (console_is_terminal() ? 500 : 60000))
+	{
+		return;
+	}
+	last_status = now;
+	if (console_is_terminal())
+	{
+		status_text = text;
+		draw_status();
+	}
+	else
+	{
+		cout << text << endl;
+	}
+}
+
+void console_message(const string& text)
+{
+	lock_guard<mutex> guard(console_lock);
+	if (status_width > 0)
+	{
+		//Over the status line, which is then written again below.
+		cout << '\r' << text;
+		if (text.size() < status_width)
+		{
+			cout << string(status_width - text.size(), ' ');
+		}
+		cout << endl;
+		status_width = 0;
+		draw_status();
+	}
+	else
+	{
+		cout << text << endl;
+	}
+}
+
+void console_end_status(const string& text)
+{
+	lock_guard<mutex> guard(console_lock);
+	if (console_is_terminal())
+	{
+		status_text = text;
+		draw_status();
+		cout << endl;
+		status_width = 0;
+		status_text.clear();
+	}
+	else
+	{
+		cout << text << endl;
+	}
+	last_status = console_ms();
 }

@@ -21,13 +21,13 @@ The first step in using Coppersmiths factorization factory is to sieve for relat
 
 Once enough relations have been stored, it is time for NFS_factory to start working. The program is invoked from the command line taking three arguments:
 
-NFS_factory <polynomial file name> <saved relation file name> <output file name> [-rels N] [-threads N] [-gpu N]
+NFS_factory <polynomial file name> <saved relation file name> <output file name> [-rels N] [-threads N] [-gpu N] [-verbose]
 
 The polynomial file describes the polynomial used for the current factorization, in GGNFS format with a few extra options, detailed below. The relation file contains the NFS relations stored by the sieving procedure, in the GGNFS/msieve relation format, or one of two binary formats that save space (see "Relation file formats" below). The program will run until all relations in the file have been processed. All found relations are appended to the output file specified.
 
 Several relation files can be processed in one run, which sets up the prime products only once and keeps filling the same remainder tree across the files:
 
-NFS_factory <polynomial file name> -list <list file name> <output file name> [-rels N] [-threads N] [-gpu N]
+NFS_factory <polynomial file name> -list <list file name> <output file name> [-rels N] [-threads N] [-gpu N] [-verbose]
 
 The list file names one relation file per line (empty lines and lines starting with # are skipped), and the files are read in that order. With -rels N, the run stops once N relations have been found: it finishes the batches it has read (up to the number of batches of the pipeline option) and the 3LP candidates found so far, so it usually finds more than N. Relations found by an earlier, interrupted run of the same input count towards N.
 
@@ -42,6 +42,8 @@ The GPU build (NFS_factory_gpu, see "Compiling the code.txt") does the product a
 -threads N sets the number of threads of the checks on the CPU: the cofactors of the relation values (primality tests, Pollard rho), and the factoring of the relations found (default 1 in the CPU build; in the GPU build 8, or the number of hardware threads if that is less). The GPU build does both on the GPU, except tinyqs, relation values of more than 256 bits, and a few rare cases, so it needs few threads: on SNFS-240 (RTX 4070 Ti SUPER) one thread is as fast as eight. The output does not depend on it.
 
 -gpu N selects the GPU of the GPU build, numbered from 0 (default 0); the one used is printed at the start. The GPU build needs a CUDA GPU of compute capability 7.5 or later, and stops with a message saying so if there is none; on such a computer, use the CPU build.
+
+At the start, the program prints the setup: the GPU, the prime products, the size of the batches (relations per batch and tree levels), the batches in progress at once, the threads, and the number and size of the relation files. During the run, one status line shows the time since the reading started, the relation file of the last batch checked, the relations checked so far and per second, and the relations found (with those of the 3LP second stage) and per second. On a console the line is rewritten in place twice a second; when the output goes to a file, it is written as a line of its own once a minute, with a line for each relation file of a list. Messages, such as the 3LP candidates found or a skipped part of a file, are printed above it. -verbose also prints, as earlier versions did, the size of the top of the product tree and the relations found for each batch.
 
 Relation file formats
 ---------------------
@@ -96,7 +98,7 @@ The largest candidates are the least likely to be products of three primes below
 
 The cost does not include setting up the prime product of the second stage, about 20 Gcycles per run whatever mfba is. For comparison, the whole run without 3LP took about 97 Gcycles and found 19587 relations, about 5 Mcycles per relation. The last few bits cost much more than that per relation found: going from 85 to 87 bits costs more than 50 Mcycles per extra relation, and from 84 to 85 about 8 Mcycles. mfba = 3 lpba - 3 (84 for lpba 29) is a reasonable choice, or 3 lpba - 2 when more relations are worth more CPU time. Without 3LP, use mfbr/mfba = 2 lbpr/lbpa as before.
 
-At the end of a run, the program prints how the time was spent on the different steps, and the peak memory use.
+At the end of a run, the program prints how the time was spent on the different steps, and the peak memory use. Each step is given in Gcycles (of the processor's time stamp counter) and as a share of the time of the whole run. The time of a step is added up over the threads doing it, and with a pipeline several threads work at once (up to four batches in the trees, the reader, and the thread of the checks), so a step can take more than 100 %, and the shares add up to more than 100 %. The waits of the pipeline show what limits the run: the thread of the checks, which takes the batches in order, is the limit when it seldom waits for the trees, and the trees (the GPU) are the limit when the checks wait for them while the reader waits for a free slot.
 
 Lines in a GGNFS/msieve relation file that cannot be parsed are skipped and counted, as is an incomplete last line, which a siever that is stopped may leave behind. A binary or .ab relation file that ends in the middle of a relation is also detected.
 

@@ -32,6 +32,8 @@ and the batch factorization code in CADO-NFS.
 #include <limits.h>
 #include <algorithm>
 #include <thread>
+#include <chrono>
+#include <iomanip>
 #include <omp.h>
 #ifdef _WIN32
 #include <io.h>
@@ -421,6 +423,22 @@ bool truncate_file(const string& name, long long size)
 #endif
 }
 
+//A number with its digits in groups of three, separated by commas.
+string group_digits(long long value)
+{
+	string digits = to_string(value < 0 ? -value : value);
+	string result;
+	for (size_t i = 0; i < digits.size(); i++)
+	{
+		if (i > 0 && (digits.size() - i) % 3 == 0)
+		{
+			result += ',';
+		}
+		result += digits[i];
+	}
+	return (value < 0) ? "-" + result : result;
+}
+
 //The progress of a run over its relation files, for resuming an interrupted run and for stopping at a number of relations.
 //After each batch, when its relations are checked and written to the output file, the position of its last relation is saved
 //to the resume file: the input (the relation file, or the list of relation files), the file reached, and how many records (lines
@@ -448,6 +466,31 @@ struct run_progress
 	long long Found()
 	{
 		return found_before + batch->Get_num_relations_found();
+	}
+
+	//The status line: the time since the reading started, the file of the last batch checked, the relations checked and found, and
+	//their rates.
+	long long start_ms;
+	string Status(size_t file)
+	{
+		const double seconds = (double)(chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now().time_since_epoch()).count() - start_ms) / 1000;
+		const long long elapsed = (long long)seconds;
+		const long long checked = batch->Get_num_relations_checked();
+		const long long found = batch->Get_num_relations_found();
+		char text[512];
+		string name = (file < files.size()) ? files[file] : files.back();
+		const size_t slash = name.find_last_of("\\/");
+		name = (slash == string::npos) ? name : name.substr(slash + 1);
+		string where = name;
+		if (files.size() > 1)
+		{
+			where += " (" + to_string(((file < files.size()) ? file : files.size() - 1) + 1) + " of " + to_string(files.size()) + ")";
+		}
+		const long long three_lp = batch->Get_num_3lp_relations_found();
+		snprintf(text, sizeof(text), "%lld:%02lld:%02lld  %s  checked %.1fM, %.2fM/s  found %s%s, %.0f/s", elapsed / 3600, elapsed / 60 % 60, elapsed % 60,
+			where.c_str(), checked / 1e6, (seconds > 0) ? checked / seconds / 1e6 : 0.0, group_digits(found_before + found).c_str(),
+			(three_lp > 0) ? (" (3LP " + group_digits(three_lp) + ")").c_str() : "", (seconds > 0) ? found / seconds : 0.0);
+		return text;
 	}
 
 	//The resume file is written by a thread of its own, since creating and renaming a file can take several ms on Windows. The
@@ -597,10 +640,11 @@ struct run_progress
 	void Batch_done(const long long position[2], long long output_size)
 	{
 		Save((size_t)position[0], position[1], (output_size >= 0) ? output_size : file_size(output_filename), true);
+		console_status(Status((size_t)position[0]));
 		if (target > 0 && Found() >= target && !target_reached)
 		{
 			target_reached = true;
-			cout << "Found " << Found() << " relations, at least the " << target << " that were asked for." << endl;
+			console_message("Found " + to_string(Found()) + " relations, at least the " + to_string(target) + " that were asked for.");
 		}
 	}
 
@@ -623,7 +667,7 @@ struct run_progress
 		}
 		if (param->maxrels > 0 && relations_added >= param->maxrels)
 		{
-			cout << "Stopping after " << relations_added << " relations (maxrels)." << endl;
+			console_message("Stopping after " + to_string(relations_added) + " relations (maxrels).");
 			return true;
 		}
 		return false;
@@ -641,7 +685,7 @@ read_result read_batch_from_file(string filename, Batch_smooth* batch, nfs_param
 
 	if (infile == NULL)
 	{
-		cout << "Could not open input file " << filename << endl;
+		console_message("Could not open input file " + filename);
 		return READ_FAILED;
 	}
 	setvbuf(infile, NULL, _IOFBF, 1 << 20);
@@ -768,17 +812,17 @@ read_result read_batch_from_file(string filename, Batch_smooth* batch, nfs_param
 
 	if (incomplete_last_line)
 	{
-		cout << "Skipped an incomplete last line in the relation file." << endl;
+		console_message("Skipped an incomplete last line in the relation file.");
 	}
 
 	if (failed_relations > 0)
 	{
-		cout << "Failed to parse " << failed_relations << " relations out of a total of " << relation_num + failed_relations + skipped_relations << " relations." << endl;
+		console_message("Failed to parse " + to_string(failed_relations) + " relations out of a total of " + to_string(relation_num + failed_relations + skipped_relations) + " relations.");
 	}
 
 	if (skipped_relations > 0)
 	{
-		cout << "Skipped " << skipped_relations << " relations with a or b larger than maxa or maxb." << endl;
+		console_message("Skipped " + to_string(skipped_relations) + " relations with a or b larger than maxa or maxb.");
 	}
 
 	return stopped ? READ_STOPPED : READ_END;
@@ -988,7 +1032,7 @@ read_result read_batch_from_binary_file(string filename, Batch_smooth* batch, nf
 	read_buffer input;
 	if (!input.file.Open(filename))
 	{
-		cout << "Failed to open input saved relations file " << filename << endl;
+		console_message("Failed to open input saved relations file " + filename);
 		return READ_FAILED;
 	}
 
@@ -1067,12 +1111,12 @@ read_result read_batch_from_binary_file(string filename, Batch_smooth* batch, nf
 
 	if (corrupt)
 	{
-		cout << "The binary relation file is truncated or corrupt after " << records << " relations. The rest of the file was skipped." << endl;
+		console_message("The binary relation file is truncated or corrupt after " + to_string(records) + " relations. The rest of the file was skipped.");
 	}
 
 	if (skipped_relations > 0)
 	{
-		cout << "Skipped " << skipped_relations << " relations with a or b larger than maxa or maxb." << endl;
+		console_message("Skipped " + to_string(skipped_relations) + " relations with a or b larger than maxa or maxb.");
 	}
 
 	return stopped ? READ_STOPPED : READ_END;
@@ -1090,19 +1134,19 @@ read_result read_batch_from_ab_file(string filename, Batch_smooth* batch, nfs_pa
 	FILE* f = fopen(filename.c_str(), "rb");
 	if (f == NULL)
 	{
-		cout << "Failed to open input relation file " << filename << endl;
+		console_message("Failed to open input relation file " + filename);
 		return READ_FAILED;
 	}
 	const bool header_read = fread(header, AB_HEADER_BYTES, 1, f) == 1;
 	fclose(f);
 	if (!header_read || memcmp(header, "NFAB", 4) != 0 || header[1] != AB_VERSION)
 	{
-		cout << filename << " is not a relation file of only a and b (.ab) of version " << AB_VERSION << "." << endl;
+		console_message(filename + " is not a relation file of only a and b (.ab) of version " + to_string(AB_VERSION) + ".");
 		return READ_FAILED;
 	}
 	if (header[2] == (unsigned int)param->smoothness_checking_side)
 	{
-		cout << "The relations of " << filename << " were sieved for side " << header[2] << ", which is the side to check here (side in the polynomial file)." << endl;
+		console_message("The relations of " + filename + " were sieved for side " + to_string(header[2]) + ", which is the side to check here (side in the polynomial file).");
 		return READ_FAILED;
 	}
 
@@ -1115,7 +1159,7 @@ read_result read_batch_from_ab_file(string filename, Batch_smooth* batch, nfs_pa
 	read_buffer input;
 	if (!input.file.Open(filename, AB_HEADER_BYTES + AB_RECORD_BYTES * skip_records))
 	{
-		cout << "Failed to open input relation file " << filename << endl;
+		console_message("Failed to open input relation file " + filename);
 		return READ_FAILED;
 	}
 	input.data.resize(READ_BUFFER_SIZE);
@@ -1159,12 +1203,12 @@ read_result read_batch_from_ab_file(string filename, Batch_smooth* batch, nfs_pa
 
 	if (partial)
 	{
-		cout << "The relation file " << filename << " ends with part of a relation, which was skipped." << endl;
+		console_message("The relation file " + filename + " ends with part of a relation, which was skipped.");
 	}
 
 	if (skipped_relations > 0)
 	{
-		cout << "Skipped " << skipped_relations << " relations with a or b larger than maxa or maxb." << endl;
+		console_message("Skipped " + to_string(skipped_relations) + " relations with a or b larger than maxa or maxb.");
 	}
 
 	return stopped ? READ_STOPPED : READ_END;
@@ -1221,6 +1265,10 @@ int main(int argc, char* argv[])
 				arguments_ok = false;
 			}
 		}
+		else if (arg == "-verbose")
+		{
+			verbose_output = true;
+		}
 		else if (arg == "-threads" && i + 1 < argc)
 		{
 			try
@@ -1240,13 +1288,14 @@ int main(int argc, char* argv[])
 	}
 	if (!arguments_ok || positional.size() != (listfile.empty() ? 3u : 2u))
 	{
-		cout << "Usage: NFS_factory <polynomial file> <relation file> <output file> [-rels N] [-threads N] [-gpu N]" << endl;
-		cout << "   or: NFS_factory <polynomial file> -list <list file> <output file> [-rels N] [-threads N] [-gpu N]" << endl;
+		cout << "Usage: NFS_factory <polynomial file> <relation file> <output file> [-rels N] [-threads N] [-gpu N] [-verbose]" << endl;
+		cout << "   or: NFS_factory <polynomial file> -list <list file> <output file> [-rels N] [-threads N] [-gpu N] [-verbose]" << endl;
 		cout << "The list file names relation files, one per line, which are read in order. With -rels, the run stops when N relations" << endl;
 		cout << "have been found. An interrupted run continues where it was, from <output file>.resume, when it is run again with the" << endl;
 		cout << "same relation file or list. A summary is written to <output file>.status at the end. -threads sets the number of" << endl;
 		cout << "threads for checking the cofactors and factoring the relations found (default 1 in the CPU build, 8 in the GPU build)." << endl;
-		cout << "-gpu selects the GPU of the GPU build, numbered from 0 (default 0)." << endl;
+		cout << "-gpu selects the GPU of the GPU build, numbered from 0 (default 0). During the run, a status line shows the progress;" << endl;
+		cout << "-verbose also prints a line for each batch." << endl;
 		cout << "Relation files: text (a,b:rational primes:algebraic primes), binary (.bin), or only a and b (.ab), whose factor list of the" << endl;
 		cout << "side that is not checked is rebuilt for the relations found (on the GPU in the GPU build). A .3lp file holds 3LP candidates." << endl;
 		return 0;
@@ -1458,6 +1507,19 @@ int main(int argc, char* argv[])
 	profile_add(PROF_SETUP, t);
 	cout << "Prime products set up, it took " << (clock() - time) / CLOCKS_PER_SEC << " seconds." << endl;
 
+	//What the run does: the batches, and the input.
+	long long input_bytes = 0;
+	for (const string& file : progress.files)
+	{
+		input_bytes += max(0LL, file_size(file));
+	}
+	cout << "Batches of " << group_digits(batch->Get_batch_size()) << " relations (" << batch->Get_tree_levels() << " tree levels), " << batch->Get_pipeline()
+		<< ((batch->Get_pipeline() > 1) ? " in progress at once, " : " at a time, ") << threads << ((threads > 1) ? " threads." : " thread.") << endl;
+	cout << "Input: " << progress.files.size() << ((progress.files.size() > 1) ? " relation files, " : " relation file, ") << fixed << setprecision(2)
+		<< input_bytes / 1e9 << " GB. Output: " << outputfile << endl;
+	cout.unsetf(ios::fixed);
+	cout << setprecision(6);
+
 	time = clock();
 
 	long long total_num_relations = 0;
@@ -1485,6 +1547,7 @@ int main(int argc, char* argv[])
 		progress.Save();
 	}
 
+	progress.start_ms = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now().time_since_epoch()).count();
 	bool read_failed = false;
 	bool stopped = progress.complete || (progress.target > 0 && progress.found_before >= progress.target);
 	long long skip_records = progress.done_records;
@@ -1492,9 +1555,10 @@ int main(int argc, char* argv[])
 	{
 		const string& file = progress.files[progress.file_index];
 		read_result result;
-		if (progress.files.size() > 1)
+		if (progress.files.size() > 1 && (verbose_output || !console_is_terminal()))
 		{
-			cout << "Reading relation file " << progress.file_index + 1 << " of " << progress.files.size() << ": " << file << endl;
+			//On a console, the status line shows the file.
+			console_message("Reading relation file " + to_string(progress.file_index + 1) + " of " + to_string(progress.files.size()) + ": " + file);
 		}
 		if (candidate_input)
 		{
@@ -1547,6 +1611,7 @@ int main(int argc, char* argv[])
 		progress.Save();
 	}
 	total_num_relations = batch->Get_num_relations_found();
+	console_end_status(progress.Status(min(progress.file_index, progress.files.size() - 1)));
 
 	unsigned long long reader_cycles = profile_now() - t;
 	profile_cycles[PROF_READ] += reader_cycles - batch->Get_reader_blocked_cycles();

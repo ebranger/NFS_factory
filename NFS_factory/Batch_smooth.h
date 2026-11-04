@@ -63,6 +63,11 @@ public:
 	bool Add_number_binary(long long a_val, long long b_val, const unsigned int* primes, unsigned int num_primes);
 	bool Add_candidate(long long a_val, long long b_val, const unsigned int* primes, unsigned int num_primes, mpz_srcptr cofactor);
 	long long Get_num_relations_found(); //including the 3LP second stage
+	long long Get_num_3lp_relations_found(); //by the 3LP second stage
+	long long Get_num_relations_checked(); //relations of the batches checked so far (not counting the second stage)
+	int Get_batch_size() { return num_relations_per_batch; }
+	int Get_tree_levels() { return tree_size; }
+	int Get_pipeline() { return (int)slots.size(); }
 
 	//The read position of the next relations added (two numbers for the caller, such as file and record), which is given back
 	//by the batch done callback.
@@ -106,6 +111,7 @@ private:
 	int tree_size;
 	int max_entries_before_check;
 	atomic<long long> num_relations_found;
+	atomic<long long> num_relations_checked;
 	long long num_factoring_failures;
 	long long num_other_side_failures;
 	int num_relations_per_batch;
