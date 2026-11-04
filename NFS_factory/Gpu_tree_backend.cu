@@ -209,6 +209,7 @@ struct Gpu_number
 
 #define ROOT_MAX_DEPTH 40 //of the Newton iteration, which halves the length down to INVERSE_EXACT_LIMBS
 #define ROOT_CACHE_ALIGN 18 //the grain in bits of the sizes for which the transform of the top of the prime product is kept
+#define PRIME_PRODUCT_KEY (1LL << 62) //the key of the transform of the prime product itself, kept by Gpu_root::Multiply
 
 //The root of the scaled remainder tree on the GPU: the steps of Cpu_tree_backend::Scaled_root, Barrett_reduce and
 //Tree_products::Inverse on numbers in device memory, with the same numbers in every step, so that the result is the same.
@@ -657,8 +658,16 @@ void Gpu_root::Compute(Gpu_number& fraction, const uint64_t* X, size_t x_limbs, 
 		}
 	}
 
-	//floor(r 2^precision / X) = floor(r V / 2^(e - precision)), or one less.
-	Multiply(product, remainder.d, remainder.n, level[0].d, level[0].n);
+	//floor(r 2^precision / X) = floor(r V / 2^(e - precision)), or one less. With P less than X, r is P, and its transform is kept
+	//for the next batches (the key is not a shift, which the Barrett reduction uses).
+	if (product_size < bits)
+	{
+		Multiply(product, level[0].d, level[0].n, prime_product_gpu.d, prime_product_gpu.n, PRIME_PRODUCT_KEY);
+	}
+	else
+	{
+		Multiply(product, remainder.d, remainder.n, level[0].d, level[0].n);
+	}
 	fraction.Resize((size_t)((precision + 63) / 64) + 1);
 	gpu->Shift(fraction.d, fraction.n, product.d, product.n, (long long)(e - precision), 0, false, 0);
 }

@@ -97,13 +97,18 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	//and 0.29 times (18 levels) about 5 % slower.
 	tree_size = (int)ceil(log2((double)mpz_sizeinbase(prime_product->get_mpz_t(), 2) / max_bits_in_input));
 	const int tree_cap = (max_tree_levels > 0) ? max_tree_levels : MAX_TREE_LEVELS;
-	//On the GPU, one level more if that still leaves the most batches in progress (the memory of the GPU and of the computer
-	//allows it): the root, which costs the same per batch, is then shared by twice the relations. For SNFS-240 on an RTX 4070 Ti
-	//SUPER, 20 levels (the root 1.15 times the prime product) were about 4 % faster than 19, with about 1.8 GB per batch.
-	if (backend == TREE_BACKEND_GPU && !three_lp_stage && pipeline <= 0 && tree_size + 1 <= tree_cap &&
-		default_pipeline(backend, tree_size + 1, max_bits_in_input, false) >= GPU_MAX_PIPELINE)
+	//On the GPU, up to two levels more if that still leaves the most batches in progress (the memory of the GPU and of the computer
+	//allows it): the root, whose Newton inverse is most of its cost, is then shared by more relations. For SNFS-240 on an RTX 4070
+	//Ti SUPER, with alim 10^8, 20 levels (the root 1.15 times the prime product) were about 4 % faster than 19, with about 1.8 GB
+	//per batch; with alim 2^24.7, the trees took 155, 129 and 130 ms per million relations with 18, 19 and 20 levels (the root 1.2,
+	//2.4 and 4.8 times the prime product), and the smallest tree here has 17.
+	for (int extra = 0; extra < 2; extra++)
 	{
-		tree_size++;
+		if (backend == TREE_BACKEND_GPU && !three_lp_stage && pipeline <= 0 && tree_size + 1 <= tree_cap &&
+			default_pipeline(backend, tree_size + 1, max_bits_in_input, false) >= GPU_MAX_PIPELINE)
+		{
+			tree_size++;
+		}
 	}
 	tree_size = min(tree_cap, tree_size);  // Force the remainder tree to not be too big to save memory.
 	tree_size = max(2, tree_size); // The remainder tree needs at least one level above the relations.
