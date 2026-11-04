@@ -17,7 +17,7 @@ enum profile_phase {
 	PROF_LEAVES,          //remainders of the leaves, squarings and gcd
 	PROF_COFACTOR,        //checking the cofactors for large primes (rho, tinyqs)
 	PROF_FACTOR,          //factoring the smooth relations for output
-	PROF_OTHER_SIDE,      //the writer waiting for the other side's factors of the relations found, and finishing their lines
+	PROF_OTHER_SIDE,      //the writer: the batch check of the other side's norms of the relations found, and finishing their lines
 	PROF_WRITE,           //formatting and writing the relations
 	PROF_3LP,             //the 3LP second stage, all of its phases
 	//The waits of the pipeline, which are not part of the total:
@@ -31,6 +31,7 @@ enum profile_phase {
 typedef std::atomic<unsigned long long> profile_counter;
 extern profile_counter profile_cycles[PROF_NUM_PHASES];
 extern profile_counter profile_cycles_3lp[PROF_NUM_PHASES]; //the phases of the 3LP second stage, which are counted as one phase in profile_cycles.
+extern profile_counter profile_cycles_other[PROF_NUM_PHASES]; //the phases of the batch check of the other side, part of PROF_OTHER_SIDE.
 
 inline unsigned long long profile_now()
 {

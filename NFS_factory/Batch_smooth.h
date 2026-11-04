@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <thread>
 #include <functional>
+#include <unordered_map>
 #include "Polynomial.h"
 #include "Tree_backend.h"
 #include "Profile.h"
@@ -17,6 +18,9 @@ using namespace std;
 
 #define MAX_SAVED_PRIMES 64 //Most primes in the saved factor list of a relation from a binary relation file.
 #define MAX_COFACTOR_PRIMES 96 //Most prime factors of a 3LP cofactor, which is less than 2^96.
+#define OTHER_STAGE_BOUND (1 << 28) //The norms of the other side of the relations found are batch checked against the primes up to this
+#define OTHER_STAGE_LARGE_PRIME_BITS 32 //and their cofactors split into two large primes of up to this many bits (see Batch_smooth).
+#define OTHER_STAGE_LEVELS 18 //Levels of the tree of those norms: 2^17 of them at a time.
 
 class Batch_smooth;
 
@@ -31,9 +35,9 @@ struct Output_batch
 		long long a, b;
 		string checked_side; //the factor list of the batch checked side
 		vector<unsigned long long> saved; //the saved factor list of the other side, if any, which must divide the norm
+		long long ticket; //of the norm in the writer's other_stage, -1 if none
 	};
 	vector<Waiting> waiting;
-	int job; //of the factoring of the other side, for the waiting lines; -1 if none
 	bool batch_end; //a batch of the object that writes: after it is written, its position goes to the batch done callback
 	long long position[2];
 };
@@ -68,8 +72,8 @@ public:
 	//other_side_poly: the polynomial of the side that is not batch checked. The factor list of that side is rebuilt from its norm, with
 	//all primes and their multiplicities, for every relation if rebuild_other_side (as CADO-NFS requires), and otherwise for the
 	//relations that were added without one (Add_number_binary with no primes, from a file of only a and b); the others are printed as
-	//they were read, if they divide the norm. The primes below print_limit are left out. On the GPU, the norms of the relations found in
-	//a batch are factored in the background (Other_side_factoring), and their lines are finished when they are written.
+	//they were read, if they divide the norm. The primes below print_limit are left out. On the GPU, the norms of the relations found are
+	//batch checked in a stage of their own (see other_stage), and their lines are finished when they are written.
 	//backend: the implementation of the tree computations.
 	//three_lp_stage: if true, this is the 3LP second stage. Its inputs are the cofactors given with Add_candidate, which are checked against all primes below 2^lbp (fblim and mfb are not used).
 	//pipeline: the number of batches in progress at once (see Batch_slot), each with its own tree, or 0 for the default of the
@@ -83,7 +87,7 @@ public:
 	bool Add_number(long long a_val, long long b_val, const char* relation_factor_list);
 	bool Add_number_binary(long long a_val, long long b_val, const unsigned int* primes, unsigned int num_primes);
 	bool Add_candidate(long long a_val, long long b_val, const unsigned int* primes, unsigned int num_primes, mpz_srcptr cofactor);
-	long long Get_num_relations_found(); //including the 3LP second stage
+	long long Get_num_relations_found(); //including the 3LP second stage, and those not yet written (see Set_batch_done)
 	long long Get_num_3lp_relations_found(); //by the 3LP second stage
 	long long Get_num_relations_checked(); //relations of the batches checked so far (not counting the second stage)
 	int Get_batch_size() { return num_relations_per_batch; }
@@ -94,8 +98,10 @@ public:
 	//by the batch done callback.
 	void Set_read_position(long long first, long long second);
 	//Called after each batch, in their order, when its relations are written to the output file (in the thread that writes them),
-	//with the read position of its last relation, and the size of the output file then (-1 if it could not be written).
-	void Set_batch_done(function<void(const long long position[2], long long output_size)> callback);
+	//with the read position of its last relation, the size of the output file then (-1 if it could not be written), and the number
+	//of relations written so far. The relations are found before they are written, by up to a tree of the batch check of the other
+	//side when that is used (2^17 relations), so this can be less than Get_num_relations_found.
+	void Set_batch_done(function<void(const long long position[2], long long output_size, long long written)> callback);
 	//The time the thread that adds the relations spent in Add_* and Finish waiting for the checks, or doing them (pipeline 1).
 	unsigned long long Get_reader_blocked_cycles();
 
@@ -124,23 +130,56 @@ private:
 	void Output_solutions(Batch_slot& s);
 	enum relation_status { RELATION_WRITTEN, RELATION_FACTORING_FAILED, RELATION_OTHER_SIDE_FAILED };
 	relation_status Format_relation(Batch_slot& s, int index, string& relation_text, bool& waiting);
+	relation_status Factor_checked_side(Batch_slot& s, int index, unsigned int* large, int& num_large, unsigned int* factors, int& num_factors);
 	string Relation_line(long long a, long long b, const string& checked_side, const string& other_side);
 	bool Complete_other_side(long long a, long long b, vector<unsigned long long>& primes, const unsigned int* factors, int num_factors, string& list);
 	bool Saved_list_divides(Batch_slot& s, int index);
 
-	//The output. The relations found in each batch go, in order, to the writer: with a pipeline its own thread, which waits for the
-	//factoring of their other side (if any), finishes their lines and writes them, and after a batch calls the batch done callback;
-	//otherwise they are written at once. The second stage gives its relations to the writer of the first stage (writer), so that
-	//they are written between the right batches, as when the checks wrote them.
+	//The output. The relations found in each batch go, in order, to the writer: with a pipeline its own thread, otherwise the thread
+	//that checks the batch. The second stage gives its relations to the writer of the first stage (writer), so that they are written
+	//between the right batches, as when the checks wrote them. The writer gives the norms of the other side that are to be factored
+	//to other_stage, keeps the batches in held until their factors are there, finishes their lines, writes them, and after a batch
+	//calls the batch done callback.
 	Batch_smooth* writer; //this, or the first stage for the second stage
-	Other_side_factoring* other_factoring; //NULL if the other side's norms are factored on the CPU
+	Other_side_factoring* other_factoring; //NULL if the other side's norms are factored on the CPU; on the GPU, for those other_stage leaves
+	tree_backend_kind backend_kind;
 	void Queue_output(Output_batch* o);
-	void Write_output(Output_batch& o);
+	void Writer_take(Output_batch* o);
+	void Write_held(bool flush);
+	bool Batch_ready(const Output_batch& o);
+	void Write_batch(Output_batch& o);
 	void Writer_worker();
-	void Wait_for_writer();
+	void Flush_writer();
 	deque<Output_batch*> output_queue;
+	deque<Output_batch*> held;
 	bool writer_busy;
 	bool writer_stopping;
+	bool flush_requested;
+
+	//The batch check of the other side's norms (on the GPU): a Batch_smooth of the other side, with the primes up to OTHER_STAGE_BOUND
+	//and two large primes, which the writer makes when the first norms come. A relation was already found, so its norm is smooth: the
+	//tree leaves a cofactor of the large primes, which the checks split, and the rest is factored with the leaves. Its results come
+	//back to the writer by number (ticket), through result_sink. The norms with more large primes (about a quarter on SNFS-240) are
+	//factored by other_factoring, in a job for each tree of other_stage, which the writer waits for when it writes them. Most of the
+	//primes of the norms are then found by the tree instead of Pollard rho.
+	Batch_smooth* other_stage;
+	bool other_stage_tried, other_stage_finished;
+	long long other_tickets; //norms given to other_stage
+	enum other_state { OTHER_FACTORED, OTHER_FAILED, OTHER_IN_JOB };
+	struct Other_result
+	{
+		other_state state;
+		vector<unsigned long long> primes; //all prime factors of the norm, in increasing order (OTHER_FACTORED)
+		int job; //of other_factoring (OTHER_IN_JOB)
+	};
+	unordered_map<long long, Other_result> other_results;
+	vector<long long> fallback_tickets, fallback_a, fallback_b; //not factored by other_stage, for the next job
+	unordered_map<int, vector<long long>> job_tickets; //the tickets of the jobs not yet taken, in their order in the job
+	void Create_other_stage();
+	void Submit_fallback();
+	void Take_job(int job);
+	function<void(long long ticket, long long a, long long b, bool factored, vector<unsigned long long>& primes)> result_sink; //set if this is an other_stage
+	long long sink_next; //the ticket of the next relation of an other_stage
 	mutex output_lock;
 	condition_variable output_changed;
 	thread writer_thread;
@@ -149,7 +188,8 @@ private:
 	FILE* output; //open from the first batch on; flushed after each batch, so that its size is that of the relations written
 	int tree_size;
 	int max_entries_before_check;
-	atomic<long long> num_relations_found;
+	atomic<long long> num_relations_found; //when the relations of a batch are checked, less those whose other side fails later
+	atomic<long long> num_relations_written; //by this object as a writer
 	atomic<long long> num_relations_checked;
 	atomic<long long> num_factoring_failures;
 	atomic<long long> num_other_side_failures;
@@ -194,7 +234,7 @@ private:
 	vector<Batch_slot*> slots;
 	Batch_slot* filling;
 	long long read_position[2];
-	function<void(const long long position[2], long long output_size)> batch_done;
+	function<void(const long long position[2], long long output_size, long long written)> batch_done;
 	long long output_size; //of the output file after the last batch written
 	bool pipelined;
 	mutex lock;

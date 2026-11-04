@@ -1,4 +1,6 @@
 #include "Prime_product.h"
+#include "Profile.h"
+#include <string>
 #include <vector>
 #include <iostream>
 #include <algorithm>
@@ -508,5 +510,5 @@ void setup_prime_product(Polynomial* poly, uint32 maxprime, mpz_class* prime_pro
 	}
 	*prime_product = *prime_product * (small_primes * small_primes);
 
-	cout << num_dividing_primes << " of the " << primes.size() << " primes up to " << maxprime << " can divide the norm." << endl;
+	console_message(to_string(num_dividing_primes) + " of the " + to_string(primes.size()) + " primes up to " + to_string(maxprime) + " can divide the norm.");
 }

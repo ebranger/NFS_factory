@@ -460,7 +460,7 @@ struct run_progress
 	long long found_before; //relations found before this run (when resuming)
 	long long target; //stop when this many relations have been found (0: no target)
 	long long relations_added; //by this run, for maxrels
-	atomic<bool> target_reached; //set after a batch, in the thread that checks the batches
+	atomic<bool> target_reached; //set when the relations found reach the target (Check_target)
 	bool complete; //all files were read
 
 	long long Found()
@@ -545,15 +545,15 @@ struct run_progress
 
 	void Save()
 	{
-		Save(file_index, done_records, file_size(output_filename), false);
+		Save(file_index, done_records, file_size(output_filename), false, Found());
 	}
 
 	//The resume file, now or by the writer thread (background), with the size of the output file.
-	void Save(size_t file, long long records, long long bytes, bool background)
+	void Save(size_t file, long long records, long long bytes, bool background, long long found)
 	{
 		char text[4096];
 		snprintf(text, sizeof(text), "input %s\nfile %zu\nname %s\nrecords %lld\nfound %lld\noutput %lld\ncomplete %d\n", input.c_str(), file,
-			(file < files.size()) ? files[file].c_str() : "-", records, Found(), (bytes > 0) ? bytes : 0, complete ? 1 : 0);
+			(file < files.size()) ? files[file].c_str() : "-", records, found, (bytes > 0) ? bytes : 0, complete ? 1 : 0);
 		if (background && writer.joinable())
 		{
 			{
@@ -637,15 +637,11 @@ struct run_progress
 
 	//Called after each batch, when its relations are written, with the position of its last relation (the file and the records
 	//of it read) and the size of the output file.
-	void Batch_done(const long long position[2], long long output_size)
+	void Batch_done(const long long position[2], long long output_size, long long written)
 	{
-		Save((size_t)position[0], position[1], (output_size >= 0) ? output_size : file_size(output_filename), true);
+		Save((size_t)position[0], position[1], (output_size >= 0) ? output_size : file_size(output_filename), true, found_before + written);
 		console_status(Status((size_t)position[0]));
-		if (target > 0 && Found() >= target && !target_reached)
-		{
-			target_reached = true;
-			console_message("Found " + to_string(Found()) + " relations, at least the " + to_string(target) + " that were asked for.");
-		}
+		Check_target();
 	}
 
 	//Called before each relation is added to the batch, with the records of the current file read so far, for the position of
@@ -655,13 +651,28 @@ struct run_progress
 		batch->Set_read_position((long long)file_index, records_read);
 	}
 
+	//Whether the relations found reach the target, which they count from when their batch is checked: when the other side is batch
+	//checked, the relations are written up to a tree of that check later.
+	bool Check_target()
+	{
+		if (target > 0 && Found() >= target)
+		{
+			if (!target_reached.exchange(true))
+			{
+				console_message("Found " + to_string(Found()) + " relations, at least the " + to_string(target) + " that were asked for.");
+			}
+			return true;
+		}
+		return false;
+	}
+
 	//Called after each relation added to the batch, with the records of the current file read so far. Returns true if
 	//reading should stop.
 	bool Relation_added(long long records_read, nfs_parameters* param)
 	{
 		relations_added++;
 		read_records = records_read;
-		if (target_reached)
+		if (target_reached || Check_target())
 		{
 			return true;
 		}
@@ -1528,7 +1539,7 @@ int main(int argc, char* argv[])
 	t = profile_now();
 
 	progress.batch = batch;
-	batch->Set_batch_done([&progress](const long long position[2], long long output_size) { progress.Batch_done(position, output_size); });
+	batch->Set_batch_done([&progress](const long long position[2], long long output_size, long long written) { progress.Batch_done(position, output_size, written); });
 	progress.Start_writer();
 	if (progress.Load())
 	{

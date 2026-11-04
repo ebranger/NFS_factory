@@ -12,6 +12,7 @@ using namespace std;
 
 profile_counter profile_cycles[PROF_NUM_PHASES] = {};
 profile_counter profile_cycles_3lp[PROF_NUM_PHASES] = {};
+profile_counter profile_cycles_other[PROF_NUM_PHASES] = {};
 
 static const char* phase_names[PROF_NUM_PHASES] = {
 	"Setup",
@@ -77,6 +78,23 @@ void print_profile(unsigned long long total_cycles)
 			if (profile_cycles_3lp[i] > 0)
 			{
 				cout << "  " << left << setw(25) << phase_names[i] << right << setw(8) << profile_cycles_3lp[i] / 1e9 << setw(7) << 100.0 * profile_cycles_3lp[i] / total_cycles << " %" << endl;
+			}
+		}
+	}
+
+	bool other = false;
+	for (int i = 0; i < PROF_FIRST_WAIT; i++)
+	{
+		other = other || profile_cycles_other[i] > 0;
+	}
+	if (other)
+	{
+		cout << "Batch check of the other side, in the writer (Gcycles, share of the time of the run):" << endl;
+		for (int i = 0; i < PROF_FIRST_WAIT; i++)
+		{
+			if (profile_cycles_other[i] > 0)
+			{
+				cout << "  " << left << setw(25) << phase_names[i] << right << setw(8) << profile_cycles_other[i] / 1e9 << setw(7) << 100.0 * profile_cycles_other[i] / total_cycles << " %" << endl;
 			}
 		}
 	}

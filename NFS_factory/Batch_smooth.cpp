@@ -112,6 +112,7 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	save_filename = filename;
 	output = NULL;
 	num_relations_found = 0;
+	num_relations_written = 0;
 	num_relations_checked = 0;
 	num_factoring_failures = 0;
 	num_other_side_failures = 0;
@@ -171,10 +172,16 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 		}
 		other_factoring = create_other_side_factoring(backend, coefficients);
 	}
+	backend_kind = backend;
 	writer = this;
 	writer_busy = false;
 	writer_stopping = false;
+	flush_requested = false;
 	output_size = -1;
+	other_stage = NULL;
+	other_stage_tried = other_stage_finished = false;
+	other_tickets = 0;
+	sink_next = 0;
 
 	if (pipelined)
 	{
@@ -201,7 +208,11 @@ Batch_smooth::~Batch_smooth(void)
 	{
 		worker.join();
 	}
-	Wait_for_writer();
+	//Only this object's own writer: that of a second stage is gone by now, and was flushed before.
+	if (writer == this)
+	{
+		Flush_writer();
+	}
 	{
 		lock_guard<mutex> guard(output_lock);
 		writer_stopping = true;
@@ -223,6 +234,7 @@ Batch_smooth::~Batch_smooth(void)
 	}
 
 	delete second_stage;
+	delete other_stage;
 	delete other_factoring;
 	if (candidate_file != NULL)
 	{
@@ -258,7 +270,7 @@ void Batch_smooth::Setup_prime_product(long long smooth_bound, bool use_gpu)
 	setup_prime_product(poly, (uint32)smooth_bound, prime_product, use_gpu);
 
 	size_t size = mpz_sizeinbase(prime_product->get_mpz_t(), 2);
-	cout << "Size of prime product: " << size << " bits." << endl;
+	console_message("Size of prime product: " + to_string(size) + " bits.");
 
 	return;
 }
@@ -480,7 +492,7 @@ void Batch_smooth::Finish()
 	{
 		second_stage->Finish();
 	}
-	Wait_for_writer();
+	Flush_writer();
 	if (second_stage != NULL)
 	{
 		console_message("The 3LP second stage found " + to_string(second_stage->Get_num_relations_found()) + " relations.");
@@ -1063,19 +1075,89 @@ bool Batch_smooth::Saved_list_divides(Batch_slot& s, int index)
 
 //The output line of a relation found smooth: the checked side is factored (its large primes are known), and the factor list of
 //the other side is the saved one, or rebuilt from its norm. Thread safe. If that norm is factored in the background
-//(other_factoring), waiting is set, and relation_text is only the factor list of the checked side, for Write_output.
+//(other_factoring), waiting is set, and relation_text is only the factor list of the checked side, for the writer.
 Batch_smooth::relation_status Batch_smooth::Format_relation(Batch_slot& s, int index, string& relation_text, bool& waiting)
 {
-	mpz_class value = *s.tree->Leaf(index);
 	const long long* a_vals = s.a_vals;
 	const long long* b_vals = s.b_vals;
-	mpz_class temp;
 	unsigned int large[MAX_COFACTOR_PRIMES];
 	unsigned int factors[MAX_FACTORS_IN_RELATION];
 	int num_factors = 0;
 	int num_large = 0;
 	string checked_side_list; //factors of the relation value that was batch checked.
 	string other_side_list; //factors of the other side, as saved or rebuilt.
+
+	if (Factor_checked_side(s, index, large, num_large, factors, num_factors) != RELATION_WRITTEN)
+	{
+		return RELATION_FACTORING_FAILED;
+	}
+
+	waiting = false;
+	if (other_poly != NULL && (rebuild_all || Saved_list_missing(s, index)))
+	{
+		if (other_factoring != NULL)
+		{
+			waiting = true;
+		}
+		else
+		{
+			vector<unsigned long long> primes;
+			Get_saved_primes(s, index, primes);
+			if (!Complete_other_side(a_vals[index], b_vals[index], primes, NULL, -1, other_side_list))
+			{
+				return RELATION_OTHER_SIDE_FAILED;
+			}
+		}
+	}
+	else
+	{
+		//The saved list must divide the norm: a relation whose a or b was stored wrongly (such as a of 2^31 or more in the int32
+		//of a binary file) was checked with the wrong value, and is left out.
+		if (other_poly != NULL && !Saved_list_divides(s, index))
+		{
+			return RELATION_OTHER_SIDE_FAILED;
+		}
+		Get_saved_list(s, index, other_side_list);
+	}
+
+	//The factor list for the batch checked side: large primes first, then the other factors.
+	for (int j = 0; j < num_large; j++)
+	{
+		if (large[j] >= (unsigned int)min_saved_prime_limit)
+		{
+			append_prime(checked_side_list, large[j]);
+		}
+	}
+
+	for (int j = 0; j < num_factors; j++)
+	{
+		if (factors[j] >= (unsigned int)min_saved_prime_limit)
+		{
+			append_prime(checked_side_list, factors[j]);
+		}
+	}
+
+	if (waiting)
+	{
+		relation_text.swap(checked_side_list);
+	}
+	else
+	{
+		relation_text = Relation_line(a_vals[index], b_vals[index], checked_side_list, other_side_list);
+	}
+	return RELATION_WRITTEN;
+}
+
+//The prime factors of the value of the batch checked side of a relation found smooth: num_large large primes, and the num_factors
+//factors of the rest. Returns RELATION_FACTORING_FAILED if they could not be found. Thread safe.
+Batch_smooth::relation_status Batch_smooth::Factor_checked_side(Batch_slot& s, int index, unsigned int* large, int& num_large, unsigned int* factors, int& num_factors)
+{
+	mpz_class value = *s.tree->Leaf(index);
+	const long long* a_vals = s.a_vals;
+	const long long* b_vals = s.b_vals;
+	mpz_class temp;
+	num_factors = 0;
+	num_large = 0;
 
 	//negative values are handled by msieve, ignore here.
 	if (value < 0)
@@ -1140,65 +1222,8 @@ Batch_smooth::relation_status Batch_smooth::Format_relation(Batch_slot& s, int i
 		num_factors = factor_general(factors, value.get_mpz_t(), MAX_FACTORS_IN_RELATION);
 	}
 
-	if (num_factors < 0)
-	{
-		//Typically: one factor is too big for an uint32. An incomplete relation is useless, so skip it.
-		return RELATION_FACTORING_FAILED;
-	}
-	waiting = false;
-	if (other_poly != NULL && (rebuild_all || Saved_list_missing(s, index)))
-	{
-		if (other_factoring != NULL)
-		{
-			waiting = true;
-		}
-		else
-		{
-			vector<unsigned long long> primes;
-			Get_saved_primes(s, index, primes);
-			if (!Complete_other_side(a_vals[index], b_vals[index], primes, NULL, -1, other_side_list))
-			{
-				return RELATION_OTHER_SIDE_FAILED;
-			}
-		}
-	}
-	else
-	{
-		//The saved list must divide the norm: a relation whose a or b was stored wrongly (such as a of 2^31 or more in the int32
-		//of a binary file) was checked with the wrong value, and is left out.
-		if (other_poly != NULL && !Saved_list_divides(s, index))
-		{
-			return RELATION_OTHER_SIDE_FAILED;
-		}
-		Get_saved_list(s, index, other_side_list);
-	}
-
-	//The factor list for the batch checked side: large primes first, then the other factors.
-	for (int j = 0; j < num_large; j++)
-	{
-		if (large[j] >= (unsigned int)min_saved_prime_limit)
-		{
-			append_prime(checked_side_list, large[j]);
-		}
-	}
-
-	for (int j = 0; j < num_factors; j++)
-	{
-		if (factors[j] >= (unsigned int)min_saved_prime_limit)
-		{
-			append_prime(checked_side_list, factors[j]);
-		}
-	}
-
-	if (waiting)
-	{
-		relation_text.swap(checked_side_list);
-	}
-	else
-	{
-		relation_text = Relation_line(a_vals[index], b_vals[index], checked_side_list, other_side_list);
-	}
-	return RELATION_WRITTEN;
+	//Typically: one factor is too big for an uint32. An incomplete relation is useless, so skip it.
+	return (num_factors < 0) ? RELATION_FACTORING_FAILED : RELATION_WRITTEN;
 }
 
 //The line of a relation: a,b:rational factors:algebraic factors
@@ -1222,6 +1247,38 @@ void Batch_smooth::Output_solutions(Batch_slot& s)
 {
 	unsigned long long t = profile_now();
 
+	if (result_sink)
+	{
+		//An other_stage: the factors of each relation, in the order they were added, for the writer that made it.
+		s.tree_factors = s.tree->Leaf_factors_ready();
+		vector<vector<unsigned long long>> found(s.entries);
+		vector<unsigned char> factored(s.entries, 0);
+		parallel_for(s.entries, 16, [&](int index)
+		{
+			unsigned int large[MAX_COFACTOR_PRIMES];
+			unsigned int factors[MAX_FACTORS_IN_RELATION];
+			int num_large = 0, num_factors = 0;
+			if (s.is_smooth[index] && Factor_checked_side(s, index, large, num_large, factors, num_factors) == RELATION_WRITTEN)
+			{
+				found[index].assign(large, large + num_large);
+				found[index].insert(found[index].end(), factors, factors + num_factors);
+				sort(found[index].begin(), found[index].end());
+				factored[index] = 1;
+			}
+		});
+		for (int index = 0; index < s.entries; index++)
+		{
+			result_sink(sink_next + index, s.a_vals[index], s.b_vals[index], factored[index] != 0, found[index]);
+			s.is_smooth[index] = false;
+			s.lp1[index] = 0;
+			s.lp2[index] = 0;
+		}
+		sink_next += s.entries;
+		s.entries = 0;
+		profile_add(profile, PROF_FACTOR, t);
+		return;
+	}
+
 	s.relation_texts.resize(num_relations_per_batch);
 	s.relation_result.resize(num_relations_per_batch);
 	s.relation_waiting.resize(num_relations_per_batch);
@@ -1239,7 +1296,6 @@ void Batch_smooth::Output_solutions(Batch_slot& s)
 
 	Output_batch* o = new Output_batch;
 	o->source = this;
-	vector<long long> a, b;
 	for (int index = 0; index < s.entries; index++)
 	{
 		if (s.is_smooth[index])
@@ -1260,10 +1316,9 @@ void Batch_smooth::Output_solutions(Batch_slot& s)
 				w.b = s.b_vals[index];
 				w.checked_side.swap(s.relation_texts[index]);
 				Get_saved_primes(s, index, w.saved);
+				w.ticket = -1;
 				o->waiting.push_back(move(w));
 				o->lines.emplace_back();
-				a.push_back(s.a_vals[index]);
-				b.push_back(s.b_vals[index]);
 			}
 			else
 			{
@@ -1276,7 +1331,6 @@ void Batch_smooth::Output_solutions(Batch_slot& s)
 		s.lp1[index] = 0;
 		s.lp2[index] = 0;
 	}
-	o->job = a.empty() ? -1 : other_factoring->Submit(a.data(), b.data(), (int)a.size());
 	o->batch_end = (writer == this);
 	o->position[0] = s.position[0];
 	o->position[1] = s.position[1];
@@ -1291,6 +1345,7 @@ void Batch_smooth::Output_solutions(Batch_slot& s)
 	{
 		num_relations_checked += s.entries;
 	}
+	num_relations_found += (long long)o->lines.size();
 	s.entries = 0;
 	writer->Queue_output(o);
 }
@@ -1300,8 +1355,7 @@ void Batch_smooth::Queue_output(Output_batch* o)
 {
 	if (!pipelined)
 	{
-		Write_output(*o);
-		delete o;
+		Writer_take(o);
 		return;
 	}
 	lock_guard<mutex> guard(output_lock);
@@ -1309,58 +1363,267 @@ void Batch_smooth::Queue_output(Output_batch* o)
 	output_changed.notify_all();
 }
 
-//The thread of the writer: the batches of relations found, in order.
+//The thread of the writer: the batches of relations found, in order, and at the end (Flush_writer) the ones still held.
 void Batch_smooth::Writer_worker()
 {
 	unique_lock<mutex> guard(output_lock);
 	for (;;)
 	{
-		output_changed.wait(guard, [this] { return writer_stopping || !output_queue.empty(); });
-		if (output_queue.empty())
+		output_changed.wait(guard, [this] { return writer_stopping || flush_requested || !output_queue.empty(); });
+		if (!output_queue.empty())
 		{
-			return;
+			Output_batch* o = output_queue.front();
+			output_queue.pop_front();
+			writer_busy = true;
+			guard.unlock();
+			Writer_take(o);
+			guard.lock();
+			writer_busy = false;
+			output_changed.notify_all();
+			continue;
 		}
-		Output_batch* o = output_queue.front();
-		writer_busy = true;
-		guard.unlock();
-		Write_output(*o);
-		delete o;
-		guard.lock();
-		output_queue.pop_front();
-		writer_busy = false;
-		output_changed.notify_all();
+		if (flush_requested)
+		{
+			writer_busy = true;
+			guard.unlock();
+			Write_held(true);
+			guard.lock();
+			writer_busy = false;
+			flush_requested = false;
+			output_changed.notify_all();
+			continue;
+		}
+		return;
 	}
 }
 
-//Wait until the writer has written everything given to it.
-void Batch_smooth::Wait_for_writer()
+//Write everything given to the writer, the batches still held included: the end of a run.
+void Batch_smooth::Flush_writer()
 {
+	if (!writer->pipelined)
+	{
+		writer->Write_held(true);
+		return;
+	}
 	unique_lock<mutex> guard(writer->output_lock);
-	writer->output_changed.wait(guard, [this] { return writer->output_queue.empty() && !writer->writer_busy; });
+	writer->flush_requested = true;
+	writer->output_changed.notify_all();
+	writer->output_changed.wait(guard, [this] { return writer->output_queue.empty() && !writer->writer_busy && !writer->flush_requested; });
 }
 
-//Finish the lines of the relations of a batch whose other side was factored in the background, write them, and after a batch of
-//this object, call the batch done callback with the size of the output file. In the thread of the writer.
-void Batch_smooth::Write_output(Output_batch& o)
+//The other_stage of the writer, if the other side's norms are factored on the GPU.
+void Batch_smooth::Create_other_stage()
+{
+	other_stage_tried = true;
+	if (other_factoring == NULL || other_poly == NULL)
+	{
+		return;
+	}
+	//The bits of the norms: a and b of up to about 34 bits.
+	int coefficient_bits = 0;
+	for (int i = 0; i <= other_poly->get_degree(); i++)
+	{
+		coefficient_bits = max(coefficient_bits, (int)mpz_sizeinbase(other_poly->get_coefficient((uint8)i).get_mpz_t(), 2));
+	}
+	const int norm_bits = coefficient_bits + 34 * other_poly->get_degree() + 4;
+	console_message("The factor lists of the other side of the relations found are batch checked against the primes up to 2^28.");
+	other_stage = new Batch_smooth(OTHER_STAGE_BOUND, OTHER_STAGE_LARGE_PRIME_BITS, 2 * OTHER_STAGE_LARGE_PRIME_BITS, norm_bits, save_filename, other_poly,
+		1 - side, 1, NULL, false, OTHER_STAGE_LEVELS, backend_kind, false, 1);
+	other_stage->profile = profile_cycles_other;
+	other_stage->result_sink = [this](long long ticket, long long a, long long b, bool factored, vector<unsigned long long>& primes)
+	{
+		if (factored)
+		{
+			Other_result& r = other_results[ticket];
+			r.state = OTHER_FACTORED;
+			r.primes.swap(primes);
+		}
+		else
+		{
+			fallback_tickets.push_back(ticket);
+			fallback_a.push_back(a);
+			fallback_b.push_back(b);
+		}
+	};
+}
+
+//A job of other_factoring for the norms that other_stage did not factor, after one of its trees.
+void Batch_smooth::Submit_fallback()
+{
+	if (fallback_tickets.empty())
+	{
+		return;
+	}
+	const int job = other_factoring->Submit(fallback_a.data(), fallback_b.data(), (int)fallback_a.size());
+	for (long long ticket : fallback_tickets)
+	{
+		Other_result& r = other_results[ticket];
+		r.state = OTHER_IN_JOB;
+		r.job = job;
+	}
+	job_tickets[job].swap(fallback_tickets);
+	fallback_tickets.clear();
+	fallback_a.clear();
+	fallback_b.clear();
+}
+
+//The results of a job of other_factoring, for all of its norms. The jobs are taken in their order, as their tickets come in order.
+void Batch_smooth::Take_job(int job)
+{
+	vector<int> counts;
+	vector<unsigned int> offsets, primes;
+	other_factoring->Results(job, counts, offsets, primes);
+	const vector<long long>& tickets = job_tickets[job];
+	for (size_t i = 0; i < tickets.size(); i++)
+	{
+		Other_result& r = other_results[tickets[i]];
+		r.state = (counts[i] >= 0) ? OTHER_FACTORED : OTHER_FAILED;
+		if (counts[i] >= 0)
+		{
+			r.primes.assign(primes.begin() + offsets[i], primes.begin() + offsets[i] + counts[i]);
+		}
+	}
+	job_tickets.erase(job);
+}
+
+//A batch of relations found, in the writer: the norms of the lines that wait for their other side go to other_stage, and the
+//batches are written in order once the factors of all their lines are there.
+void Batch_smooth::Writer_take(Output_batch* o)
+{
+	unsigned long long t = profile_now();
+	if (!o->waiting.empty() && !other_stage_tried)
+	{
+		Create_other_stage();
+	}
+	for (Output_batch::Waiting& w : o->waiting)
+	{
+		if (other_stage != NULL)
+		{
+			w.ticket = other_tickets++;
+			other_stage->Add_number_binary(w.a, w.b, NULL, 0);
+			Submit_fallback();
+		}
+	}
+	held.push_back(o);
+	profile_add(profile, PROF_OTHER_SIDE, t);
+	Write_held(false);
+}
+
+//Whether the factors of all the waiting lines of a batch are there.
+bool Batch_smooth::Batch_ready(const Output_batch& o)
+{
+	for (const Output_batch::Waiting& w : o.waiting)
+	{
+		if (w.ticket >= 0 && other_results.find(w.ticket) == other_results.end())
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+//Write the batches held, in order, as far as their factors are there; with flush, all of them, after the last norms are checked.
+void Batch_smooth::Write_held(bool flush)
+{
+	if (flush && other_stage != NULL && !other_stage_finished)
+	{
+		unsigned long long t = profile_now();
+		other_stage->Finish();
+		other_stage_finished = true;
+		Submit_fallback();
+		profile_add(profile, PROF_OTHER_SIDE, t);
+	}
+	while (!held.empty() && (flush || Batch_ready(*held.front())))
+	{
+		Write_batch(*held.front());
+		delete held.front();
+		held.pop_front();
+	}
+}
+
+//Finish the lines of a batch that waited for their other side, write them, and after a batch of this object, call the batch done
+//callback with the size of the output file. The norms that other_stage did not factor are factored by other_factoring (on the GPU),
+//or on the CPU if that fails too.
+void Batch_smooth::Write_batch(Output_batch& o)
 {
 	unsigned long long t = profile_now();
 	Batch_smooth& source = *o.source;
-	if (o.job >= 0)
+	vector<size_t> rest; //waiting lines without factors
+	for (size_t k = 0; k < o.waiting.size(); k++)
 	{
-		vector<int> counts;
-		vector<unsigned int> offsets, primes;
-		source.other_factoring->Results(o.job, counts, offsets, primes);
-		for (size_t k = 0; k < o.waiting.size(); k++)
+		Output_batch::Waiting& w = o.waiting[k];
+		auto r = (w.ticket >= 0) ? other_results.find(w.ticket) : other_results.end();
+		if (r != other_results.end() && r->second.state == OTHER_IN_JOB)
 		{
-			Output_batch::Waiting& w = o.waiting[k];
+			Take_job(r->second.job);
+		}
+		if (r == other_results.end())
+		{
+			rest.push_back(k);
+		}
+		else if (r->second.state == OTHER_FAILED)
+		{
+			//Not factored on the GPU at all: on the CPU (rare).
 			string other_side;
-			if (source.Complete_other_side(w.a, w.b, w.saved, (counts[k] >= 0) ? primes.data() + offsets[k] : NULL, counts[k], other_side))
+			if (source.Complete_other_side(w.a, w.b, w.saved, NULL, -1, other_side))
 			{
 				o.lines[w.line] = source.Relation_line(w.a, w.b, w.checked_side, other_side);
 			}
 			else
 			{
 				source.num_other_side_failures++;
+				source.num_relations_found--;
+			}
+		}
+		else
+		{
+			vector<unsigned int> factors;
+			for (unsigned long long p : r->second.primes)
+			{
+				factors.push_back((unsigned int)p);
+			}
+			string other_side;
+			if (source.Complete_other_side(w.a, w.b, w.saved, factors.data(), (int)factors.size(), other_side))
+			{
+				o.lines[w.line] = source.Relation_line(w.a, w.b, w.checked_side, other_side);
+			}
+			else
+			{
+				source.num_other_side_failures++;
+				source.num_relations_found--;
+			}
+		}
+		if (r != other_results.end())
+		{
+			other_results.erase(r);
+		}
+	}
+	if (!rest.empty())
+	{
+		vector<long long> a, b;
+		for (size_t k : rest)
+		{
+			a.push_back(o.waiting[k].a);
+			b.push_back(o.waiting[k].b);
+		}
+		vector<int> counts(rest.size(), -1);
+		vector<unsigned int> offsets, primes;
+		if (source.other_factoring != NULL)
+		{
+			source.other_factoring->Results(source.other_factoring->Submit(a.data(), b.data(), (int)a.size()), counts, offsets, primes);
+		}
+		for (size_t j = 0; j < rest.size(); j++)
+		{
+			Output_batch::Waiting& w = o.waiting[rest[j]];
+			string other_side;
+			if (source.Complete_other_side(w.a, w.b, w.saved, (counts[j] >= 0) ? primes.data() + offsets[j] : NULL, counts[j], other_side))
+			{
+				o.lines[w.line] = source.Relation_line(w.a, w.b, w.checked_side, other_side);
+			}
+			else
+			{
+				source.num_other_side_failures++;
+				source.num_relations_found--;
 			}
 		}
 	}
@@ -1396,12 +1659,12 @@ void Batch_smooth::Write_output(Output_batch& o)
 		output_size = (long long)ftello(output);
 #endif
 	}
-	source.num_relations_found += written;
+	num_relations_written += written;
 	profile_add(profile, PROF_WRITE, t);
 
 	if (o.batch_end && batch_done)
 	{
-		batch_done(o.position, output_size);
+		batch_done(o.position, output_size, num_relations_written);
 	}
 }
 
@@ -1411,7 +1674,7 @@ void Batch_smooth::Set_read_position(long long first, long long second)
 	read_position[1] = second;
 }
 
-void Batch_smooth::Set_batch_done(function<void(const long long position[2], long long output_size)> callback)
+void Batch_smooth::Set_batch_done(function<void(const long long position[2], long long output_size, long long written)> callback)
 {
 	batch_done = callback;
 }
