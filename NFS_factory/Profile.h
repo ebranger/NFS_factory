@@ -17,7 +17,7 @@ enum profile_phase {
 	PROF_LEAVES,          //remainders of the leaves, squarings and gcd
 	PROF_COFACTOR,        //checking the cofactors for large primes (rho, tinyqs)
 	PROF_FACTOR,          //factoring the smooth relations for output
-	PROF_OTHER_SIDE,      //rebuilding the factor list of the other side (format: cado)
+	PROF_OTHER_SIDE,      //the writer waiting for the other side's factors of the relations found, and finishing their lines
 	PROF_WRITE,           //formatting and writing the relations
 	PROF_3LP,             //the 3LP second stage, all of its phases
 	//The waits of the pipeline, which are not part of the total:

@@ -154,6 +154,7 @@ private:
 
 #ifdef NFS_GPU
 Tree_backend* create_gpu_tree_backend(int levels, int max_bits_in_input); //Gpu_tree_backend.cu
+Other_side_factoring* create_gpu_other_side_factoring(const std::vector<mpz_class>& coefficients); //Gpu_tree_backend.cu
 int gpu_pipeline(int levels, int max_bits_in_input, bool report); //Gpu_tree_backend.cu
 #endif
 
@@ -208,6 +209,17 @@ Tree_backend* create_tree_backend(tree_backend_kind kind, int levels, int max_bi
 		return new Ntt_tree_backend(levels, max_bits_in_input);
 	}
 	return new Cpu_tree_backend(new Mpir_tree_products, levels, max_bits_in_input);
+}
+
+Other_side_factoring* create_other_side_factoring(tree_backend_kind kind, const std::vector<mpz_class>& coefficients)
+{
+#ifdef NFS_GPU
+	if (kind == TREE_BACKEND_GPU)
+	{
+		return create_gpu_other_side_factoring(coefficients);
+	}
+#endif
+	return NULL;
 }
 
 //The tree takes ownership of products.

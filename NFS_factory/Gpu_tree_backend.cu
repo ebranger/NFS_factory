@@ -14,6 +14,7 @@
 #include <utility>
 #include <algorithm>
 #include <mutex>
+#include <condition_variable>
 #include <vector>
 
 static void gpu_start();
@@ -1985,9 +1986,6 @@ public:
 	bool Set_leaf_factoring();
 	bool Leaf_factors_ready();
 	int Leaf_factors(int index, const unsigned int** factors);
-	bool Set_other_side(const std::vector<mpz_class>& coefficients);
-	void Set_relations(const long long* a, const long long* b, int count);
-	int Other_factors(int index, const unsigned int** factors);
 
 private:
 	//The nodes of a depth: the product tree, and then the fractions of the remainder tree.
@@ -2041,24 +2039,6 @@ private:
 	void Start_factoring(int K);
 	std::vector<uint32_t> host_factor_list, host_factor_offsets, host_factor_primes;
 	std::vector<int> host_factor_counts, host_factor_entry; //host_factor_entry: the entry of each leaf in the list, or -1
-	//The other side of the smooth leaves, factored after them: its polynomial (Set_other_side), a and b of the leaves (other_ab, from
-	//host_ab, for a batch given with Set_relations), the norms (by leaf), and their factors (by entry in the list of smooth leaves),
-	//as for the leaves.
-	bool other_side; //Set_other_side was called
-	int other_degree, other_coefficient_bits;
-	uint64_t* other_coefficients;
-	int64_t* other_ab;
-	size_t other_ab_capacity;
-	Pinned<int64_t> host_ab;
-	bool other_given; //Set_relations for this batch
-	bool other_pending, other_valid; //the factoring of the other side was started, and its factors are there (for this batch)
-	uint64_t* other_values;
-	uint32_t *other_sizes, *other_offsets, *other_primes, *other_used;
-	int* other_counts;
-	size_t other_values_capacity, other_sizes_capacity, other_offsets_capacity, other_primes_capacity, other_counts_capacity;
-	uint32_t other_pool;
-	std::vector<uint32_t> host_other_offsets, host_other_primes;
-	std::vector<int> host_other_counts;
 	Pinned<unsigned char> host_classes;
 	Pinned<unsigned long long> host_large_primes;
 	//The cofactors that the CPU needs, gathered on the GPU (k_gather_cofactors): their leaves (after their count), sizes and limbs.
@@ -2171,14 +2151,6 @@ Gpu_tree_backend::Gpu_tree_backend(int levels, int max_bits_in_input) : Cpu_tree
 	factor_pool = 0;
 	CUDA_CHECK(cudaEventCreateWithFlags(&factored, cudaEventDisableTiming));
 	factors_pending = factors_valid = false;
-	other_side = other_given = other_pending = other_valid = false;
-	other_degree = other_coefficient_bits = 0;
-	other_coefficients = other_values = NULL;
-	other_ab = NULL;
-	other_sizes = other_offsets = other_primes = other_used = NULL;
-	other_counts = NULL;
-	other_ab_capacity = other_values_capacity = other_sizes_capacity = other_offsets_capacity = other_primes_capacity = other_counts_capacity = 0;
-	other_pool = 0;
 }
 
 Gpu_tree_backend::~Gpu_tree_backend()
@@ -2215,14 +2187,6 @@ Gpu_tree_backend::~Gpu_tree_backend()
 	cudaFree(factor_counts);
 	cudaFree(factor_offsets);
 	cudaFree(factor_primes);
-	cudaFree(other_coefficients);
-	cudaFree(other_ab);
-	cudaFree(other_values);
-	cudaFree(other_sizes);
-	cudaFree(other_offsets);
-	cudaFree(other_primes);
-	cudaFree(other_used);
-	cudaFree(other_counts);
 	cudaEventDestroy(rho_done);
 	cudaEventDestroy(classified);
 	cudaStreamDestroy(rho_stream);
@@ -2290,29 +2254,6 @@ void Gpu_tree_backend::Start_factoring(int K)
 	k_factor_smooth<<<1024, FACTOR_BLOCK, 0, rho_stream>>>(factor_list + 2, factor_list, leaves.level.limbs, leaves.level.stride, leaves.level.size,
 		checking ? large_primes : NULL, factor_counts, factor_offsets, factor_primes, factor_list + 1, factor_pool);
 	CUDA_CHECK(cudaGetLastError());
-	if (other_given)
-	{
-		//The other side of the same leaves: their norms, factored as the leaves. The pool starts at one factor per leaf, for a few
-		//percent of the leaves being smooth, and grows as the leaves' pool does.
-		other_pool = (other_pool > (uint32_t)num_leaves) ? other_pool : (uint32_t)num_leaves;
-		reserve(other_values, other_values_capacity, (size_t)num_leaves * FACTOR_LIMBS);
-		reserve(other_sizes, other_sizes_capacity, (size_t)num_leaves);
-		reserve(other_counts, other_counts_capacity, (size_t)num_leaves);
-		reserve(other_offsets, other_offsets_capacity, (size_t)num_leaves);
-		reserve(other_primes, other_primes_capacity, (size_t)other_pool);
-		if (other_used == NULL)
-		{
-			CUDA_CHECK(cudaMalloc(&other_used, sizeof(uint32_t)));
-		}
-		CUDA_CHECK(cudaMemsetAsync(other_used, 0, sizeof(uint32_t), rho_stream));
-		k_other_norms<<<grid_size_leaves(num_leaves), 128, 0, rho_stream>>>(factor_list + 2, factor_list, other_ab, other_coefficients, other_degree,
-			other_coefficient_bits, other_values, other_sizes);
-		k_factor_smooth<<<1024, FACTOR_BLOCK, 0, rho_stream>>>(factor_list + 2, factor_list, other_values, FACTOR_LIMBS, other_sizes, NULL, other_counts,
-			other_offsets, other_primes, other_used, other_pool);
-		CUDA_CHECK(cudaGetLastError());
-		other_pending = true;
-		other_given = false;
-	}
 	CUDA_CHECK(cudaEventRecord(factored, rho_stream));
 	factors_pending = true;
 }
@@ -2350,27 +2291,6 @@ bool Gpu_tree_backend::Leaf_factors_ready()
 	{
 		host_factor_entry[host_factor_list[j]] = (int)j;
 	}
-	other_valid = other_pending;
-	if (other_pending)
-	{
-		uint32_t used = 0;
-		CUDA_CHECK(cudaMemcpy(&used, other_used, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-		host_other_counts.resize(count);
-		host_other_offsets.resize(count);
-		host_other_primes.resize((used < other_pool) ? used : other_pool);
-		if (count > 0)
-		{
-			CUDA_CHECK(cudaMemcpy(host_other_counts.data(), other_counts, count * sizeof(int), cudaMemcpyDeviceToHost));
-			CUDA_CHECK(cudaMemcpy(host_other_offsets.data(), other_offsets, count * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-			CUDA_CHECK(cudaMemcpy(host_other_primes.data(), other_primes, host_other_primes.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-		}
-		if (used > other_pool)
-		{
-			//As for the leaves: the CPU factors the norms that did not fit, and the next batch has room for all.
-			other_pool = used + used / 4;
-		}
-		other_pending = false;
-	}
 	factors_pending = false;
 	factors_valid = true;
 	return true;
@@ -2385,82 +2305,6 @@ int Gpu_tree_backend::Leaf_factors(int index, const unsigned int** factors)
 	}
 	*factors = host_factor_primes.data() + host_factor_offsets[j];
 	return host_factor_counts[j];
-}
-
-//The polynomial of the other side, as numbers of OTHER_WIDTH limbs in two's complement, if it is small enough: k_other_norms then
-//computes the norms for a and b of up to (64 OTHER_WIDTH - 5 - coefficient bits) / degree bits.
-bool Gpu_tree_backend::Set_other_side(const std::vector<mpz_class>& coefficients)
-{
-	const int degree = (int)coefficients.size() - 1;
-	if (degree < 1 || degree > OTHER_MAX_DEGREE || !factoring)
-	{
-		return false;
-	}
-	int bits = 0;
-	std::vector<uint64_t> words((size_t)(degree + 1) * OTHER_WIDTH, 0);
-	for (int e = 0; e <= degree; e++)
-	{
-		mpz_srcptr c = coefficients[e].get_mpz_t();
-		const int c_bits = (int)mpz_sizeinbase(c, 2);
-		if (c_bits + degree * 32 + 4 > 64 * OTHER_WIDTH - 1)
-		{
-			return false; //too large even for a and b of 32 bits
-		}
-		bits = (c_bits > bits) ? c_bits : bits;
-		uint64_t* x = &words[(size_t)e * OTHER_WIDTH];
-		for (size_t k = 0; k < mpz_size(c); k++)
-		{
-			x[k] = mpz_getlimbn(c, k);
-		}
-		if (mpz_sgn(c) < 0)
-		{
-			uint64_t carry = 1;
-			for (int k = 0; k < OTHER_WIDTH; k++)
-			{
-				x[k] = ~x[k] + carry;
-				carry = (x[k] < carry);
-			}
-		}
-	}
-	gpu_start();
-	cudaFree(other_coefficients);
-	CUDA_CHECK(cudaMalloc(&other_coefficients, words.size() * sizeof(uint64_t)));
-	CUDA_CHECK(cudaMemcpy(other_coefficients, words.data(), words.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
-	other_degree = degree;
-	other_coefficient_bits = bits;
-	other_side = true;
-	return true;
-}
-
-//a and b of the leaves of this batch, copied to the GPU on the stream of the thread, before Leaf_cofactors starts the factoring.
-void Gpu_tree_backend::Set_relations(const long long* a, const long long* b, int count)
-{
-	if (!other_side)
-	{
-		return;
-	}
-	gpu_start();
-	host_ab.resize(2 * (size_t)num_leaves);
-	for (int i = 0; i < count; i++)
-	{
-		host_ab[2 * (size_t)i] = a[i];
-		host_ab[2 * (size_t)i + 1] = b[i];
-	}
-	memset(host_ab.data() + 2 * (size_t)count, 0, 2 * (size_t)(num_leaves - count) * sizeof(int64_t));
-	reserve(other_ab, other_ab_capacity, 2 * (size_t)num_leaves);
-	CUDA_CHECK(cudaMemcpyAsync(other_ab, host_ab.data(), 2 * (size_t)num_leaves * sizeof(int64_t), cudaMemcpyHostToDevice, 0));
-	other_given = true;
-}
-
-int Gpu_tree_backend::Other_factors(int index, const unsigned int** factors)
-{
-	const int j = (factors_valid && other_valid) ? host_factor_entry[index] : -1;
-	if (j < 0)
-	{
-		return -1;
-	}
-	*factors = host_other_primes.data() + host_other_offsets[j];
-	return host_other_counts[j];
 }
 
 void Gpu_tree_backend::Set_stride(Depth& d, size_t count, size_t stride)
@@ -2699,7 +2543,7 @@ void Gpu_tree_backend::Leaf_cofactors()
 		if (gpu->Leaf_cofactors(parents.level, parents.bits, leaves.level, leaves.bits, (int)leaf_limbs, (uint32_t)guard, MAX_SQUARINGS_IN_CHECK, cofactors, 0))
 		{
 			classes_valid = checking;
-			factors_pending = factors_valid = other_valid = false;
+			factors_pending = factors_valid = false;
 			if (checking)
 			{
 				reserve(classes, classes_capacity, (size_t)num_leaves);
@@ -2772,9 +2616,240 @@ void Gpu_tree_backend::Leaf_cofactors()
 	}
 	//Large leaves: on the CPU, from the fractions of their parents. Their cofactors are not checked here.
 	classes_valid = false;
-	factors_pending = factors_valid = other_valid = other_given = false;
+	factors_pending = factors_valid = false;
 	Download(levels - 2);
 	Cpu_tree_backend::Leaf_cofactors();
+}
+
+#define OTHER_JOBS 16 //jobs of the factoring of the other side in progress at once
+#define OTHER_JOB_CAPACITY 4096 //norms of a job for which the memory is allocated up front (a batch of 2^19 relations has about 1500)
+
+//The factoring of the other side's norms of the relations found, as jobs apart from the trees: a job (the relations found in a batch)
+//is copied to the GPU, and its norms computed and factored (k_other_norms, k_factor_smooth, a warp per norm), on a stream of its own,
+//so that the jobs of several batches run at once. A norm takes several splits by Pollard rho, which take
+//tens of ms while the trees keep the GPU busy, so the results are only waited for when the relations are written, and the batches
+//go on meanwhile. Submit is called by one thread, and Results by one thread, in the order of the jobs.
+class Gpu_other_side_factoring : public Other_side_factoring
+{
+public:
+	Gpu_other_side_factoring(const std::vector<uint64_t>& words, int degree, int coefficient_bits);
+	~Gpu_other_side_factoring();
+	int Submit(const long long* a, const long long* b, int count);
+	void Results(int job, std::vector<int>& counts, std::vector<unsigned int>& offsets, std::vector<unsigned int>& primes);
+
+private:
+	struct Job
+	{
+		cudaStream_t stream;
+		cudaEvent_t done;
+		bool busy; //submitted, and its results not taken yet
+		int count;
+		Pinned<int64_t> host_ab; //a and b of the norms
+		Pinned<uint32_t> host_header; //the number of norms, and the room their factors need in the pool
+		Pinned<int> host_counts;
+		Pinned<uint32_t> host_offsets, host_primes;
+		int64_t* ab;
+		uint64_t* values;
+		uint32_t *header, *list, *sizes, *offsets, *primes;
+		int* counts;
+		size_t capacity; //norms
+	};
+	void Reserve(Job& j, size_t count);
+	Job jobs[OTHER_JOBS];
+	long long submitted, taken;
+	std::mutex lock;
+	std::condition_variable changed;
+	uint64_t* coefficients;
+	int degree, coefficient_bits;
+};
+
+Gpu_other_side_factoring::Gpu_other_side_factoring(const std::vector<uint64_t>& words, int degree, int coefficient_bits)
+	: submitted(0), taken(0), degree(degree), coefficient_bits(coefficient_bits)
+{
+	gpu_start();
+	set_trial_primes();
+	CUDA_CHECK(cudaMalloc(&coefficients, words.size() * sizeof(uint64_t)));
+	CUDA_CHECK(cudaMemcpy(coefficients, words.data(), words.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
+	//At the highest priority, which was a few percent faster: the jobs are small, and their results are waited for.
+	int least_priority = 0, greatest_priority = 0;
+	CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority));
+	for (Job& j : jobs)
+	{
+		CUDA_CHECK(cudaStreamCreateWithPriority(&j.stream, cudaStreamNonBlocking, greatest_priority));
+		CUDA_CHECK(cudaEventCreateWithFlags(&j.done, cudaEventDisableTiming));
+		j.busy = false;
+		j.count = 0;
+		j.ab = NULL;
+		j.values = NULL;
+		j.header = j.list = j.sizes = j.offsets = j.primes = NULL;
+		j.counts = NULL;
+		j.capacity = 0;
+		CUDA_CHECK(cudaMalloc(&j.header, 2 * sizeof(uint32_t)));
+		j.host_header.resize(2);
+		Reserve(j, OTHER_JOB_CAPACITY);
+	}
+	//The coefficients too are on the GPU before the first job.
+	CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+//Room for count norms in a job, their factors, and the list of them (0, 1, ...), which k_other_norms and k_factor_smooth take.
+//The memory is allocated up front, so that it is not freed and allocated while the GPU is busy.
+void Gpu_other_side_factoring::Reserve(Job& j, size_t count)
+{
+	if (count <= j.capacity)
+	{
+		return;
+	}
+	cudaFree(j.ab);
+	cudaFree(j.values);
+	cudaFree(j.list);
+	cudaFree(j.sizes);
+	cudaFree(j.offsets);
+	cudaFree(j.primes);
+	cudaFree(j.counts);
+	CUDA_CHECK(cudaMalloc(&j.ab, 2 * count * sizeof(int64_t)));
+	CUDA_CHECK(cudaMalloc(&j.values, count * FACTOR_LIMBS * sizeof(uint64_t)));
+	CUDA_CHECK(cudaMalloc(&j.list, count * sizeof(uint32_t)));
+	CUDA_CHECK(cudaMalloc(&j.sizes, count * sizeof(uint32_t)));
+	CUDA_CHECK(cudaMalloc(&j.offsets, count * sizeof(uint32_t)));
+	CUDA_CHECK(cudaMalloc(&j.primes, count * FACTOR_MAX * sizeof(uint32_t)));
+	CUDA_CHECK(cudaMalloc(&j.counts, count * sizeof(int)));
+	std::vector<uint32_t> identity(count);
+	for (size_t i = 0; i < count; i++)
+	{
+		identity[i] = (uint32_t)i;
+	}
+	//On the stream of the job, and waited for: cudaMemcpy from memory that is not page-locked can return before the data is on the
+	//GPU, and the kernels of the job (on its own stream) then read a list that is not there yet.
+	CUDA_CHECK(cudaMemcpyAsync(j.list, identity.data(), count * sizeof(uint32_t), cudaMemcpyHostToDevice, j.stream));
+	CUDA_CHECK(cudaStreamSynchronize(j.stream));
+	j.host_ab.resize(2 * count);
+	j.host_counts.resize(count);
+	j.host_offsets.resize(count);
+	j.host_primes.resize(count * FACTOR_MAX);
+	j.capacity = count;
+}
+
+Gpu_other_side_factoring::~Gpu_other_side_factoring()
+{
+	for (Job& j : jobs)
+	{
+		cudaStreamSynchronize(j.stream);
+		cudaFree(j.ab);
+		cudaFree(j.values);
+		cudaFree(j.header);
+		cudaFree(j.list);
+		cudaFree(j.sizes);
+		cudaFree(j.offsets);
+		cudaFree(j.primes);
+		cudaFree(j.counts);
+		cudaEventDestroy(j.done);
+		cudaStreamDestroy(j.stream);
+	}
+	cudaFree(coefficients);
+}
+
+//Start a job: the norms of the relations (a, b) and their factors, at most FACTOR_MAX each. Waits for the oldest job's results to be
+//taken if all OTHER_JOBS are in use. Returns the number of the job.
+int Gpu_other_side_factoring::Submit(const long long* a, const long long* b, int count)
+{
+	std::unique_lock<std::mutex> guard(lock);
+	changed.wait(guard, [&] { return submitted - taken < OTHER_JOBS; });
+	const long long number = submitted;
+	Job& j = jobs[number % OTHER_JOBS];
+	guard.unlock();
+
+	gpu_start();
+	Reserve(j, (size_t)count + count / 4);
+	j.count = count;
+	for (int i = 0; i < count; i++)
+	{
+		j.host_ab[2 * (size_t)i] = a[i];
+		j.host_ab[2 * (size_t)i + 1] = b[i];
+	}
+	j.host_header[0] = (uint32_t)count;
+	j.host_header[1] = 0;
+	if (count > 0)
+	{
+		const uint32_t pool = (uint32_t)count * FACTOR_MAX;
+		const unsigned int blocks = (unsigned int)std::min(1024, (count + FACTOR_BLOCK / 32 - 1) / (FACTOR_BLOCK / 32));
+		CUDA_CHECK(cudaMemcpyAsync(j.ab, j.host_ab.data(), 2 * (size_t)count * sizeof(int64_t), cudaMemcpyHostToDevice, j.stream));
+		CUDA_CHECK(cudaMemcpyAsync(j.header, j.host_header.data(), 2 * sizeof(uint32_t), cudaMemcpyHostToDevice, j.stream));
+		k_other_norms<<<(count + 127) / 128, 128, 0, j.stream>>>(j.list, j.header, j.ab, coefficients, degree, coefficient_bits, j.values, j.sizes);
+		k_factor_smooth<<<blocks, FACTOR_BLOCK, 0, j.stream>>>(j.list, j.header, j.values, FACTOR_LIMBS, j.sizes, NULL, j.counts, j.offsets, j.primes,
+			j.header + 1, pool);
+		CUDA_CHECK(cudaGetLastError());
+		CUDA_CHECK(cudaMemcpyAsync(j.host_counts.data(), j.counts, (size_t)count * sizeof(int), cudaMemcpyDeviceToHost, j.stream));
+		CUDA_CHECK(cudaMemcpyAsync(j.host_offsets.data(), j.offsets, (size_t)count * sizeof(uint32_t), cudaMemcpyDeviceToHost, j.stream));
+		CUDA_CHECK(cudaMemcpyAsync(j.host_primes.data(), j.primes, (size_t)pool * sizeof(uint32_t), cudaMemcpyDeviceToHost, j.stream));
+	}
+	CUDA_CHECK(cudaEventRecord(j.done, j.stream));
+
+	guard.lock();
+	j.busy = true;
+	submitted++;
+	return (int)(number % (1LL << 30));
+}
+
+//The factors of the norms of a job, in the order they were submitted: for norm i, counts[i] of them (or -1 if it was not factored)
+//from offsets[i] in primes, in increasing order. The jobs must be taken in the order they were submitted.
+void Gpu_other_side_factoring::Results(int job, std::vector<int>& counts, std::vector<unsigned int>& offsets, std::vector<unsigned int>& primes)
+{
+	Job& j = jobs[(taken % (1LL << 30)) % OTHER_JOBS];
+	if (job != (int)(taken % (1LL << 30)) || !j.busy)
+	{
+		fprintf(stderr, "Gpu_other_side_factoring: results of job %d taken out of order\n", job);
+		exit(3);
+	}
+	gpu_start();
+	CUDA_CHECK(cudaEventSynchronize(j.done));
+	counts.assign(j.host_counts.data(), j.host_counts.data() + j.count);
+	offsets.assign(j.host_offsets.data(), j.host_offsets.data() + j.count);
+	primes.assign(j.host_primes.data(), j.host_primes.data() + (size_t)j.count * FACTOR_MAX);
+	{
+		std::lock_guard<std::mutex> guard(lock);
+		j.busy = false;
+		taken++;
+	}
+	changed.notify_all();
+}
+
+//The polynomial of the other side, as numbers of OTHER_WIDTH limbs in two's complement, if it is small enough: k_other_norms then
+//computes the norms for a and b of up to (64 OTHER_WIDTH - 5 - coefficient bits) / degree bits.
+Other_side_factoring* create_gpu_other_side_factoring(const std::vector<mpz_class>& coefficients)
+{
+	const int degree = (int)coefficients.size() - 1;
+	if (degree < 1 || degree > OTHER_MAX_DEGREE)
+	{
+		return NULL;
+	}
+	int bits = 0;
+	std::vector<uint64_t> words((size_t)(degree + 1) * OTHER_WIDTH, 0);
+	for (int e = 0; e <= degree; e++)
+	{
+		mpz_srcptr c = coefficients[e].get_mpz_t();
+		const int c_bits = (int)mpz_sizeinbase(c, 2);
+		if (c_bits + degree * 32 + 4 > 64 * OTHER_WIDTH - 1)
+		{
+			return NULL; //too large even for a and b of 32 bits
+		}
+		bits = (c_bits > bits) ? c_bits : bits;
+		uint64_t* x = &words[(size_t)e * OTHER_WIDTH];
+		for (size_t k = 0; k < mpz_size(c); k++)
+		{
+			x[k] = mpz_getlimbn(c, k);
+		}
+		if (mpz_sgn(c) < 0)
+		{
+			uint64_t carry = 1;
+			for (int k = 0; k < OTHER_WIDTH; k++)
+			{
+				x[k] = ~x[k] + carry;
+				carry = (x[k] < carry);
+			}
+		}
+	}
+	return new Gpu_other_side_factoring(words, degree, bits);
 }
 
 //The GPU used, chosen by gpu_init. Each host thread has its own current device, so the threads that use the GPU set it first

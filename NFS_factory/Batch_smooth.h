@@ -18,6 +18,26 @@ using namespace std;
 #define MAX_SAVED_PRIMES 64 //Most primes in the saved factor list of a relation from a binary relation file.
 #define MAX_COFACTOR_PRIMES 96 //Most prime factors of a 3LP cofactor, which is less than 2^96.
 
+class Batch_smooth;
+
+//The relations found in a batch (or a batch of the 3LP second stage), on their way to the output file: see Batch_smooth::Queue_output.
+struct Output_batch
+{
+	Batch_smooth* source; //which counts the relations written
+	vector<string> lines; //the relations, in the order of the batch; a line waiting for the factors of its other side is empty
+	struct Waiting
+	{
+		size_t line;
+		long long a, b;
+		string checked_side; //the factor list of the batch checked side
+		vector<unsigned long long> saved; //the saved factor list of the other side, if any, which must divide the norm
+	};
+	vector<Waiting> waiting;
+	int job; //of the factoring of the other side, for the waiting lines; -1 if none
+	bool batch_end; //a batch of the object that writes: after it is written, its position goes to the batch done callback
+	long long position[2];
+};
+
 //The relations of one batch, from reading them to writing the smooth ones: the input, the tree with their values as leaves,
 //and the results of the checks.
 struct Batch_slot
@@ -33,11 +53,11 @@ struct Batch_slot
 	long long position[2]; //the read position of its last relation, as given by Set_read_position
 	size_t root_bits; //of the product tree
 	bool tree_factors; //the tree factored the smooth relations of the batch (Tree_backend::Leaf_factors)
-	bool rebuilds_other_side; //the factor list of the other side is rebuilt for some of the relations (see Batch_smooth)
 	mpz_class temp_number;
 	vector<unsigned char> leaf_result; //cofactor_result of each leaf
 	vector<string> relation_texts;
 	vector<unsigned char> relation_result;
+	vector<unsigned char> relation_waiting; //for the factors of its other side
 	vector<int> candidate_index; //3LP candidates of the batch, sent on after the batch is checked.
 	vector<mpz_class> candidate_cofactor;
 };
@@ -48,14 +68,15 @@ public:
 	//other_side_poly: the polynomial of the side that is not batch checked. The factor list of that side is rebuilt from its norm, with
 	//all primes and their multiplicities, for every relation if rebuild_other_side (as CADO-NFS requires), and otherwise for the
 	//relations that were added without one (Add_number_binary with no primes, from a file of only a and b); the others are printed as
-	//they were read, if they divide the norm. The primes below print_limit are left out. On the GPU, the norms are factored with the
-	//relation values.
+	//they were read, if they divide the norm. The primes below print_limit are left out. On the GPU, the norms of the relations found in
+	//a batch are factored in the background (Other_side_factoring), and their lines are finished when they are written.
 	//backend: the implementation of the tree computations.
 	//three_lp_stage: if true, this is the 3LP second stage. Its inputs are the cofactors given with Add_candidate, which are checked against all primes below 2^lbp (fblim and mfb are not used).
 	//pipeline: the number of batches in progress at once (see Batch_slot), each with its own tree, or 0 for the default of the
 	//backend (default_pipeline). 1 checks each batch when it is full, in the calling thread. With more, the batches are checked in a pipeline of threads while the next ones are read: the
-	//polynomial values and the trees (by up to four threads, as the trees use the GPU), and then the cofactors and the output (one
-	//thread, in the order of the batches, so that the output does not depend on the pipeline). The second stage always uses 1.
+	//polynomial values and the trees (by up to four threads, as the trees use the GPU), then the cofactors and the factor lists of the
+	//relations found (one thread), and the output (one thread), both in the order of the batches, so that the output does not depend
+	//on the pipeline. The second stage always uses 1, and its relations are written by the writer of the first stage.
 	Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, bool rebuild_other_side, int max_tree_levels, tree_backend_kind backend, bool three_lp_stage = false, int pipeline = 1);
 	~Batch_smooth(void);
 	void Finish(); //Check the remaining relations, and any 3LP candidates in the second stage. Call once, after the last relation.
@@ -102,9 +123,27 @@ private:
 	void Check_worker();
 	void Output_solutions(Batch_slot& s);
 	enum relation_status { RELATION_WRITTEN, RELATION_FACTORING_FAILED, RELATION_OTHER_SIDE_FAILED };
-	relation_status Format_relation(Batch_slot& s, int index, string& relation_text);
-	bool Complete_other_side(Batch_slot& s, int index, string& list);
+	relation_status Format_relation(Batch_slot& s, int index, string& relation_text, bool& waiting);
+	string Relation_line(long long a, long long b, const string& checked_side, const string& other_side);
+	bool Complete_other_side(long long a, long long b, vector<unsigned long long>& primes, const unsigned int* factors, int num_factors, string& list);
 	bool Saved_list_divides(Batch_slot& s, int index);
+
+	//The output. The relations found in each batch go, in order, to the writer: with a pipeline its own thread, which waits for the
+	//factoring of their other side (if any), finishes their lines and writes them, and after a batch calls the batch done callback;
+	//otherwise they are written at once. The second stage gives its relations to the writer of the first stage (writer), so that
+	//they are written between the right batches, as when the checks wrote them.
+	Batch_smooth* writer; //this, or the first stage for the second stage
+	Other_side_factoring* other_factoring; //NULL if the other side's norms are factored on the CPU
+	void Queue_output(Output_batch* o);
+	void Write_output(Output_batch& o);
+	void Writer_worker();
+	void Wait_for_writer();
+	deque<Output_batch*> output_queue;
+	bool writer_busy;
+	bool writer_stopping;
+	mutex output_lock;
+	condition_variable output_changed;
+	thread writer_thread;
 
 	string save_filename;
 	FILE* output; //open from the first batch on; flushed after each batch, so that its size is that of the relations written
@@ -112,15 +151,14 @@ private:
 	int max_entries_before_check;
 	atomic<long long> num_relations_found;
 	atomic<long long> num_relations_checked;
-	long long num_factoring_failures;
-	long long num_other_side_failures;
+	atomic<long long> num_factoring_failures;
+	atomic<long long> num_other_side_failures;
 	int num_relations_per_batch;
 	int min_saved_prime_limit;
 
 	Polynomial* poly;
 	Polynomial* other_poly; //for rebuilding the other side's factor list
 	bool rebuild_all; //for every relation, not only those without a saved list
-	bool other_side_on_tree; //the tree factors the other side (Tree_backend::Set_other_side)
 
 	bool using_snfs_deg4_binomial;
 	bool binomial_fits; //the coefficients of the binomial fit in 63 bits, for Binomial_value_native.
@@ -157,7 +195,7 @@ private:
 	Batch_slot* filling;
 	long long read_position[2];
 	function<void(const long long position[2], long long output_size)> batch_done;
-	long long output_size;
+	long long output_size; //of the output file after the last batch written
 	bool pipelined;
 	mutex lock;
 	condition_variable changed;

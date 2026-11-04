@@ -9,11 +9,15 @@ The 3LP candidate file (3lp: save) holds a in 32 bits, as the .bin format, so th
 more (from .ab or text files) are skipped and counted. With 3lp: auto they are checked. A candidate format with a 64-bit a
 would keep them.
 
-The factoring of the other side's norms for .ab files: on the GPU it runs with the factoring of the leaves (about 11 ms per batch
-for the 229-bit rational norms of SNFS-240, most of it rho for the five or so primes between 2^24 and 2^29), which the check
-thread waits for; the runs were as fast as from .bin files in the page cache, but a GPU that checks relations faster could
-notice it. Trial division beyond 2^16 or more slots for the checks could help. The CPU build factors them on the CPU (a
-one-thread SNFS-220 run was about 30 % slower than from the .bin file).
+The factoring of the other side's norms for .ab files runs on the GPU in the background (jobs of Other_side_factoring), but it
+still costs GPU time: on SNFS-240 (97777_239.poly, 4 files of 139M relations) a run took 74 s, and 53 s with that factoring left
+out. It is most of it rho for the five or so primes between 2^24 and 2^29 of each 229-bit rational norm, with 32 walks per norm
+(a warp each), which keeps the latency short but costs about 5 times the work of one walk. Now that the latency is hidden, fewer
+walks per norm (several norms per warp) would save most of that. The CPU build factors them on the CPU (a one-thread SNFS-220
+run was about 30 % slower than from the .bin file).
+
+The thread of the checks now mostly waits for k_rho (Pollard rho on the two large prime cofactors, a thread each, about 240 per
+SNFS-240 batch). A warp per cofactor (32 walks) was tried and was not faster.
 
 A validating converter to .ab (finding the right a for the relations of old .bin files whose |a| is 2^31 or more, which needs the
 polynomial) exists outside the repository; Utilities\RelationsToBinaryFormat converts without checking.
@@ -30,10 +34,6 @@ GPU transform kernels: they are limited by latency (registers, barriers between 
 
 The plan of the integer NTT (number of primes and transform length) is chosen with a cost model of the CPU transforms. On the
 GPU the CRT combine is a larger part, and grows with the square of the number of primes.
-
-The checks of a batch wait for k_rho (Pollard rho on the two large prime cofactors, about 10 ms per batch, one thread per
-cofactor). If the trees get faster than about 16 ms per batch, this becomes the limit; rho with a warp per cofactor (as the
-factoring of the relations) or an earlier start would help.
 
 The prime product of the 3LP second stage (all primes below 2^lbp) takes about 1.3 s to set up on the CPU (the root tests of
 28 million primes). Only noticeable on short runs.
