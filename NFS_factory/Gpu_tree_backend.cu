@@ -2644,6 +2644,7 @@ public:
 	Gpu_other_side_factoring(const std::vector<uint64_t>& words, int degree, int coefficient_bits);
 	~Gpu_other_side_factoring();
 	int Submit(const long long* a, const long long* b, int count);
+	int Submit_values(const unsigned long long* limbs, const unsigned int* sizes, int count);
 	void Results(int job, std::vector<int>& counts, std::vector<unsigned int>& offsets, std::vector<unsigned int>& primes);
 
 private:
@@ -2654,6 +2655,8 @@ private:
 		bool busy; //submitted, and its results not taken yet
 		int count;
 		Pinned<int64_t> host_ab; //a and b of the norms
+		Pinned<uint64_t> host_values; //or the values themselves (Submit_values)
+		Pinned<uint32_t> host_sizes;
 		Pinned<uint32_t> host_header; //the number of norms, and the room their factors need in the pool
 		Pinned<int> host_counts;
 		Pinned<uint32_t> host_offsets, host_primes;
@@ -2664,6 +2667,7 @@ private:
 		size_t capacity; //norms
 	};
 	void Reserve(Job& j, size_t count);
+	int Launch(const long long* a, const long long* b, const unsigned long long* limbs, const unsigned int* sizes, int count);
 	Job jobs[OTHER_JOBS];
 	long long submitted, taken;
 	std::mutex lock;
@@ -2733,6 +2737,8 @@ void Gpu_other_side_factoring::Reserve(Job& j, size_t count)
 	CUDA_CHECK(cudaMemcpyAsync(j.list, identity.data(), count * sizeof(uint32_t), cudaMemcpyHostToDevice, j.stream));
 	CUDA_CHECK(cudaStreamSynchronize(j.stream));
 	j.host_ab.resize(2 * count);
+	j.host_values.resize(count * FACTOR_LIMBS);
+	j.host_sizes.resize(count);
 	j.host_counts.resize(count);
 	j.host_offsets.resize(count);
 	j.host_primes.resize(count * FACTOR_MAX);
@@ -2762,6 +2768,17 @@ Gpu_other_side_factoring::~Gpu_other_side_factoring()
 //taken if all OTHER_JOBS are in use. Returns the number of the job.
 int Gpu_other_side_factoring::Submit(const long long* a, const long long* b, int count)
 {
+	return Launch(a, b, NULL, NULL, count);
+}
+
+int Gpu_other_side_factoring::Submit_values(const unsigned long long* limbs, const unsigned int* sizes, int count)
+{
+	return Launch(NULL, NULL, limbs, sizes, count);
+}
+
+//A job of the norms of (a, b), or (if a is NULL) of the values given.
+int Gpu_other_side_factoring::Launch(const long long* a, const long long* b, const unsigned long long* limbs, const unsigned int* sizes, int count)
+{
 	std::unique_lock<std::mutex> guard(lock);
 	changed.wait(guard, [&] { return submitted - taken < OTHER_JOBS; });
 	const long long number = submitted;
@@ -2771,10 +2788,15 @@ int Gpu_other_side_factoring::Submit(const long long* a, const long long* b, int
 	gpu_start();
 	Reserve(j, (size_t)count + count / 4);
 	j.count = count;
-	for (int i = 0; i < count; i++)
+	for (int i = 0; i < count && a != NULL; i++)
 	{
 		j.host_ab[2 * (size_t)i] = a[i];
 		j.host_ab[2 * (size_t)i + 1] = b[i];
+	}
+	if (a == NULL && count > 0)
+	{
+		memcpy(j.host_values.data(), limbs, (size_t)count * FACTOR_LIMBS * sizeof(uint64_t));
+		memcpy(j.host_sizes.data(), sizes, (size_t)count * sizeof(uint32_t));
 	}
 	j.host_header[0] = (uint32_t)count;
 	j.host_header[1] = 0;
@@ -2782,9 +2804,17 @@ int Gpu_other_side_factoring::Submit(const long long* a, const long long* b, int
 	{
 		const uint32_t pool = (uint32_t)count * FACTOR_MAX;
 		const unsigned int blocks = (unsigned int)std::min(1024, (count + FACTOR_BLOCK / 32 - 1) / (FACTOR_BLOCK / 32));
-		CUDA_CHECK(cudaMemcpyAsync(j.ab, j.host_ab.data(), 2 * (size_t)count * sizeof(int64_t), cudaMemcpyHostToDevice, j.stream));
 		CUDA_CHECK(cudaMemcpyAsync(j.header, j.host_header.data(), 2 * sizeof(uint32_t), cudaMemcpyHostToDevice, j.stream));
-		k_other_norms<<<(count + 127) / 128, 128, 0, j.stream>>>(j.list, j.header, j.ab, coefficients, degree, coefficient_bits, j.values, j.sizes);
+		if (a != NULL)
+		{
+			CUDA_CHECK(cudaMemcpyAsync(j.ab, j.host_ab.data(), 2 * (size_t)count * sizeof(int64_t), cudaMemcpyHostToDevice, j.stream));
+			k_other_norms<<<(count + 127) / 128, 128, 0, j.stream>>>(j.list, j.header, j.ab, coefficients, degree, coefficient_bits, j.values, j.sizes);
+		}
+		else
+		{
+			CUDA_CHECK(cudaMemcpyAsync(j.values, j.host_values.data(), (size_t)count * FACTOR_LIMBS * sizeof(uint64_t), cudaMemcpyHostToDevice, j.stream));
+			CUDA_CHECK(cudaMemcpyAsync(j.sizes, j.host_sizes.data(), (size_t)count * sizeof(uint32_t), cudaMemcpyHostToDevice, j.stream));
+		}
 		k_factor_smooth<<<blocks, FACTOR_BLOCK, 0, j.stream>>>(j.list, j.header, j.values, FACTOR_LIMBS, j.sizes, NULL, j.counts, j.offsets, j.primes,
 			j.header + 1, pool);
 		CUDA_CHECK(cudaGetLastError());

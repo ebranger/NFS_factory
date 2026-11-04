@@ -421,6 +421,10 @@ bool Batch_smooth::Set_three_lp_handling(Batch_smooth* second_stage, string cand
 //(uint64)low and (uint64)high 64 bits of the cofactor.
 void Batch_smooth::Send_candidates(Batch_slot& s)
 {
+	if (result_sink)
+	{
+		return; //an other_stage gives its candidates to the writer, in Output_solutions
+	}
 	vector<unsigned long long> primes;
 	unsigned int saved[MAX_SAVED_PRIMES];
 	long long* a_vals = s.a_vals;
@@ -483,7 +487,7 @@ void Batch_smooth::Finish()
 		reader_blocked += profile_add(PROF_WAIT_READER, t) - t;
 	}
 
-	if (three_lp_max_bits > 0)
+	if (three_lp_max_bits > 0 && !result_sink)
 	{
 		string text = "Found " + to_string(num_candidates) + " 3LP candidates";
 		if (num_candidates_skipped > 0)
@@ -1271,13 +1275,21 @@ void Batch_smooth::Output_solutions(Batch_slot& s)
 				factored[index] = 1;
 			}
 		});
+		vector<int> candidate(s.entries, -1);
+		for (size_t n = 0; n < s.candidate_index.size(); n++)
+		{
+			candidate[s.candidate_index[n]] = (int)n;
+		}
 		for (int index = 0; index < s.entries; index++)
 		{
-			result_sink(sink_next + index, s.a_vals[index], s.b_vals[index], factored[index] != 0, found[index]);
+			const bool is_candidate = candidate[index] >= 0;
+			result_sink(sink_next + index, s.a_vals[index], s.b_vals[index], factored[index] != 0, found[index],
+				is_candidate ? &s.candidate_cofactor[candidate[index]] : NULL, is_candidate ? s.tree->Leaf(index) : NULL);
 			s.is_smooth[index] = false;
 			s.lp1[index] = 0;
 			s.lp2[index] = 0;
 		}
+		s.candidate_index.clear();
 		sink_next += s.entries;
 		s.entries = 0;
 		profile_add(profile, PROF_FACTOR, t);
@@ -1432,16 +1444,34 @@ void Batch_smooth::Create_other_stage()
 	}
 	const int norm_bits = coefficient_bits + 34 * other_poly->get_degree() + 4;
 	console_message("The factor lists of the other side of the relations found are batch checked against the primes up to 2^28.");
-	other_stage = new Batch_smooth(OTHER_STAGE_BOUND, OTHER_STAGE_LARGE_PRIME_BITS, 2 * OTHER_STAGE_LARGE_PRIME_BITS, norm_bits, save_filename, other_poly,
+	other_stage = new Batch_smooth(OTHER_STAGE_BOUND, OTHER_STAGE_LARGE_PRIME_BITS, OTHER_STAGE_MAX_COFACTOR_BITS, norm_bits, save_filename, other_poly,
 		1 - side, 1, NULL, false, OTHER_STAGE_LEVELS, backend_kind, false, 1);
 	other_stage->profile = profile_cycles_other;
-	other_stage->result_sink = [this](long long ticket, long long a, long long b, bool factored, vector<unsigned long long>& primes)
+	other_stage->result_sink = [this](long long ticket, long long a, long long b, bool factored, vector<unsigned long long>& primes,
+		const mpz_class* cofactor, const mpz_class* norm)
 	{
 		if (factored)
 		{
 			Other_result& r = other_results[ticket];
 			r.state = OTHER_FACTORED;
 			r.primes.swap(primes);
+		}
+		else if (cofactor != NULL && mpz_size(norm->get_mpz_t()) <= 4 && mpz_divisible_p(norm->get_mpz_t(), cofactor->get_mpz_t()))
+		{
+			//The rest of the norm and the cofactor, factored apart.
+			mpz_class rest;
+			mpz_divexact(rest.get_mpz_t(), norm->get_mpz_t(), cofactor->get_mpz_t());
+			const mpz_class* parts[2] = { &rest, cofactor };
+			for (const mpz_class* v : parts)
+			{
+				const size_t n = mpz_size(v->get_mpz_t());
+				for (size_t k = 0; k < 4; k++)
+				{
+					split_limbs.push_back((k < n) ? mpz_getlimbn(v->get_mpz_t(), k) : 0);
+				}
+				split_sizes.push_back((unsigned int)n);
+			}
+			split_tickets.push_back(ticket);
 		}
 		else
 		{
@@ -1452,9 +1482,26 @@ void Batch_smooth::Create_other_stage()
 	};
 }
 
-//A job of other_factoring for the norms that other_stage did not factor, after one of its trees.
+//The jobs of other_factoring for the norms that other_stage did not factor, after one of its trees: the cofactors and the rest of
+//the norms apart, and the whole norms.
 void Batch_smooth::Submit_fallback()
 {
+	if (!split_tickets.empty())
+	{
+		const int job = other_factoring->Submit_values(split_limbs.data(), split_sizes.data(), (int)split_sizes.size());
+		for (long long ticket : split_tickets)
+		{
+			Other_result& r = other_results[ticket];
+			r.state = OTHER_IN_JOB;
+			r.job = job;
+		}
+		job_tickets[job].swap(split_tickets);
+		job_split[job] = true;
+		pending_jobs.push_back(job);
+		split_tickets.clear();
+		split_limbs.clear();
+		split_sizes.clear();
+	}
 	if (fallback_tickets.empty())
 	{
 		return;
@@ -1467,28 +1514,55 @@ void Batch_smooth::Submit_fallback()
 		r.job = job;
 	}
 	job_tickets[job].swap(fallback_tickets);
+	job_split[job] = false;
+	pending_jobs.push_back(job);
 	fallback_tickets.clear();
 	fallback_a.clear();
 	fallback_b.clear();
 }
 
-//The results of a job of other_factoring, for all of its norms. The jobs are taken in their order, as their tickets come in order.
+//The results of a job of other_factoring, for all of its norms, after those of the jobs submitted before it: the results must be
+//taken in that order, and a job of values and a job of norms from the same tree have tickets in between each other's.
 void Batch_smooth::Take_job(int job)
+{
+	while (!pending_jobs.empty())
+	{
+		const int next = pending_jobs.front();
+		pending_jobs.pop_front();
+		Take_one_job(next);
+		if (next == job)
+		{
+			return;
+		}
+	}
+}
+
+void Batch_smooth::Take_one_job(int job)
 {
 	vector<int> counts;
 	vector<unsigned int> offsets, primes;
 	other_factoring->Results(job, counts, offsets, primes);
 	const vector<long long>& tickets = job_tickets[job];
+	const bool split = job_split[job];
 	for (size_t i = 0; i < tickets.size(); i++)
 	{
 		Other_result& r = other_results[tickets[i]];
-		r.state = (counts[i] >= 0) ? OTHER_FACTORED : OTHER_FAILED;
-		if (counts[i] >= 0)
+		const size_t first = split ? 2 * i : i, values = split ? 2 : 1;
+		r.state = OTHER_FACTORED;
+		r.primes.clear();
+		for (size_t v = first; v < first + values; v++)
 		{
-			r.primes.assign(primes.begin() + offsets[i], primes.begin() + offsets[i] + counts[i]);
+			if (counts[v] < 0)
+			{
+				r.state = OTHER_FAILED;
+				break;
+			}
+			r.primes.insert(r.primes.end(), primes.begin() + offsets[v], primes.begin() + offsets[v] + counts[v]);
 		}
+		sort(r.primes.begin(), r.primes.end());
 	}
 	job_tickets.erase(job);
+	job_split.erase(job);
 }
 
 //A batch of relations found, in the writer: the norms of the lines that wait for their other side go to other_stage, and the

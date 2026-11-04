@@ -92,6 +92,8 @@ class Other_side_factoring
 public:
 	virtual ~Other_side_factoring() {}
 	virtual int Submit(const long long* a, const long long* b, int count) = 0;
+	//A job of count values instead of norms: of up to four limbs each, at limbs + 4 i, with their sizes in limbs.
+	virtual int Submit_values(const unsigned long long* limbs, const unsigned int* sizes, int count) = 0;
 	virtual void Results(int job, std::vector<int>& counts, std::vector<unsigned int>& offsets, std::vector<unsigned int>& primes) = 0;
 };
 

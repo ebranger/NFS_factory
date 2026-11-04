@@ -9,13 +9,14 @@ The 3LP candidate file (3lp: save) holds a in 32 bits, as the .bin format, so th
 more (from .ab or text files) are skipped and counted. With 3lp: auto they are checked. A candidate format with a 64-bit a
 would keep them.
 
-The other side's factor lists for .ab files: a batch check of the norms against the primes up to 2^28 (other_stage) took a run of
-4 SNFS-240 files from 74 to 69 s; with no other side at all it was 53 s. What is left: the parts of the norms below 2^28 are factored
-with the leaves by Pollard rho (a warp per norm), and the quarter of the norms with three or more primes above 2^28 are factored
-whole by Pollard rho. Factoring only their cofactor (the primes above 2^28) and the rest apart would save some of that, as would a
-second tree at about 2^26. One walk per thread instead of a warp per norm was tried, and was not faster (the threads of a warp
-diverge). The prime product of that check takes about 8 s to set up, which only matters for short runs. The CPU build factors the
-norms on the CPU (a one-thread SNFS-220 run was about 30 % slower than from the .bin file).
+The other side's factor lists for .ab files: a batch check of the norms against the primes up to 2^28 (other_stage), with the
+cofactors of norms with three or four larger primes factored apart from the rest. With nothing else on the GPU, 4 SNFS-240 files
+took 46 s; 57 s with the norms factored by Pollard rho alone, and 37 s with no other side at all. What is left is mostly the rho
+for the parts of the norms below 2^28, with the leaves. A second tree at 2^26 would split those (rho on 100,000 of them took 0.41 s,
+and 0.29 s for the parts below 2^26 and between 2^26 and 2^28), about 1.6 s of the 46, but needs a stage within the stage. One walk
+per thread instead of a warp per norm was tried, and was not faster (the threads of a warp diverge). The prime product of that
+check takes about 8 s to set up, which only matters for short runs. The CPU build factors the norms on the CPU (a one-thread
+SNFS-220 run was about 30 % slower than from the .bin file).
 
 The thread of the checks now mostly waits for k_rho (Pollard rho on the two large prime cofactors, a thread each, about 240 per
 SNFS-240 batch). A warp per cofactor (32 walks) was tried and was not faster.

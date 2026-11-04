@@ -19,7 +19,8 @@ using namespace std;
 #define MAX_SAVED_PRIMES 64 //Most primes in the saved factor list of a relation from a binary relation file.
 #define MAX_COFACTOR_PRIMES 96 //Most prime factors of a 3LP cofactor, which is less than 2^96.
 #define OTHER_STAGE_BOUND (1 << 28) //The norms of the other side of the relations found are batch checked against the primes up to this
-#define OTHER_STAGE_LARGE_PRIME_BITS 32 //and their cofactors split into two large primes of up to this many bits (see Batch_smooth).
+#define OTHER_STAGE_LARGE_PRIME_BITS 32 //and their cofactors split into two large primes of up to this many bits (see Batch_smooth);
+#define OTHER_STAGE_MAX_COFACTOR_BITS 128 //larger cofactors of up to this many bits are factored apart from the rest of the norm.
 #define OTHER_STAGE_LEVELS 18 //Levels of the tree of those norms: 2^17 of them at a time.
 
 class Batch_smooth;
@@ -159,9 +160,10 @@ private:
 	//The batch check of the other side's norms (on the GPU): a Batch_smooth of the other side, with the primes up to OTHER_STAGE_BOUND
 	//and two large primes, which the writer makes when the first norms come. A relation was already found, so its norm is smooth: the
 	//tree leaves a cofactor of the large primes, which the checks split, and the rest is factored with the leaves. Its results come
-	//back to the writer by number (ticket), through result_sink. The norms with more large primes (about a quarter on SNFS-240) are
-	//factored by other_factoring, in a job for each tree of other_stage, which the writer waits for when it writes them. Most of the
-	//primes of the norms are then found by the tree instead of Pollard rho.
+	//back to the writer by number (ticket), through result_sink. For the norms with more large primes (about a quarter on SNFS-240),
+	//other_factoring factors the cofactor and the rest of the norm apart (or the whole norm, for the few with a cofactor of more than
+	//OTHER_STAGE_MAX_COFACTOR_BITS bits), in jobs for each tree of other_stage, which the writer waits for when it writes them. Most of
+	//the primes of the norms are then found by the tree instead of Pollard rho.
 	Batch_smooth* other_stage;
 	bool other_stage_tried, other_stage_finished;
 	long long other_tickets; //norms given to other_stage
@@ -174,11 +176,19 @@ private:
 	};
 	unordered_map<long long, Other_result> other_results;
 	vector<long long> fallback_tickets, fallback_a, fallback_b; //not factored by other_stage, for the next job
+	vector<long long> split_tickets; //their cofactor and the rest factored apart, for the next job of values:
+	vector<unsigned long long> split_limbs; //the rest and the cofactor of each, at FACTOR_LIMBS limbs each
+	vector<unsigned int> split_sizes;
 	unordered_map<int, vector<long long>> job_tickets; //the tickets of the jobs not yet taken, in their order in the job
+	unordered_map<int, bool> job_split; //a job of values, two for each ticket
+	deque<int> pending_jobs; //in the order they were submitted, which is the order their results must be taken in
 	void Create_other_stage();
 	void Submit_fallback();
 	void Take_job(int job);
-	function<void(long long ticket, long long a, long long b, bool factored, vector<unsigned long long>& primes)> result_sink; //set if this is an other_stage
+	void Take_one_job(int job);
+	//Set if this is an other_stage. For a norm that was not factored, cofactor is the part with the primes above the bound of the tree,
+	//if it is a candidate (NULL if not), and norm the norm.
+	function<void(long long ticket, long long a, long long b, bool factored, vector<unsigned long long>& primes, const mpz_class* cofactor, const mpz_class* norm)> result_sink;
 	long long sink_next; //the ticket of the next relation of an other_stage
 	mutex output_lock;
 	condition_variable output_changed;
