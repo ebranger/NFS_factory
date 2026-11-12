@@ -610,7 +610,7 @@ Batch_smooth::cofactor_result Batch_smooth::Classify_cofactor(Batch_slot& s, mpz
 	}
 
 	//should be one large prime by now. Make sure it is actually a large prime as well.
-	if (number > max_batch_prime && is_probable_prime(number.get_mpz_t()))
+	if (number > (int64)max_batch_prime && is_probable_prime(number.get_mpz_t()))
 	{
 		s.lp1[index] = mpz_get_ui(number.get_mpz_t());
 		s.lp2[index] = 0;
@@ -804,7 +804,7 @@ void Batch_smooth::Run_trees(Batch_slot& s)
 		}
 		else
 		{
-			poly->evaluate_polynomial_homogenous(value, s.a_vals[index], s.b_vals[index]);
+			poly->evaluate_polynomial_homogenous(value, (int64)s.a_vals[index], (int64)s.b_vals[index]);
 		}
 
 		if (*value < 0)
@@ -1064,7 +1064,7 @@ bool Batch_smooth::Complete_other_side(long long a, long long b, vector<unsigned
 bool Batch_smooth::Saved_list_divides(Batch_slot& s, int index)
 {
 	mpz_class norm;
-	other_poly->evaluate_polynomial_homogenous(&norm, s.a_vals[index], s.b_vals[index]);
+	other_poly->evaluate_polynomial_homogenous(&norm, (int64)s.a_vals[index], (int64)s.b_vals[index]);
 	if (norm == 0)
 	{
 		return false;
@@ -1095,6 +1095,14 @@ Batch_smooth::relation_status Batch_smooth::Format_relation(Batch_slot& s, int i
 	int num_large = 0;
 	string checked_side_list; //factors of the relation value that was batch checked.
 	string other_side_list; //factors of the other side, as saved or rebuilt.
+
+	if (keys_only)
+	{
+		//Smoothness is settled by the batch check and the cofactor split; only the pair is written.
+		waiting = false;
+		relation_text = to_string(a_vals[index]) + "," + to_string(b_vals[index]) + "\n";
+		return RELATION_WRITTEN;
+	}
 
 	if (Factor_checked_side(s, index, large, num_large, factors, num_factors) != RELATION_WRITTEN)
 	{
@@ -1190,7 +1198,7 @@ Batch_smooth::relation_status Batch_smooth::Factor_checked_side(Batch_slot& s, i
 		{
 			num_large = factor_smooth(large, value.get_mpz_t(), MAX_COFACTOR_PRIMES);
 		}
-		poly->evaluate_polynomial_homogenous(&temp, a_vals[index], b_vals[index]);
+		poly->evaluate_polynomial_homogenous(&temp, (int64)a_vals[index], (int64)b_vals[index]);
 		mpz_abs(temp.get_mpz_t(), temp.get_mpz_t());
 
 		if (num_large < 0 || temp == 0 || !mpz_divisible_p(temp.get_mpz_t(), value.get_mpz_t()))

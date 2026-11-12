@@ -209,6 +209,11 @@ private:
 	Polynomial* poly;
 	Polynomial* other_poly; //for rebuilding the other side's factor list
 	bool rebuild_all; //for every relation, not only those without a saved list
+public:
+	//"format: keys": write only a,b of the relations found, without factoring them or rebuilding the other side (for building
+	//a store of pairs, where only smoothness matters).
+	bool keys_only = false;
+private:
 
 	bool using_snfs_deg4_binomial;
 	bool binomial_fits; //the coefficients of the binomial fit in 63 bits, for Binomial_value_native.
