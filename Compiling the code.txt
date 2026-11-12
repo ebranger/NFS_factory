@@ -87,3 +87,34 @@ faster, edit CodeGeneration in NFS_factory\NFS_factory_GPU.vcxproj. CUDA 13 supp
 later. Another CUDA version needs the "CUDA 13.4" props and targets imports there changed to that version.
 
 The CPU build needs no CUDA. Both builds take the same polynomial and relation files and write the same relations.
+
+6. Linux
+--------
+
+The Makefile in the main folder builds both programs with GCC and MPIR. Linux/include/intrin.h stands in for the intrinsics of
+Visual Studio. MPIR is built from its sources (https://github.com/wbhart/mpir), with YASM and the autotools:
+
+  apt install build-essential yasm autoconf automake libtool texinfo
+  git clone https://github.com/wbhart/mpir && cd mpir
+  ./autogen.sh
+  ./configure --prefix=/opt/mpir --enable-cxx
+  make && make install
+
+MPIR's configure picks the assembly code for the processor, but does not know many newer ones, and then builds its generic
+x86_64 code (./config.guess shows x86_64-unknown-linux-gnu).
+Then --build=skylakeavx-pc-linux-gnu selects the code of lib_mpir_skylake_avx (for processors with AVX2).
+MPIR's sources are old enough that GCC 15 may not build them; CC=gcc-13 CXX=g++-13 before ./configure sets another compiler.
+
+Then, in the main folder of NFS_factory:
+
+  make                 the CPU build, build/NFS_factory, and the utilities
+  make gpu             the GPU build, build/NFS_factory_gpu, which needs the CUDA Toolkit (nvcc)
+  make utils           only the utilities of the Utilities folder, build/RelationsToBinaryFormat and build/RelationFilterSplit
+  make both            all of them
+
+RelationFilterSplit.cpp is saved as UTF-16, which GCC does not read; the Makefile compiles a UTF-8 copy that iconv (part of
+the C library tools on Linux) writes to build/utils.
+
+MPIR is linked statically. MPIR_DIR=<folder> sets where MPIR is installed (default /opt/mpir). The GPU build compiles for the GPUs
+of the machine (CUDA_ARCH=native); CUDA_ARCH="75 86 120" builds for others. nvcc needs a host compiler that its CUDA version
+supports, set with NVCC_CCBIN, for example make gpu NVCC_CCBIN=g++-13 for CUDA 12.4.

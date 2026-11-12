@@ -3,10 +3,15 @@
 #include <iomanip>
 #include <mutex>
 #include <chrono>
-#include <io.h>
 #include <stdio.h>
+#ifdef _WIN32
+#include <io.h>
 #include <windows.h>
 #include <psapi.h>
+#else
+#include <unistd.h>
+#include <sys/resource.h>
+#endif
 
 using namespace std;
 
@@ -110,11 +115,19 @@ void print_profile(unsigned long long total_cycles)
 		}
 	}
 
+#ifdef _WIN32
 	PROCESS_MEMORY_COUNTERS memory;
 	if (GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory)))
 	{
 		cout << "Peak memory use: " << memory.PeakWorkingSetSize / (1024 * 1024) << " MB" << endl;
 	}
+#else
+	struct rusage usage;
+	if (getrusage(RUSAGE_SELF, &usage) == 0)
+	{
+		cout << "Peak memory use: " << usage.ru_maxrss / 1024 << " MB" << endl; //ru_maxrss is in kB on Linux
+	}
+#endif
 
 	cout.unsetf(ios::fixed);
 	cout << setprecision(6);
@@ -134,7 +147,11 @@ static long long console_ms()
 
 bool console_is_terminal()
 {
+#ifdef _WIN32
 	static const bool terminal = _isatty(_fileno(stdout)) != 0;
+#else
+	static const bool terminal = isatty(fileno(stdout)) != 0;
+#endif
 	return terminal;
 }
 

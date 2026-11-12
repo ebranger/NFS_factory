@@ -45,6 +45,8 @@ and the batch factorization code in CADO-NFS.
 #include <windows.h>
 #else
 #include <unistd.h>
+#include <sys/stat.h>
+#define _fgetc_nolock getc_unlocked
 #endif
 
 using namespace std;
@@ -71,6 +73,7 @@ struct nfs_parameters {
 	int max_algebraic_coefficient_bits;
 	int print_limit; // Skip printing all primes less than this.
 	bool cado_format; // Print all primes on both sides, with multiplicity, as CADO-NFS requires.
+	bool keys_only; // "format: keys": write only a,b of the relations found (see Batch_smooth::keys_only).
 	int tree_levels; // Maximum number of levels in the remainder tree. 0 means the default.
 	int tree_levels_3lp; // Maximum number of levels in the remainder tree of a run on a 3LP candidate file.
 	bool save_3lp; // 3LP candidates (mfb more than 2 lpb) are saved to a file instead of checked in a second stage during the run.
@@ -246,9 +249,14 @@ bool read_polynomial(string filename, nfs_parameters* params)
 				{
 					params->cado_format = false;
 				}
+				else if (line == "keys")
+				{
+					params->cado_format = false;
+					params->keys_only = true;
+				}
 				else
 				{
-					cout << "Unknown output format " << line << " on line " << line_number << " of the polynomial file. Use msieve or cado." << endl;
+					cout << "Unknown output format " << line << " on line " << line_number << " of the polynomial file. Use msieve, cado or keys." << endl;
 					return false;
 				}
 			}
@@ -387,23 +395,28 @@ bool relation_in_range(long long a, long long b, nfs_parameters* param)
 	return llabs(a) <= param->maxa && b <= param->maxb;
 }
 
-//The size of a file in bytes, or -1 if it cannot be opened.
+//The size of a file in bytes, or -1 if it cannot be opened or is not a regular file (opening a named pipe here would take
+//data from the program writing into it).
 long long file_size(const string& name)
 {
+#ifdef _WIN32
 	FILE* f = fopen(name.c_str(), "rb");
 	if (f == NULL)
 	{
 		return -1;
 	}
-#ifdef _WIN32
 	_fseeki64(f, 0, SEEK_END);
 	long long size = _ftelli64(f);
-#else
-	fseeko(f, 0, SEEK_END);
-	long long size = (long long)ftello(f);
-#endif
 	fclose(f);
 	return size;
+#else
+	struct stat st;
+	if (stat(name.c_str(), &st) != 0 || !S_ISREG(st.st_mode))
+	{
+		return -1;
+	}
+	return (long long)st.st_size;
+#endif
 }
 
 //Cut a file to size bytes. Returns false if that failed.
@@ -841,12 +854,14 @@ read_result read_batch_from_file(string filename, Batch_smooth* batch, nfs_param
 
 //A file read in order, in blocks of READ_BUFFER_SIZE. On Windows, READ_AHEAD_BLOCKS reads are in flight at once (overlapped I/O),
 //so that a hard disk keeps reading while the relations are parsed, or the reader waits for a batch: one read at a time, as fread
-//does, got about 180 MB/s from a disk that reads 260 MB/s. Elsewhere, fread.
+//does, got about 180 MB/s from a disk that reads 260 MB/s. Elsewhere, fread. A stream (Open_stream: standard input, or a pipe)
+//is read with fread everywhere.
 class Block_reader
 {
 public:
 	Block_reader()
 	{
+		stream = NULL;
 #ifdef _WIN32
 		handle = INVALID_HANDLE_VALUE;
 #else
@@ -881,17 +896,41 @@ public:
 		return true;
 #else
 		file = fopen(name.c_str(), "rb");
-		if (file != NULL && offset > 0)
+		if (file != NULL && offset > 0 && fseeko(file, (off_t)offset, SEEK_SET) != 0)
 		{
-			fseeko(file, (off_t)offset, SEEK_SET);
+			//Not seekable (a pipe): reading from the start instead would give the wrong relations.
+			fclose(file);
+			file = NULL;
 		}
 		return file != NULL;
 #endif
 	}
 
+	//Read standard input ("-") or a file that is not a regular file (a named pipe) from its start, in order, with fread. It can
+	//be opened only once: what was read cannot be read again, so the caller skips what it does not need by reading past it.
+	bool Open_stream(const string& name)
+	{
+		if (name == "-")
+		{
+#ifdef _WIN32
+			_setmode(_fileno(stdin), _O_BINARY);
+#endif
+			stream = stdin;
+		}
+		else
+		{
+			stream = fopen(name.c_str(), "rb");
+		}
+		return stream != NULL;
+	}
+
 	//Up to max of the next bytes of the file into out. Returns how many, 0 at the end of the file (or on a read error).
 	size_t Read(unsigned char* out, size_t max)
 	{
+		if (stream != NULL)
+		{
+			return fread(out, 1, max, stream);
+		}
 #ifdef _WIN32
 		size_t written = 0;
 		while (written < max && !finished)
@@ -940,6 +979,15 @@ public:
 
 	void Close()
 	{
+		if (stream != NULL)
+		{
+			if (stream != stdin)
+			{
+				fclose(stream);
+			}
+			stream = NULL;
+			return;
+		}
 #ifdef _WIN32
 		if (handle == INVALID_HANDLE_VALUE)
 		{
@@ -988,7 +1036,24 @@ private:
 #else
 	FILE* file;
 #endif
+	FILE* stream; //standard input or a pipe (Open_stream), else NULL
 };
+
+//Whether a relation file is read as a stream (Block_reader::Open_stream): "-" is standard input, and a name that is not a regular
+//file (a named pipe, or /dev/stdin) cannot be opened twice or seeked in either.
+static bool is_stream_input(const string& name)
+{
+	if (name == "-")
+	{
+		return true;
+	}
+#ifdef _WIN32
+	return false;
+#else
+	struct stat st;
+	return stat(name.c_str(), &st) == 0 && !S_ISREG(st.st_mode);
+#endif
+}
 
 //A buffer for reading a binary file in large blocks.
 struct read_buffer
@@ -1142,22 +1207,47 @@ read_result read_batch_from_binary_file(string filename, Batch_smooth* batch, nf
 read_result read_batch_from_ab_file(string filename, Batch_smooth* batch, nfs_parameters* param, run_progress& progress, long long skip_records)
 {
 	unsigned int header[AB_HEADER_BYTES / sizeof(unsigned int)];
-	FILE* f = fopen(filename.c_str(), "rb");
-	if (f == NULL)
+	const bool stream = is_stream_input(filename);
+	const string name = (filename == "-") ? "standard input" : filename;
+	read_buffer input;
+	input.data.resize(READ_BUFFER_SIZE);
+	input.position = 0;
+	input.filled = 0;
+	bool header_read;
+	if (stream)
 	{
-		console_message("Failed to open input relation file " + filename);
-		return READ_FAILED;
+		//A stream (standard input, a pipe) is read once, from its start: the header, then the relations.
+		if (!input.file.Open_stream(filename))
+		{
+			console_message("Failed to open input relation file " + name);
+			return READ_FAILED;
+		}
+		header_read = input.ensure(AB_HEADER_BYTES);
+		if (header_read)
+		{
+			memcpy(header, input.data.data(), AB_HEADER_BYTES);
+			input.position = AB_HEADER_BYTES;
+		}
 	}
-	const bool header_read = fread(header, AB_HEADER_BYTES, 1, f) == 1;
-	fclose(f);
+	else
+	{
+		FILE* f = fopen(filename.c_str(), "rb");
+		if (f == NULL)
+		{
+			console_message("Failed to open input relation file " + filename);
+			return READ_FAILED;
+		}
+		header_read = fread(header, AB_HEADER_BYTES, 1, f) == 1;
+		fclose(f);
+	}
 	if (!header_read || memcmp(header, "NFAB", 4) != 0 || header[1] != AB_VERSION)
 	{
-		console_message(filename + " is not a relation file of only a and b (.ab) of version " + to_string(AB_VERSION) + ".");
+		console_message(name + " is not a relation file of only a and b (.ab) of version " + to_string(AB_VERSION) + ".");
 		return READ_FAILED;
 	}
 	if (header[2] == (unsigned int)param->smoothness_checking_side)
 	{
-		console_message("The relations of " + filename + " were sieved for side " + to_string(header[2]) + ", which is the side to check here (side in the polynomial file).");
+		console_message("The relations of " + name + " were sieved for side " + to_string(header[2]) + ", which is the side to check here (side in the polynomial file).");
 		return READ_FAILED;
 	}
 
@@ -1166,16 +1256,28 @@ read_result read_batch_from_ab_file(string filename, Batch_smooth* batch, nfs_pa
 	long long records = skip_records; //relations read, those done by an earlier run included
 	bool stopped = false;
 
-	//The relations done by an earlier run are skipped by starting after them.
-	read_buffer input;
-	if (!input.file.Open(filename, AB_HEADER_BYTES + AB_RECORD_BYTES * skip_records))
+	if (stream)
 	{
+		//The relations done by an earlier run are skipped by reading past them.
+		unsigned long long skip = (unsigned long long)AB_RECORD_BYTES * (unsigned long long)skip_records;
+		while (skip > 0 && input.ensure(1))
+		{
+			const size_t n = (size_t)std::min<unsigned long long>(skip, input.filled - input.position);
+			input.position += n;
+			skip -= n;
+		}
+		if (skip > 0)
+		{
+			console_message(name + " ended before the " + to_string(skip_records) + " relations done by the earlier run: it is not the same input.");
+			return READ_FAILED;
+		}
+	}
+	else if (!input.file.Open(filename, AB_HEADER_BYTES + AB_RECORD_BYTES * skip_records))
+	{
+		//The relations done by an earlier run are skipped by starting after them.
 		console_message("Failed to open input relation file " + filename);
 		return READ_FAILED;
 	}
-	input.data.resize(READ_BUFFER_SIZE);
-	input.position = 0;
-	input.filled = 0;
 
 	while (input.ensure(AB_RECORD_BYTES))
 	{
@@ -1214,7 +1316,7 @@ read_result read_batch_from_ab_file(string filename, Batch_smooth* batch, nfs_pa
 
 	if (partial)
 	{
-		console_message("The relation file " + filename + " ends with part of a relation, which was skipped.");
+		console_message("The relation file " + name + " ends with part of a relation, which was skipped.");
 	}
 
 	if (skipped_relations > 0)
@@ -1309,6 +1411,7 @@ int main(int argc, char* argv[])
 		cout << "-verbose also prints a line for each batch." << endl;
 		cout << "Relation files: text (a,b:rational primes:algebraic primes), binary (.bin), or only a and b (.ab), whose factor list of the" << endl;
 		cout << "side that is not checked is rebuilt for the relations found (on the GPU in the GPU build). A .3lp file holds 3LP candidates." << endl;
+		cout << "A relation file named - is an .ab file read from standard input, as in: xz -dc store.ab.xz | NFS_factory poly - output" << endl;
 		return 0;
 	}
 	omp_set_num_threads(threads);
@@ -1346,6 +1449,11 @@ int main(int argc, char* argv[])
 			return -1;
 		}
 	}
+	if (count(progress.files.begin(), progress.files.end(), string("-")) > 1)
+	{
+		cout << "Standard input (-) can be read only once, but the list names it more than once." << endl;
+		return -1;
+	}
 	progress.resume_filename = outputfile + ".resume";
 	progress.output_filename = outputfile;
 	progress.file_index = 0;
@@ -1359,7 +1467,8 @@ int main(int argc, char* argv[])
 
 	Batch_smooth* batch;
 
-	clock_t time;
+	//Wall-clock time: clock() is wall time with MSVC, but the CPU time of all threads on Linux.
+	std::chrono::steady_clock::time_point time;
 	unsigned long long program_start = profile_now();
 
 	nfs_parameters* param = new nfs_parameters();
@@ -1369,6 +1478,7 @@ int main(int argc, char* argv[])
 
 	param->print_limit = 1000; //Msieve default.
 	param->cado_format = false;
+	param->keys_only = false;
 	param->tree_levels = 0;
 	param->tree_levels_3lp = STAGE2_ONLY_TREE_LEVELS;
 	param->save_3lp = false;
@@ -1473,17 +1583,19 @@ int main(int argc, char* argv[])
 		cout << "Writing relations in CADO-NFS format, with all primes on both sides." << endl;
 	}
 
-	time = clock();
+	time = std::chrono::steady_clock::now();
 	unsigned long long t = profile_now();
 	if (candidate_input)
 	{
 		//The cofactors are less than 2^(3 lbp). The tree size is limited by 3lptreelevels instead of treelevels.
 		cout << "Checking 3LP candidates against all primes up to 2^" << lbp << "." << endl;
 		batch = new Batch_smooth(lim, lbp, mfb, 3 * lbp, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->cado_format, param->tree_levels_3lp, param->backend, true);
+		batch->keys_only = param->keys_only;
 	}
 	else
 	{
 		batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->cado_format, param->tree_levels, param->backend, false, param->pipeline);
+		batch->keys_only = param->keys_only;
 	}
 
 	if (three_lp)
@@ -1506,6 +1618,7 @@ int main(int argc, char* argv[])
 		{
 			cout << "Checking 3LP candidates of up to " << mfb << " bits against all primes up to 2^" << lbp << " during the run." << endl;
 			second_stage = new Batch_smooth(lim, lbp, mfb, 3 * lbp, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->cado_format, param->tree_levels, param->backend, true);
+			second_stage->keys_only = param->keys_only;
 		}
 
 		if (!batch->Set_three_lp_handling(second_stage, candidate_filename))
@@ -1516,7 +1629,7 @@ int main(int argc, char* argv[])
 		}
 	}
 	profile_add(PROF_SETUP, t);
-	cout << "Prime products set up, it took " << (clock() - time) / CLOCKS_PER_SEC << " seconds." << endl;
+	cout << "Prime products set up, it took " << std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - time).count() << " seconds." << endl;
 
 	//What the run does: the batches, and the input.
 	long long input_bytes = 0;
@@ -1531,7 +1644,7 @@ int main(int argc, char* argv[])
 	cout.unsetf(ios::fixed);
 	cout << setprecision(6);
 
-	time = clock();
+	time = std::chrono::steady_clock::now();
 
 	long long total_num_relations = 0;
 
@@ -1576,9 +1689,9 @@ int main(int argc, char* argv[])
 			//3LP candidates saved by an earlier run, with a .3lp extension.
 			result = read_batch_from_binary_file(file, batch, param, true, progress, skip_records);
 		}
-		else if (ends_with(file, ".ab"))
+		else if (ends_with(file, ".ab") || file == "-")
 		{
-			//Only a and b, with a .ab extension.
+			//Only a and b, with a .ab extension, or from standard input.
 			result = read_batch_from_ab_file(file, batch, param, progress, skip_records);
 		}
 		else if (file.find(".bin") == string::npos)
@@ -1627,7 +1740,7 @@ int main(int argc, char* argv[])
 	unsigned long long reader_cycles = profile_now() - t;
 	profile_cycles[PROF_READ] += reader_cycles - batch->Get_reader_blocked_cycles();
 
-	cout << "Batch-checking all numbers took " << (clock() - time) / CLOCKS_PER_SEC << " seconds. Found a total of " << total_num_relations << " relations." << endl;
+	cout << "Batch-checking all numbers took " << std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - time).count() << " seconds. Found a total of " << total_num_relations << " relations." << endl;
 
 	//A summary for a driver script: relations found by this run and in total, whether the target was reached, and whether all files are done.
 	string status_filename = outputfile + ".status";

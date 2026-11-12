@@ -2913,17 +2913,18 @@ bool gpu_init(int device)
 	}
 	cudaDeviceProp properties;
 	CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
-	if (properties.major * 10 + properties.minor < 75)
-	{
-		printf("GPU %d (%s) has compute capability %d.%d, and the GPU build needs 7.5 or later. Use the CPU build (NFS_factory).\n", device, properties.name,
-			properties.major, properties.minor);
-		return false;
-	}
-	gpu_device = device;
 	CUDA_CHECK(cudaSetDevice(device));
 	//The threads that wait for the GPU sleep instead of spinning, which leaves the CPU to the threads that check the batches
 	//(the waits get a little longer).
 	CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+	cudaFuncAttributes attributes;
+	cudaError_t image = cudaFuncGetAttributes(&attributes, k_list_smooth);
+	if (image != cudaSuccess)
+	{
+		printf("GPU %d (%s) has compute capability %d.%d, which this build of NFS_factory has no code for.\n", device, properties.name, properties.major, properties.minor);
+		return false;
+	}
+	gpu_device = device;
 	gpu_device_set = true;
 	printf("GPU %d: %s, compute capability %d.%d, %.1f GB.\n", device, properties.name, properties.major, properties.minor, properties.totalGlobalMem / 1e9);
 	return true;
