@@ -143,6 +143,24 @@ private:
 };
 
 #define INVERSE_MAX_ERROR (1 << 16)
+
+//The root X of the product tree can be much larger than the prime product P (the GPU build chooses its trees so). The fraction
+//P 2^precision / X then has only about bits(P) + guard significant bits, and X is needed only to that many bits more than its
+//size: with t low bits of X left out, X_t = floor(X / 2^t) + 1, the fraction P 2^(precision - t) / X_t is at most the true one, and
+//less by under 2^-ROOT_SPARE_BITS of a unit when X_t keeps bits(P) + guard + ROOT_SPARE_BITS bits. The inverse and the products of
+//the root step then have the size of P instead of that of X. root_truncation gives t (a whole number of limbs), or 0 when the
+//gain would be small; guard is precision - bits(X).
+#define ROOT_SPARE_BITS 66
+#define ROOT_MIN_TRUNCATION 4096
+inline mp_bitcnt_t root_truncation(mp_bitcnt_t root_bits, mp_bitcnt_t product_bits, mp_bitcnt_t guard)
+{
+	const mp_bitcnt_t kept = product_bits + guard + ROOT_SPARE_BITS;
+	if (product_bits >= root_bits || root_bits < kept + ROOT_MIN_TRUNCATION)
+	{
+		return 0;
+	}
+	return (root_bits - kept) / GMP_LIMB_BITS * GMP_LIMB_BITS;
+}
 #define CHUNKED_REDUCTION_MAX_PARTS 32 //A prime product of more parts of the size of the root than this is reduced by one division on the CPU.
 #define INVERSE_EXACT_LIMBS 2000 //Inverses of up to this many limbs are computed exactly by MPIR.
 #define INVERSE_MARGIN (1 << 12) //Subtracted from the Newton inverse, which can be a few units too large.

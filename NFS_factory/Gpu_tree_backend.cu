@@ -233,6 +233,9 @@ private:
 	void Mod_2expm1(Gpu_number& result, const uint64_t* a, size_t a_limbs, mp_bitcnt_t L);
 	void Multiply(Gpu_number& out, const uint64_t* a, size_t a_limbs, const uint64_t* b, size_t b_limbs, long long b_key = -1);
 	mp_bitcnt_t Product_mod(Gpu_number& out, const uint64_t* y, size_t y_limbs, const uint64_t* x, size_t x_limbs, mp_bitcnt_t min_L);
+	void Multiply_kept(Gpu_number& out, const uint64_t* a, size_t a_limbs, const uint64_t* x, size_t x_limbs);
+	bool y_transform_kept = false; //Y holds the transform of the x of the last Product_mod, with kept_plan
+	Ntt_plan kept_plan;
 	bool Transform_pair(const Ntt_plan& plan, const uint64_t* a, const uint64_t* b);
 	void Sizes(const uint64_t* a, size_t a_limbs, const uint64_t* b, size_t b_limbs);
 	mp_bitcnt_t Bits(const uint64_t* a, size_t limbs);
@@ -252,7 +255,7 @@ private:
 	long long cached_key;
 	Ntt_plan cached_plan;
 	Gpu_number level[ROOT_MAX_DEPTH]; //the inverses of the Newton iteration, of the whole root at 0
-	Gpu_number shifted, d, magnitude, product, remainder, part, quotient, temp, temp2, prime_product_gpu;
+	Gpu_number shifted, d, magnitude, product, remainder, part, quotient, temp, temp2, prime_product_gpu, truncated;
 	mpz_srcptr prime_product_host; //of prime_product_gpu
 	size_t prime_product_limbs;
 	std::vector<mp_limb_t> host_a, host_v;
@@ -419,6 +422,7 @@ mp_bitcnt_t Gpu_root::Product_mod(Gpu_number& out, const uint64_t* y, size_t y_l
 {
 	Sizes(y, y_limbs, x, x_limbs);
 	Ntt_plan plan;
+	y_transform_kept = false;
 	if (!ntt_plan_cyclic(plan, min_L, host_words[1], host_words[3]))
 	{
 		To_mpz(host_x.get_mpz_t(), y, host_words[0]);
@@ -437,7 +441,30 @@ mp_bitcnt_t Gpu_root::Product_mod(Gpu_number& out, const uint64_t* y, size_t y_l
 	out.Resize(Gpu_ntt::Combine_limbs(plan));
 	Gpu_level o = { out.d, out.n, words + 4, 1 };
 	gpu->Combine_products(plan, PRODUCTS_PLAIN, X, Y, X, 1, true, o, 0);
+	//The transform of x stays in Y, for Multiply_kept.
+	y_transform_kept = true;
+	kept_plan = plan;
 	return plan.L();
+}
+
+//out = a * x, for the x of the last Product_mod (given again, with its size), whose transform is used again if the plan of that
+//product is also one for this product without wraparound. The product is exact either way, so it is the same number as Multiply's.
+void Gpu_root::Multiply_kept(Gpu_number& out, const uint64_t* a, size_t a_limbs, const uint64_t* x, size_t x_limbs)
+{
+	if (y_transform_kept)
+	{
+		Sizes(a, a_limbs, x, x_limbs);
+		if (host_words[0] != 0 && host_words[2] != 0 && ntt_plan_valid(kept_plan, host_words[1], host_words[3], false))
+		{
+			out.Resize(Gpu_ntt::Combine_limbs(kept_plan));
+			Gpu_level o = { out.d, out.n, words + 4, 1 };
+			Gpu_level la = { const_cast<uint64_t*>(a), host_words[0], words, 1 };
+			gpu->Forward(kept_plan, la, X, 0);
+			gpu->Combine_products(kept_plan, PRODUCTS_PLAIN, X, Y, X, 1, false, o, 0);
+			return;
+		}
+	}
+	Multiply(out, a, a_limbs, x, x_limbs);
 }
 
 //The inverse of the n limbs at a (top bit set) as Tree_products::Newton_inverse, into level[depth]: an approximation of
@@ -468,7 +495,9 @@ void Gpu_root::Newton_inverse(int depth, const uint64_t* a, size_t n)
 	Gpu_number& v_h = level[depth + 1];
 
 	//D modulo 2^L - 1, from -2^(L - 1) to 2^(L - 1): a v_h - B^(n + h), with B^(n + h) modulo 2^L - 1 = 2^k.
-	const mp_bitcnt_t L = Product_mod(d, a, n, v_h.d, v_h.n, GMP_LIMB_BITS * (n + 2));
+	//L of two limbs more than D needs, so that the plan also holds the product of the top of D and v_h below without wraparound
+	//(of about n + 1 limbs), and the transform of v_h is used for both. D is exact for any L of at least n + 2 limbs.
+	const mp_bitcnt_t L = Product_mod(d, a, n, v_h.d, v_h.n, GMP_LIMB_BITS * (n + 4));
 	const mp_bitcnt_t k = (GMP_LIMB_BITS * (n + h)) % L;
 	gpu->Add(d.d, d.n, d.d, d.n, NULL, 0, (size_t)(k / 64), 1ULL << (k % 64), true, words + 6, 0);
 	if (Carry())
@@ -489,7 +518,7 @@ void Gpu_root::Newton_inverse(int depth, const uint64_t* a, size_t n)
 	//v_h D / B^(2h), with only the top part of D, as floor(floor(D / B^(h - 1)) v_h / B^(h + 1)).
 	size_t d1_limbs, d3_limbs;
 	const uint64_t* d1 = Floor_shift(*D, h - 1, negative, d1_limbs);
-	Multiply(product, d1, d1_limbs, v_h.d, v_h.n);
+	Multiply_kept(product, d1, d1_limbs, v_h.d, v_h.n);
 	const uint64_t* d3 = Floor_shift(product, h + 1, negative, d3_limbs);
 
 	//v = v_h B^(n - h) - D v_h / B^(2h)
@@ -610,6 +639,19 @@ void Gpu_root::Barrett_reduce(Gpu_number& r, const uint64_t* a, size_t a_limbs, 
 
 void Gpu_root::Compute(Gpu_number& fraction, const uint64_t* X, size_t x_limbs, mp_bitcnt_t bits, mp_bitcnt_t precision, mpz_srcptr prime_product)
 {
+	//A root much larger than the prime product is used without its low bits, as in Cpu_tree_backend::Scaled_root.
+	const mp_bitcnt_t truncation = root_truncation(bits, mpz_sizeinbase(prime_product, 2), precision - bits);
+	if (truncation > 0)
+	{
+		const size_t kept_limbs = x_limbs - (size_t)(truncation / GMP_LIMB_BITS);
+		truncated.Resize(kept_limbs + 1);
+		gpu->Shift(truncated.d, truncated.n, X, x_limbs, (long long)truncation, 0, false, 0);
+		gpu->Add(truncated.d, truncated.n, truncated.d, truncated.n, NULL, 0, 0, 1, false, NULL, 0);
+		Sizes(truncated.d, truncated.n, truncated.d, truncated.n);
+		//The truncated root is not truncated again: its size leaves less than ROOT_MIN_TRUNCATION bits to leave out.
+		Compute(fraction, truncated.d, host_words[0], host_words[1], precision - truncation, prime_product);
+		return;
+	}
 	const size_t limbs = x_limbs;
 	const mp_bitcnt_t normalize = limbs * GMP_LIMB_BITS - bits;
 
@@ -2486,6 +2528,11 @@ void Gpu_tree_backend::Scaled_root(mpz_srcptr prime_product)
 		Set_stride(top, 1, fraction.n);
 	}
 	CUDA_CHECK(cudaMemcpy(top.level.limbs, fraction.d, fraction.n * sizeof(uint64_t), cudaMemcpyDeviceToDevice));
+	if (fraction.n < top.level.stride)
+	{
+		//The fraction can be shorter than the root was.
+		CUDA_CHECK(cudaMemsetAsync(top.level.limbs + fraction.n, 0, (top.level.stride - fraction.n) * sizeof(uint64_t), 0));
+	}
 	gpu->Size(top.level.limbs, fraction.n, top.level.size, NULL, 0);
 	if (levels < 3)
 	{

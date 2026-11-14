@@ -362,6 +362,15 @@ void Cpu_tree_backend::Scaled_root(mpz_srcptr prime_product)
 {
 	mpz_ptr root = node[0].get_mpz_t();
 	mp_bitcnt_t precision = node_bits[0] + guard;
+
+	//A root much larger than the prime product is used without its low bits (see root_truncation).
+	const mp_bitcnt_t truncation = root_truncation(node_bits[0], mpz_sizeinbase(prime_product, 2), guard);
+	if (truncation > 0)
+	{
+		mpz_tdiv_q_2exp(root, root, truncation);
+		mpz_add_ui(root, root, 1);
+		precision -= truncation;
+	}
 	mp_bitcnt_t bits = mpz_sizeinbase(root, 2);
 	mp_size_t limbs = abs(root->_mp_size);
 	mp_bitcnt_t normalize = limbs * GMP_LIMB_BITS - bits;
