@@ -1,7 +1,5 @@
 This is a list of things that could be improved.
 
-Check that the polynomials match the input number. At currently I assume that this check is done by the python driver.
-
 A Linux build (CMake). The code has fallbacks for the Windows-specific parts (free host memory, file positions), but the
 binary relation files are read with fread there, without the read-ahead of the Windows build, and it has not been built or tested.
 

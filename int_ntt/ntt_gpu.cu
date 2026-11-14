@@ -15,6 +15,11 @@ void cuda_check(cudaError_t error, const char* call, const char* file, int line)
 	if (error != cudaSuccess)
 	{
 		fprintf(stderr, "CUDA error %s in %s at %s:%d\n", cudaGetErrorString(error), call, file, line);
+		if (error == cudaErrorMemoryAllocation)
+		{
+			fprintf(stderr, "The GPU ran out of memory. Other programs may be using it; otherwise use fewer batches at once (pipeline in the polynomial file, "
+				"down to 1) or smaller trees (treelevels). A run that is started again continues from its resume file.\n");
+		}
 		exit(3);
 	}
 }

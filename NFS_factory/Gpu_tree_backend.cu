@@ -2121,6 +2121,14 @@ static void set_trial_primes()
 
 Gpu_tree_backend::Gpu_tree_backend(int levels, int max_bits_in_input) : Cpu_tree_backend(new Gpu_tree_products, levels, max_bits_in_input, false)
 {
+	//The root is the product of all leaves, and the products of the tree need a transform for it: of at most 2^NTT_MAX_LOG_LENGTH
+	//coefficients of 64 bits. Stop here if the tree is too large for that, since the tree itself has no fallback.
+	if (((unsigned long long)max_bits_in_input << (levels - 1)) + 4096 > ((unsigned long long)NTT_MAX_COEFFICIENT_BITS << NTT_MAX_LOG_LENGTH))
+	{
+		fprintf(stderr, "A tree of %d levels of relation values of up to %d bits is too large for the GPU transforms. Use fewer levels (treelevels in the polynomial file).\n",
+			levels, max_bits_in_input);
+		exit(3);
+	}
 	gpu_start();
 	set_trial_primes();
 	gpu = &static_cast<Gpu_tree_products*>(products)->gpu;
@@ -3073,7 +3081,7 @@ void gpu_product_list(const uint32_t* factors, size_t n, mpz_class& result)
 }
 
 //As many trees as fit in 70 % of the free memory of the GPU (the rest is left for the second stage, the products of the setup,
-//and other programs), from 1 to 5. A tree takes about 20 to 25 bytes per bit of its leaves, measured for 17 to 21 levels.
+//and other programs), from 1 to GPU_MAX_PIPELINE. A tree takes about 20 to 25 bytes per bit of its leaves, measured for 17 to 21 levels.
 int gpu_pipeline(int levels, int max_bits_in_input, bool report)
 {
 	gpu_start();

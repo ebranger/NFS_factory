@@ -21,6 +21,7 @@ using namespace std;
 #define OTHER_STAGE_BOUND (1 << 28) //The norms of the other side of the relations found are batch checked against the primes up to this
 #define OTHER_STAGE_LARGE_PRIME_BITS 32 //and their cofactors split into two large primes of up to this many bits (see Batch_smooth);
 #define OTHER_STAGE_MAX_COFACTOR_BITS 128 //larger cofactors of up to this many bits are factored apart from the rest of the norm.
+#define MAX_OUTPUT_QUEUE 4 //Batches of relations found that can wait for the writer before the checks wait for it.
 #define OTHER_STAGE_LEVELS 18 //Levels of the tree of those norms: 2^17 of them at a time.
 
 class Batch_smooth;
@@ -40,6 +41,8 @@ struct Output_batch
 	};
 	vector<Waiting> waiting;
 	bool batch_end; //a batch of the object that writes: after it is written, its position goes to the batch done callback
+	long long candidate_bytes; //the size of the 3LP candidate file with the candidates of the batch, -1 if there is none
+	bool failed; //the candidates of the batch could not be written
 	long long position[2];
 };
 
@@ -56,6 +59,7 @@ struct Batch_slot
 	int entries;
 	long long sequence; //the number of the batch
 	long long position[2]; //the read position of its last relation, as given by Set_read_position
+	long long candidate_bytes; //see Output_batch
 	size_t root_bits; //of the product tree
 	bool tree_factors; //the tree factored the smooth relations of the batch (Tree_backend::Leaf_factors)
 	mpz_class temp_number;
@@ -92,6 +96,11 @@ public:
 	long long Get_num_3lp_relations_found(); //by the 3LP second stage
 	long long Get_num_relations_checked(); //relations of the batches checked so far (not counting the second stage)
 	int Get_batch_size() { return num_relations_per_batch; }
+	//Whether writing the relations found (or the 3LP candidates) failed. The batch done callback is then not called for that batch or
+	//any after it, so the read position that it reported last is that of the last batch that was written in full.
+	bool Output_failed() { return output_failed; }
+	//The size of the 3LP candidate file with the candidates of the batches reported as done, -1 if there is no such file.
+	long long Get_candidate_bytes() { return candidate_bytes_written; }
 	int Get_tree_levels() { return tree_size; }
 	int Get_pipeline() { return (int)slots.size(); }
 
@@ -200,6 +209,8 @@ private:
 	int max_entries_before_check;
 	atomic<long long> num_relations_found; //when the relations of a batch are checked, less those whose other side fails later
 	atomic<long long> num_relations_written; //by this object as a writer
+	atomic<bool> output_failed; //the relations or the 3LP candidates of a batch could not be written: no batch is reported as done after it
+	atomic<long long> candidate_bytes_written; //the size of the candidate file with the batches written so far, -1 if none
 	atomic<long long> num_relations_checked;
 	atomic<long long> num_factoring_failures;
 	atomic<long long> num_other_side_failures;
@@ -235,6 +246,7 @@ private:
 	Batch_smooth* second_stage;
 	FILE* candidate_file;
 	long long num_candidates;
+	bool candidate_failed; //writing the candidate file failed
 	long long num_candidates_skipped; //could not be saved (a, b or saved primes too large for the candidate format).
 	void Send_candidates(Batch_slot& s);
 
