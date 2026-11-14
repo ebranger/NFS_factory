@@ -665,14 +665,22 @@ Batch_smooth::cofactor_result Batch_smooth::Check_two_primes(Batch_slot& s, unsi
 	return COFACTOR_SMOOTH;
 }
 
-//Split a 2LP cofactor that 64-bit rho could not with tinyqs, and check the two factors. Not thread safe.
+//tinyqs keeps its state in global variables, and two objects can need it at the same time: the checks of the batches run in one
+//thread, and those of the batch check of the other side's norms (other_stage) in the thread of the writer.
+static mutex tinyqs_lock;
+
+//Split a 2LP cofactor that 64-bit rho could not with tinyqs, and check the two factors. One call at a time for each object.
 bool Batch_smooth::Split_with_tinyqs(Batch_slot& s, mpz_class& number, unsigned int index)
 {
 	*factor1 = 0;
 	*factor2 = 0;
-	int qs_sucess = tinyqs(number.get_mpz_t(), factor1->get_mpz_t(), factor2->get_mpz_t());
+	int qs_sucess;
+	{
+		lock_guard<mutex> guard(tinyqs_lock);
+		qs_sucess = tinyqs(number.get_mpz_t(), factor1->get_mpz_t(), factor2->get_mpz_t());
+	}
 
-	if (qs_sucess == 0)
+	if (qs_sucess == 0 || *factor1 * *factor2 != number)
 	{
 		//unsuccesful
 		return false;
@@ -810,6 +818,12 @@ void Batch_smooth::Run_trees(Batch_slot& s)
 		if (*value < 0)
 		{
 			*value *= -1;
+		}
+		if (*value == 0)
+		{
+			//A root of the polynomial is no relation, and the trees cannot hold a zero.
+			*value = 1;
+			s.is_smooth[index] = false;
 		}
 	}
 	t = profile_add(profile, PROF_POLY_EVAL, t);
@@ -1486,6 +1500,14 @@ void Batch_smooth::Create_other_stage()
 //the norms apart, and the whole norms.
 void Batch_smooth::Submit_fallback()
 {
+	//This thread also takes the results, so it must leave room for the (up to two) jobs submitted here: a batch of very many
+	//relations found can fill many trees of other_stage before any of its lines are written.
+	while (pending_jobs.size() + 2 > OTHER_JOBS)
+	{
+		const int oldest = pending_jobs.front();
+		pending_jobs.pop_front();
+		Take_one_job(oldest);
+	}
 	if (!split_tickets.empty())
 	{
 		const int job = other_factoring->Submit_values(split_limbs.data(), split_sizes.data(), (int)split_sizes.size());

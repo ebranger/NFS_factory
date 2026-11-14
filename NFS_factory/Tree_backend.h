@@ -86,7 +86,9 @@ public:
 //The prime factors of the norms |F(a, b)| of the side that is not batch checked, for the relations found, in the background (on the
 //GPU), apart from the trees: Submit starts a job (a and b of count relations) and returns its number; Results waits for a job, and
 //gives for its norm i counts[i] prime factors (-1 if it was not factored) from offsets[i] in primes, in increasing order. The jobs
-//are submitted by one thread, and their results taken by one thread, in the same order.
+//are submitted by one thread, and their results taken by one thread, in the same order. At most OTHER_JOBS jobs can be in progress:
+//Submit waits for a result to be taken when they all are, so a thread that does both must take results before that.
+#define OTHER_JOBS 16
 class Other_side_factoring
 {
 public:
@@ -141,6 +143,7 @@ private:
 };
 
 #define INVERSE_MAX_ERROR (1 << 16)
+#define CHUNKED_REDUCTION_MAX_PARTS 32 //A prime product of more parts of the size of the root than this is reduced by one division on the CPU.
 #define INVERSE_EXACT_LIMBS 2000 //Inverses of up to this many limbs are computed exactly by MPIR.
 #define INVERSE_MARGIN (1 << 12) //Subtracted from the Newton inverse, which can be a few units too large.
 

@@ -383,6 +383,11 @@ void Cpu_tree_backend::Scaled_root(mpz_srcptr prime_product)
 	{
 		Barrett_reduce(r, prime_product, root, e, bits);
 	}
+	else if (product_size / CHUNKED_REDUCTION_MAX_PARTS >= bits)
+	{
+		//A root much smaller than the prime product (a batch of few relations): one division instead of very many parts.
+		mpz_tdiv_r(r, prime_product, root);
+	}
 	else
 	{
 		mp_bitcnt_t position = product_size;

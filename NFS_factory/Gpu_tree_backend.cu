@@ -634,9 +634,23 @@ void Gpu_root::Compute(Gpu_number& fraction, const uint64_t* X, size_t x_limbs, 
 	}
 	const mp_bitcnt_t product_size = mpz_sizeinbase(prime_product, 2);
 
-	if (product_size <= 2 * bits)
+	if (product_size < bits)
+	{
+		//The prime product is its own remainder, and is used as it is below.
+	}
+	else if (product_size <= 2 * bits)
 	{
 		Barrett_reduce(remainder, prime_product_gpu.d, prime_product_gpu.n, product_size, X, x_limbs, e, bits, true);
+	}
+	else if (product_size / CHUNKED_REDUCTION_MAX_PARTS >= bits)
+	{
+		//A root much smaller than the prime product (a batch of few relations, at the end of a file or of a second stage): the
+		//reduction below would take a part of the size of the root at a time, each with tens of kernel launches. The remainder is
+		//the same number however it is computed, so divide on the CPU.
+		mpz_class x, r;
+		To_mpz(x.get_mpz_t(), X, x_limbs);
+		mpz_tdiv_r(r.get_mpz_t(), prime_product, x.get_mpz_t());
+		From_mpz(remainder, r.get_mpz_t(), 1);
 	}
 	else
 	{
@@ -1895,7 +1909,7 @@ __global__ void k_other_norms(const uint32_t* __restrict__ list, const uint32_t*
 	{
 		const uint32_t i = list[j];
 		const int64_t a = ab[2 * (size_t)i], b = ab[2 * (size_t)i + 1];
-		const uint64_t abs_a = (uint64_t)((a < 0) ? -a : a), abs_b = (uint64_t)((b < 0) ? -b : b);
+		const uint64_t abs_a = (a < 0) ? 0 - (uint64_t)a : (uint64_t)a, abs_b = (b < 0) ? 0 - (uint64_t)b : (uint64_t)b;
 		const uint64_t larger = (abs_a > abs_b) ? abs_a : abs_b;
 		const int larger_bits = 64 - __clzll((long long)larger);
 		if (coefficient_bits + degree * larger_bits + 4 > 64 * OTHER_WIDTH - 1)
@@ -2164,6 +2178,15 @@ Gpu_tree_backend::Gpu_tree_backend(int levels, int max_bits_in_input) : Cpu_tree
 
 Gpu_tree_backend::~Gpu_tree_backend()
 {
+	//The kernels in the background read the leaves and the cofactors: wait for them before anything is freed.
+	if (rho_pending)
+	{
+		cudaEventSynchronize(rho_done);
+	}
+	if (factors_pending)
+	{
+		cudaEventSynchronize(factored);
+	}
 	delete root;
 	for (Depth& x : depth_data)
 	{
@@ -2180,14 +2203,6 @@ Gpu_tree_backend::~Gpu_tree_backend()
 	cudaFree(precision);
 	cudaFree(cofactors.limbs);
 	cudaFree(cofactors.size);
-	if (rho_pending)
-	{
-		cudaEventSynchronize(rho_done);
-	}
-	if (factors_pending)
-	{
-		cudaEventSynchronize(factored);
-	}
 	cudaEventDestroy(factored);
 	cudaFree(gather_list);
 	cudaFree(gather_sizes);
@@ -2630,7 +2645,6 @@ void Gpu_tree_backend::Leaf_cofactors()
 	Cpu_tree_backend::Leaf_cofactors();
 }
 
-#define OTHER_JOBS 16 //jobs of the factoring of the other side in progress at once
 #define OTHER_JOB_CAPACITY 4096 //norms of a job for which the memory is allocated up front (a batch of 2^19 relations has about 1500)
 
 //The factoring of the other side's norms of the relations found, as jobs apart from the trees: a job (the relations found in a batch)

@@ -381,10 +381,11 @@ bool valid_factor_list(const char* list)
 	return !expect_digit || *list == '\0';
 }
 
-//Check if a relation is within the allowed range of a and b values.
+//Check if a relation is within the allowed range of a and b values. b must be positive: a record of zeros in a binary file (a
+//damaged or zero filled part) would otherwise give the value 0, which no tree can hold.
 bool relation_in_range(long long a, long long b, nfs_parameters* param)
 {
-	return llabs(a) <= param->maxa && b <= param->maxb;
+	return a != LLONG_MIN && llabs(a) <= param->maxa && b > 0 && b <= param->maxb;
 }
 
 //The size of a file in bytes, or -1 if it cannot be opened.
@@ -572,6 +573,7 @@ struct run_progress
 		Write(text);
 	}
 
+	bool replace_failed = false; //said once
 	void Write(const string& text)
 	{
 		string temp = resume_filename + ".tmp";
@@ -581,10 +583,24 @@ struct run_progress
 			cout << "Could not write the resume file " << temp << endl;
 			return;
 		}
-		fputs(text.c_str(), f);
-		fclose(f);
-		remove(resume_filename.c_str());
-		rename(temp.c_str(), resume_filename.c_str());
+		const bool written = fputs(text.c_str(), f) >= 0;
+		if (fclose(f) != 0 || !written)
+		{
+			//The resume file of the batch before stays.
+			cout << "Could not write the resume file " << temp << endl;
+			return;
+		}
+		//Replaced in one step, so that a run that is stopped at any time leaves a complete resume file.
+#ifdef _WIN32
+		const bool replaced = MoveFileExA(temp.c_str(), resume_filename.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+		const bool replaced = rename(temp.c_str(), resume_filename.c_str()) == 0;
+#endif
+		if (!replaced && !replace_failed)
+		{
+			replace_failed = true;
+			cout << "Could not replace the resume file " << resume_filename << " (is another program reading it?)" << endl;
+		}
 	}
 
 	//Read a resume file of the same input. Returns false if there is none.
@@ -833,7 +849,7 @@ read_result read_batch_from_file(string filename, Batch_smooth* batch, nfs_param
 
 	if (skipped_relations > 0)
 	{
-		console_message("Skipped " + to_string(skipped_relations) + " relations with a or b larger than maxa or maxb.");
+		console_message("Skipped " + to_string(skipped_relations) + " relations with b = 0, or with a or b larger than maxa or maxb.");
 	}
 
 	return stopped ? READ_STOPPED : READ_END;
@@ -889,7 +905,17 @@ public:
 #endif
 	}
 
-	//Up to max of the next bytes of the file into out. Returns how many, 0 at the end of the file (or on a read error).
+	//Whether a read failed (Read then returns 0, as at the end of the file).
+	bool Failed()
+	{
+#ifdef _WIN32
+		return failed;
+#else
+		return file != NULL && ferror(file) != 0;
+#endif
+	}
+
+	//Up to max of the next bytes of the file into out. Returns how many, 0 at the end of the file or on a read error (see Failed).
 	size_t Read(unsigned char* out, size_t max)
 	{
 #ifdef _WIN32
@@ -900,8 +926,14 @@ public:
 			{
 				//The next block, in the order the reads were issued.
 				DWORD got = 0;
-				if (!pending[current] || !GetOverlappedResult(handle, &requests[current], &got, TRUE))
+				if (!pending[current])
 				{
+					failed = failed || issue_failed[current];
+				}
+				else if (!GetOverlappedResult(handle, &requests[current], &got, TRUE))
+				{
+					//The end of the file, unless the read failed.
+					failed = failed || GetLastError() != ERROR_HANDLE_EOF;
 					got = 0;
 				}
 				pending[current] = false;
@@ -973,7 +1005,10 @@ private:
 		requests[i].Offset = (DWORD)next_offset;
 		requests[i].OffsetHigh = (DWORD)(next_offset >> 32);
 		ResetEvent(requests[i].hEvent);
-		pending[i] = ReadFile(handle, blocks[i].data(), READ_BUFFER_SIZE, NULL, &requests[i]) || GetLastError() == ERROR_IO_PENDING;
+		const bool started = ReadFile(handle, blocks[i].data(), READ_BUFFER_SIZE, NULL, &requests[i]) != 0;
+		const DWORD error = started ? ERROR_SUCCESS : GetLastError();
+		pending[i] = started || error == ERROR_IO_PENDING;
+		issue_failed[i] = !pending[i] && error != ERROR_HANDLE_EOF;
 		next_offset += READ_BUFFER_SIZE;
 	}
 
@@ -981,6 +1016,8 @@ private:
 	vector<unsigned char> blocks[READ_AHEAD_BLOCKS];
 	OVERLAPPED requests[READ_AHEAD_BLOCKS];
 	bool pending[READ_AHEAD_BLOCKS];
+	bool issue_failed[READ_AHEAD_BLOCKS]; //the read could not be started, for another reason than the end of the file
+	bool failed = false;
 	unsigned long long next_offset; //of the next read issued
 	int current; //the block being used, in the order of the file
 	size_t position, size; //in the current block
@@ -1125,9 +1162,16 @@ read_result read_batch_from_binary_file(string filename, Batch_smooth* batch, nf
 		console_message("The binary relation file is truncated or corrupt after " + to_string(records) + " relations. The rest of the file was skipped.");
 	}
 
+	if (input.file.Failed())
+	{
+		//Not the end of the file: the run stops here, and continues from this batch when it is started again.
+		console_message("Reading the relation file failed after " + to_string(records) + " relations (a disk error?).");
+		return READ_FAILED;
+	}
+
 	if (skipped_relations > 0)
 	{
-		console_message("Skipped " + to_string(skipped_relations) + " relations with a or b larger than maxa or maxb.");
+		console_message("Skipped " + to_string(skipped_relations) + " relations with b = 0, or with a or b larger than maxa or maxb.");
 	}
 
 	return stopped ? READ_STOPPED : READ_END;
@@ -1217,9 +1261,16 @@ read_result read_batch_from_ab_file(string filename, Batch_smooth* batch, nfs_pa
 		console_message("The relation file " + filename + " ends with part of a relation, which was skipped.");
 	}
 
+	if (input.file.Failed())
+	{
+		//Not the end of the file: the run stops here, and continues from this batch when it is started again.
+		console_message("Reading the relation file failed after " + to_string(records) + " relations (a disk error?).");
+		return READ_FAILED;
+	}
+
 	if (skipped_relations > 0)
 	{
-		console_message("Skipped " + to_string(skipped_relations) + " relations with a or b larger than maxa or maxb.");
+		console_message("Skipped " + to_string(skipped_relations) + " relations with b = 0, or with a or b larger than maxa or maxb.");
 	}
 
 	return stopped ? READ_STOPPED : READ_END;
@@ -1309,7 +1360,8 @@ int main(int argc, char* argv[])
 		cout << "-verbose also prints a line for each batch." << endl;
 		cout << "Relation files: text (a,b:rational primes:algebraic primes), binary (.bin), or only a and b (.ab), whose factor list of the" << endl;
 		cout << "side that is not checked is rebuilt for the relations found (on the GPU in the GPU build). A .3lp file holds 3LP candidates." << endl;
-		return 0;
+		//Arguments that are wrong are an error for a script that runs the program; no arguments at all asks for this text.
+		return (argc > 1) ? -1 : 0;
 	}
 	omp_set_num_threads(threads);
 

@@ -947,7 +947,10 @@ __device__ void combine_finish(int logT, int b, int cyclic, uint64_t* __restrict
 				all_ones = 0;
 			}
 			__syncthreads();
-			if (!all_ones)
+			//Read by all threads before any of them can clear it in the next round.
+			const int still_ones = all_ones;
+			__syncthreads();
+			if (!still_ones)
 			{
 				break;
 			}
@@ -1040,7 +1043,8 @@ __global__ void __launch_bounds__(COMBINE_THREADS) k_carry(size_t n, size_t chun
 		}
 		//A carry can reach above the top nonzero limb.
 		top = warp_max(top);
-		if ((tid & 31) == 0 && top != 0)
+		//Only kept when the last block takes it (and sets it back to 0): an addition without a carry out must leave it alone.
+		if ((tid & 31) == 0 && top != 0 && (carry_out != NULL || finish))
 		{
 			atomicMax(row_info + 2 * row + 1, top);
 		}
