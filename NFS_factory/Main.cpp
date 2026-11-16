@@ -979,15 +979,20 @@ public:
 		return stream != NULL;
 	}
 
-	//Up to max of the next bytes of the file into out. Returns how many, 0 at the end of the file (or on a read error).
-	//Whether a read failed (Read then returns 0, as at the end of the file).
+	//Whether a read failed (Read then returns 0, as at the end of the file). Also after Close.
 	bool Failed()
 	{
-#ifdef _WIN32
-		return failed;
-#else
-		return file != NULL && ferror(file) != 0;
+		if (stream != NULL && ferror(stream) != 0)
+		{
+			return true;
+		}
+#ifndef _WIN32
+		if (file != NULL && ferror(file) != 0)
+		{
+			return true;
+		}
 #endif
+		return failed;
 	}
 
 	//Up to max of the next bytes of the file into out. Returns how many, 0 at the end of the file or on a read error (see Failed).
@@ -1053,6 +1058,7 @@ public:
 	{
 		if (stream != NULL)
 		{
+			failed = failed || ferror(stream) != 0;
 			if (stream != stdin)
 			{
 				fclose(stream);
@@ -1080,6 +1086,7 @@ public:
 #else
 		if (file != NULL)
 		{
+			failed = failed || ferror(file) != 0;
 			fclose(file);
 			file = NULL;
 		}
@@ -1105,7 +1112,6 @@ private:
 	OVERLAPPED requests[READ_AHEAD_BLOCKS];
 	bool pending[READ_AHEAD_BLOCKS];
 	bool issue_failed[READ_AHEAD_BLOCKS]; //the read could not be started, for another reason than the end of the file
-	bool failed = false;
 	unsigned long long next_offset; //of the next read issued
 	int current; //the block being used, in the order of the file
 	size_t position, size; //in the current block
@@ -1114,6 +1120,7 @@ private:
 	FILE* file;
 #endif
 	FILE* stream; //standard input or a pipe (Open_stream), else NULL
+	bool failed = false; //a read failed (kept when the file is closed)
 };
 
 //Whether a relation file is read as a stream (Block_reader::Open_stream): "-" is standard input, and a name that is not a regular
@@ -1440,10 +1447,15 @@ int main(int argc, char* argv[])
 	int gpu = 0;
 	vector<string> positional;
 	bool arguments_ok = true;
+	bool help = (argc == 1);
 	for (int i = 1; i < argc; i++)
 	{
 		string arg = argv[i];
-		if (arg == "-list" && i + 1 < argc)
+		if (arg == "-help" || arg == "-h" || arg == "--help")
+		{
+			help = true;
+		}
+		else if (arg == "-list" && i + 1 < argc)
 		{
 			listfile = argv[++i];
 		}
@@ -1490,9 +1502,9 @@ int main(int argc, char* argv[])
 			positional.push_back(arg);
 		}
 	}
-	if (!arguments_ok || positional.size() != (listfile.empty() ? 3u : 2u))
+	if (help || !arguments_ok || positional.size() != (listfile.empty() ? 3u : 2u))
 	{
-		cout << "Usage: NFS_factory <polynomial file> <relation file> <output file> [-rels N] [-threads N] [-gpu N] [-verbose]" << endl;
+		cout << "Usage: NFS_factory <polynomial file> <relation file> <output file> [-rels N] [-threads N] [-gpu N] [-verbose] [-help]" << endl;
 		cout << "   or: NFS_factory <polynomial file> -list <list file> <output file> [-rels N] [-threads N] [-gpu N] [-verbose]" << endl;
 		cout << "The list file names relation files, one per line, which are read in order. With -rels, the run stops when N relations" << endl;
 		cout << "have been found. An interrupted run continues where it was, from <output file>.resume, when it is run again with the" << endl;
@@ -1503,8 +1515,8 @@ int main(int argc, char* argv[])
 		cout << "Relation files: text (a,b:rational primes:algebraic primes), binary (.bin), or only a and b (.ab), whose factor list of the" << endl;
 		cout << "side that is not checked is rebuilt for the relations found (on the GPU in the GPU build). A .3lp file holds 3LP candidates." << endl;
 		cout << "A relation file named - is an .ab file read from standard input, as in: xz -dc store.ab.xz | NFS_factory poly - output" << endl;
-		//Arguments that are wrong are an error for a script that runs the program; no arguments at all asks for this text.
-		return (argc > 1) ? -1 : 0;
+		//Arguments that are wrong are an error for a script that runs the program; -help, or no arguments at all, asks for this text.
+		return help ? 0 : -1;
 	}
 	omp_set_num_threads(threads);
 

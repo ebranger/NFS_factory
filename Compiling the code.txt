@@ -97,13 +97,16 @@ Visual Studio. MPIR is built from its sources (https://github.com/wbhart/mpir), 
   apt install build-essential yasm autoconf automake libtool texinfo
   git clone https://github.com/wbhart/mpir && cd mpir
   ./autogen.sh
-  ./configure --prefix=/opt/mpir --enable-cxx
-  make && make install
+  ./configure --prefix=/opt/mpir --enable-cxx CC="gcc -std=gnu17"
+  make && sudo make install
 
 MPIR's configure picks the assembly code for the processor, but does not know many newer ones, and then builds its generic
 x86_64 code (./config.guess shows x86_64-unknown-linux-gnu).
 Then --build=skylakeavx-pc-linux-gnu selects the code of lib_mpir_skylake_avx (for processors with AVX2).
-MPIR's sources are old enough that GCC 15 may not build them; CC=gcc-13 CXX=g++-13 before ./configure sets another compiler.
+GCC 15 compiles C as C23 by default, which the test programs of MPIR's configure are not: without CC="gcc -std=gnu17" it stops
+with "could not find a working compiler" (every compiler fails its "long long reliability test 1"). The option is harmless with
+older GCC. make check runs MPIR's tests. A --prefix in the home folder (--prefix=$HOME/mpir, then MPIR_DIR=$HOME/mpir below)
+needs no sudo.
 
 Then, in the main folder of NFS_factory:
 
