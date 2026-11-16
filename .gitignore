@@ -43,3 +43,6 @@ NFS_factory/Test_input/
 NFS_factory/test/
 NFS_factory/Debug line.txt
 NFS_factory/*.poly
+
+# Linux build (Makefile)
+build/
