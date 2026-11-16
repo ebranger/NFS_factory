@@ -65,6 +65,7 @@ struct nfs_parameters {
 	Polynomial* rational_polynomial, *algebraic_polynomial;
 	int lbpr, lbpa;
 	int smoothness_checking_side; // 0 for rational, 1 for algebraic.
+	mpz_class n; // The number that is factored, 0 if the polynomial file does not give it.
 	long long maxa, maxb; // Relations with larger |a| or b are skipped.
 	long long maxrels; // Stop after reading this many relations. 0 means no limit.
 	long long rlim, alim;
@@ -146,7 +147,11 @@ bool read_polynomial(string filename, nfs_parameters* params)
 		{
 			//For rational root given as x - m in the input. This is a short form occasionally used.
 			//Otherwise, both Y0 and Y1 needs to be set.
-			if (data == "m")
+			if (data == "n")
+			{
+				params->n = line;
+			}
+			else if (data == "m")
 			{
 				number = line;
 				number = number * -1;
@@ -389,10 +394,11 @@ bool valid_factor_list(const char* list)
 	return !expect_digit || *list == '\0';
 }
 
-//Check if a relation is within the allowed range of a and b values.
+//Check if a relation is within the allowed range of a and b values. b must be positive: a record of zeros in a binary file (a
+//damaged or zero filled part) would otherwise give the value 0, which no tree can hold.
 bool relation_in_range(long long a, long long b, nfs_parameters* param)
 {
-	return llabs(a) <= param->maxa && b <= param->maxb;
+	return a != LLONG_MIN && llabs(a) <= param->maxa && b > 0 && b <= param->maxb;
 }
 
 //The size of a file in bytes, or -1 if it cannot be opened or is not a regular file (opening a named pipe here would take
@@ -564,9 +570,13 @@ struct run_progress
 	//The resume file, now or by the writer thread (background), with the size of the output file.
 	void Save(size_t file, long long records, long long bytes, bool background, long long found)
 	{
-		char text[4096];
-		snprintf(text, sizeof(text), "input %s\nfile %zu\nname %s\nrecords %lld\nfound %lld\noutput %lld\ncomplete %d\n", input.c_str(), file,
-			(file < files.size()) ? files[file].c_str() : "-", records, found, (bytes > 0) ? bytes : 0, complete ? 1 : 0);
+		string text = "input " + input + "\nfile " + to_string(file) + "\nname " + ((file < files.size()) ? files[file] : string("-")) + "\nrecords " + to_string(records) +
+			"\nfound " + to_string(found) + "\noutput " + to_string((bytes > 0) ? bytes : 0) + "\ncomplete " + (complete ? "1" : "0") + "\n";
+		if (candidate_bytes >= 0)
+		{
+			//The size of the 3LP candidate file (3lp: save) with the candidates of the relations up to this position.
+			text += "candidates " + to_string(candidate_bytes) + "\n";
+		}
 		if (background && writer.joinable())
 		{
 			{
@@ -585,6 +595,7 @@ struct run_progress
 		Write(text);
 	}
 
+	bool replace_failed = false; //said once
 	void Write(const string& text)
 	{
 		string temp = resume_filename + ".tmp";
@@ -594,17 +605,37 @@ struct run_progress
 			cout << "Could not write the resume file " << temp << endl;
 			return;
 		}
-		fputs(text.c_str(), f);
-		fclose(f);
-		remove(resume_filename.c_str());
-		rename(temp.c_str(), resume_filename.c_str());
+		const bool written = fputs(text.c_str(), f) >= 0;
+		if (fclose(f) != 0 || !written)
+		{
+			//The resume file of the batch before stays.
+			cout << "Could not write the resume file " << temp << endl;
+			return;
+		}
+		//Replaced in one step, so that a run that is stopped at any time leaves a complete resume file.
+#ifdef _WIN32
+		const bool replaced = MoveFileExA(temp.c_str(), resume_filename.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+		const bool replaced = rename(temp.c_str(), resume_filename.c_str()) == 0;
+#endif
+		if (!replaced && !replace_failed)
+		{
+			replace_failed = true;
+			cout << "Could not replace the resume file " << resume_filename << " (is another program reading it?)" << endl;
+		}
 	}
 
-	//Read a resume file of the same input. Returns false if there is none.
-	bool Load()
+	enum load_result { LOAD_NONE, LOAD_RESUMED, LOAD_FAILED };
+	string candidate_filename; //of a run that saves its 3LP candidates
+	long long candidate_bytes = -1; //its size at the saved position
+
+	//Read a resume file of the same input. LOAD_NONE if there is none, and LOAD_FAILED, after saying why, if the run cannot continue
+	//from it: the files are then left as they are.
+	load_result Load()
 	{
 		ifstream f(resume_filename);
-		string key, value, saved_input;
+		string key, value, saved_input, saved_name;
+		long long candidates = -1;
 		size_t index = 0;
 		long long records = 0, found = 0, bytes = 0;
 		int done = 0;
@@ -620,15 +651,23 @@ struct run_progress
 				else if (key == "found") { found = stoll(value); keys++; }
 				else if (key == "output") { bytes = stoll(value); keys++; }
 				else if (key == "complete") { done = stoi(value); keys++; }
+				else if (key == "name") { saved_name = value; }
+				else if (key == "candidates") { candidates = stoll(value); }
 			}
 			catch (const exception&)
 			{
-				return false;
+				return LOAD_NONE;
 			}
 		}
 		if (keys != 6 || saved_input != input)
 		{
-			return false;
+			return LOAD_NONE;
+		}
+		if (index < files.size() && !saved_name.empty() && saved_name != files[index])
+		{
+			cout << "The resume file " << resume_filename << " was saved in relation file " << index + 1 << " of the list, " << saved_name << ", but that is now " << files[index]
+				<< ". A list must not change between the runs that continue each other: restore it, or remove the resume file to start again." << endl;
+			return LOAD_FAILED;
 		}
 		file_index = index;
 		done_records = records;
@@ -637,21 +676,37 @@ struct run_progress
 
 		//Relations written after the saved position are written again.
 		long long size = file_size(output_filename);
+		if (size < bytes)
+		{
+			//The relations counted in the resume file are not all there, so the count would be wrong.
+			cout << "The output file " << output_filename << ((size < 0) ? " is missing" : " is shorter than when the resume file was written") << " (" << bytes
+				<< " bytes with " << found << " relations). Restore it, or remove the resume file " << resume_filename << " to start again." << endl;
+			return LOAD_FAILED;
+		}
 		if (size > bytes && !truncate_file(output_filename, bytes))
 		{
 			cout << "Could not remove the relations written after the saved position from " << output_filename << endl;
+			return LOAD_FAILED;
 		}
-		if (size >= 0 && size < bytes)
+		if (!candidate_filename.empty() && candidates >= 0)
 		{
-			cout << "The output file " << output_filename << " is shorter than when the resume file was written." << endl;
+			//The same for the 3LP candidates: those of the batches after the saved position are written again.
+			const long long candidate_size = file_size(candidate_filename);
+			if (candidate_size < candidates || (candidate_size > candidates && !truncate_file(candidate_filename, candidates)))
+			{
+				cout << "The 3LP candidate file " << candidate_filename << " could not be set back to its saved size of " << candidates << " bytes." << endl;
+				return LOAD_FAILED;
+			}
+			candidate_bytes = candidates;
 		}
-		return true;
+		return LOAD_RESUMED;
 	}
 
 	//Called after each batch, when its relations are written, with the position of its last relation (the file and the records
 	//of it read) and the size of the output file.
 	void Batch_done(const long long position[2], long long output_size, long long written)
 	{
+		candidate_bytes = batch->Get_candidate_bytes();
 		Save((size_t)position[0], position[1], (output_size >= 0) ? output_size : file_size(output_filename), true, found_before + written);
 		console_status(Status((size_t)position[0]));
 		Check_target();
@@ -685,7 +740,7 @@ struct run_progress
 	{
 		relations_added++;
 		read_records = records_read;
-		if (target_reached || Check_target())
+		if (target_reached || Check_target() || batch->Output_failed())
 		{
 			return true;
 		}
@@ -846,7 +901,7 @@ read_result read_batch_from_file(string filename, Batch_smooth* batch, nfs_param
 
 	if (skipped_relations > 0)
 	{
-		console_message("Skipped " + to_string(skipped_relations) + " relations with a or b larger than maxa or maxb.");
+		console_message("Skipped " + to_string(skipped_relations) + " relations with b = 0, or with a or b larger than maxa or maxb.");
 	}
 
 	return stopped ? READ_STOPPED : READ_END;
@@ -925,6 +980,17 @@ public:
 	}
 
 	//Up to max of the next bytes of the file into out. Returns how many, 0 at the end of the file (or on a read error).
+	//Whether a read failed (Read then returns 0, as at the end of the file).
+	bool Failed()
+	{
+#ifdef _WIN32
+		return failed;
+#else
+		return file != NULL && ferror(file) != 0;
+#endif
+	}
+
+	//Up to max of the next bytes of the file into out. Returns how many, 0 at the end of the file or on a read error (see Failed).
 	size_t Read(unsigned char* out, size_t max)
 	{
 		if (stream != NULL)
@@ -939,8 +1005,14 @@ public:
 			{
 				//The next block, in the order the reads were issued.
 				DWORD got = 0;
-				if (!pending[current] || !GetOverlappedResult(handle, &requests[current], &got, TRUE))
+				if (!pending[current])
 				{
+					failed = failed || issue_failed[current];
+				}
+				else if (!GetOverlappedResult(handle, &requests[current], &got, TRUE))
+				{
+					//The end of the file, unless the read failed.
+					failed = failed || GetLastError() != ERROR_HANDLE_EOF;
 					got = 0;
 				}
 				pending[current] = false;
@@ -1021,7 +1093,10 @@ private:
 		requests[i].Offset = (DWORD)next_offset;
 		requests[i].OffsetHigh = (DWORD)(next_offset >> 32);
 		ResetEvent(requests[i].hEvent);
-		pending[i] = ReadFile(handle, blocks[i].data(), READ_BUFFER_SIZE, NULL, &requests[i]) || GetLastError() == ERROR_IO_PENDING;
+		const bool started = ReadFile(handle, blocks[i].data(), READ_BUFFER_SIZE, NULL, &requests[i]) != 0;
+		const DWORD error = started ? ERROR_SUCCESS : GetLastError();
+		pending[i] = started || error == ERROR_IO_PENDING;
+		issue_failed[i] = !pending[i] && error != ERROR_HANDLE_EOF;
 		next_offset += READ_BUFFER_SIZE;
 	}
 
@@ -1029,6 +1104,8 @@ private:
 	vector<unsigned char> blocks[READ_AHEAD_BLOCKS];
 	OVERLAPPED requests[READ_AHEAD_BLOCKS];
 	bool pending[READ_AHEAD_BLOCKS];
+	bool issue_failed[READ_AHEAD_BLOCKS]; //the read could not be started, for another reason than the end of the file
+	bool failed = false;
 	unsigned long long next_offset; //of the next read issued
 	int current; //the block being used, in the order of the file
 	size_t position, size; //in the current block
@@ -1190,9 +1267,16 @@ read_result read_batch_from_binary_file(string filename, Batch_smooth* batch, nf
 		console_message("The binary relation file is truncated or corrupt after " + to_string(records) + " relations. The rest of the file was skipped.");
 	}
 
+	if (input.file.Failed())
+	{
+		//Not the end of the file: the run stops here, and continues from this batch when it is started again.
+		console_message("Reading the relation file failed after " + to_string(records) + " relations (a disk error?).");
+		return READ_FAILED;
+	}
+
 	if (skipped_relations > 0)
 	{
-		console_message("Skipped " + to_string(skipped_relations) + " relations with a or b larger than maxa or maxb.");
+		console_message("Skipped " + to_string(skipped_relations) + " relations with b = 0, or with a or b larger than maxa or maxb.");
 	}
 
 	return stopped ? READ_STOPPED : READ_END;
@@ -1319,9 +1403,16 @@ read_result read_batch_from_ab_file(string filename, Batch_smooth* batch, nfs_pa
 		console_message("The relation file " + name + " ends with part of a relation, which was skipped.");
 	}
 
+	if (input.file.Failed())
+	{
+		//Not the end of the file: the run stops here, and continues from this batch when it is started again.
+		console_message("Reading the relation file failed after " + to_string(records) + " relations (a disk error?).");
+		return READ_FAILED;
+	}
+
 	if (skipped_relations > 0)
 	{
-		console_message("Skipped " + to_string(skipped_relations) + " relations with a or b larger than maxa or maxb.");
+		console_message("Skipped " + to_string(skipped_relations) + " relations with b = 0, or with a or b larger than maxa or maxb.");
 	}
 
 	return stopped ? READ_STOPPED : READ_END;
@@ -1412,7 +1503,8 @@ int main(int argc, char* argv[])
 		cout << "Relation files: text (a,b:rational primes:algebraic primes), binary (.bin), or only a and b (.ab), whose factor list of the" << endl;
 		cout << "side that is not checked is rebuilt for the relations found (on the GPU in the GPU build). A .3lp file holds 3LP candidates." << endl;
 		cout << "A relation file named - is an .ab file read from standard input, as in: xz -dc store.ab.xz | NFS_factory poly - output" << endl;
-		return 0;
+		//Arguments that are wrong are an error for a script that runs the program; no arguments at all asks for this text.
+		return (argc > 1) ? -1 : 0;
 	}
 	omp_set_num_threads(threads);
 
@@ -1448,6 +1540,14 @@ int main(int argc, char* argv[])
 			cout << "The list file " << listfile << " names no relation files." << endl;
 			return -1;
 		}
+		for (const string& name : progress.files)
+		{
+			if (ends_with(name, ".3lp"))
+			{
+				cout << "The list file " << listfile << " names a 3LP candidate file, " << name << ". Candidate files are checked in a run of their own, one file at a time." << endl;
+				return -1;
+			}
+		}
 	}
 	if (count(progress.files.begin(), progress.files.end(), string("-")) > 1)
 	{
@@ -1456,6 +1556,8 @@ int main(int argc, char* argv[])
 	}
 	progress.resume_filename = outputfile + ".resume";
 	progress.output_filename = outputfile;
+	//The status file is written at the end of the run. One of an earlier run must not be taken for it if this run stops before that.
+	remove((outputfile + ".status").c_str());
 	progress.file_index = 0;
 	progress.done_records = 0;
 	progress.read_records = 0;
@@ -1495,6 +1597,37 @@ int main(int argc, char* argv[])
 	if (!read_polynomial(polyfile, param))
 	{
 		return -1;
+	}
+
+	//The polynomials must belong to the number: with the common root m = -Y0 / Y1 of both modulo n, the algebraic polynomial has
+	//Y1^d f(m) = sum of c_i (-Y0)^i Y1^(d - i) = 0 modulo n. Relations of other polynomials would be found just the same, and only
+	//fail much later, in the square root.
+	if (param->n > 0 && param->rational_polynomial->get_degree() == 1 && param->algebraic_polynomial->get_degree() >= 1)
+	{
+		const int d = param->algebraic_polynomial->get_degree();
+		const mpz_class y1 = param->rational_polynomial->get_coefficient(1), minus_y0 = -param->rational_polynomial->get_coefficient(0);
+		mpz_class value = 0, power = 1; //power = (-Y0)^i, value by Horner in Y1
+		vector<mpz_class> a_powers(d + 1);
+		for (int i = 0; i <= d; i++)
+		{
+			a_powers[i] = power;
+			power = power * minus_y0 % param->n;
+		}
+		power = 1; //Y1^(d - i)
+		for (int i = d; i >= 0; i--)
+		{
+			value += param->algebraic_polynomial->get_coefficient((uint8)i) * a_powers[i] % param->n * power;
+			power = power * y1 % param->n;
+		}
+		if (value % param->n != 0)
+		{
+			cout << "The polynomials do not match the number n of the polynomial file: the algebraic polynomial is not 0 at the root m (or -Y0/Y1) modulo n." << endl;
+			return -1;
+		}
+	}
+	else if (param->n == 0)
+	{
+		cout << "The polynomial file has no number n, so the polynomials could not be checked against it." << endl;
 	}
 
 	//Check the polynomial to ensure input is reasonable.
@@ -1601,7 +1734,7 @@ int main(int argc, char* argv[])
 	if (three_lp)
 	{
 		Batch_smooth* second_stage = NULL;
-		string candidate_filename;
+		string& candidate_filename = progress.candidate_filename;
 
 		if (param->save_3lp)
 		{
@@ -1654,7 +1787,14 @@ int main(int argc, char* argv[])
 	progress.batch = batch;
 	batch->Set_batch_done([&progress](const long long position[2], long long output_size, long long written) { progress.Batch_done(position, output_size, written); });
 	progress.Start_writer();
-	if (progress.Load())
+	const run_progress::load_result loaded = progress.Load();
+	if (loaded == run_progress::LOAD_FAILED)
+	{
+		progress.Stop_writer();
+		delete batch;
+		return -1;
+	}
+	if (loaded == run_progress::LOAD_RESUMED)
 	{
 		if (progress.complete)
 		{
@@ -1668,6 +1808,11 @@ int main(int argc, char* argv[])
 	}
 	else
 	{
+		const long long existing = file_size(outputfile);
+		if (existing > 0)
+		{
+			cout << "No resume file for this input: starting from its first relation, and adding to the " << existing << " bytes already in " << outputfile << "." << endl;
+		}
 		progress.Save();
 	}
 
@@ -1694,15 +1839,15 @@ int main(int argc, char* argv[])
 			//Only a and b, with a .ab extension, or from standard input.
 			result = read_batch_from_ab_file(file, batch, param, progress, skip_records);
 		}
-		else if (file.find(".bin") == string::npos)
+		else if (ends_with(file, ".bin"))
 		{
-			//for reading gnfs-lasieve output.
-			result = read_batch_from_file(file, batch, param, progress, skip_records);
+			//binary formated files, with a .bin extension.
+			result = read_batch_from_binary_file(file, batch, param, false, progress, skip_records);
 		}
 		else
 		{
-			//for reading binary formated files, assumed to have a .bin extension.
-			result = read_batch_from_binary_file(file, batch, param, false, progress, skip_records);
+			//for reading gnfs-lasieve output.
+			result = read_batch_from_file(file, batch, param, progress, skip_records);
 		}
 		skip_records = 0;
 
@@ -1726,6 +1871,14 @@ int main(int argc, char* argv[])
 	if (!read_failed)
 	{
 		batch->Finish();
+	}
+	if (batch->Output_failed())
+	{
+		//The relations of a batch could not be written. The resume file is at the last batch that was.
+		read_failed = true;
+	}
+	if (!read_failed)
+	{
 		progress.complete = progress.complete || !stopped;
 		if (progress.complete)
 		{

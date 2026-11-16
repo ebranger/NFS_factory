@@ -15,6 +15,11 @@ void cuda_check(cudaError_t error, const char* call, const char* file, int line)
 	if (error != cudaSuccess)
 	{
 		fprintf(stderr, "CUDA error %s in %s at %s:%d\n", cudaGetErrorString(error), call, file, line);
+		if (error == cudaErrorMemoryAllocation)
+		{
+			fprintf(stderr, "The GPU ran out of memory. Other programs may be using it; otherwise use fewer batches at once (pipeline in the polynomial file, "
+				"down to 1) or smaller trees (treelevels). A run that is started again continues from its resume file.\n");
+		}
 		exit(3);
 	}
 }
@@ -947,7 +952,10 @@ __device__ void combine_finish(int logT, int b, int cyclic, uint64_t* __restrict
 				all_ones = 0;
 			}
 			__syncthreads();
-			if (!all_ones)
+			//Read by all threads before any of them can clear it in the next round.
+			const int still_ones = all_ones;
+			__syncthreads();
+			if (!still_ones)
 			{
 				break;
 			}
@@ -1040,7 +1048,8 @@ __global__ void __launch_bounds__(COMBINE_THREADS) k_carry(size_t n, size_t chun
 		}
 		//A carry can reach above the top nonzero limb.
 		top = warp_max(top);
-		if ((tid & 31) == 0 && top != 0)
+		//Only kept when the last block takes it (and sets it back to 0): an addition without a carry out must leave it alone.
+		if ((tid & 31) == 0 && top != 0 && (carry_out != NULL || finish))
 		{
 			atomicMax(row_info + 2 * row + 1, top);
 		}

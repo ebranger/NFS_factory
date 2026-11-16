@@ -89,6 +89,9 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	candidate_file = NULL;
 	num_candidates = 0;
 	num_candidates_skipped = 0;
+	candidate_failed = false;
+	output_failed = false;
+	candidate_bytes_written = -1;
 
 	//Estiamte a good tree size for the remainder tree
 	//Choose the smallest tree where the product of the relation values at the root is at least half the size of the prime product.
@@ -201,7 +204,7 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	}
 }
 
-//Destructor, free all memory that was requested. Relations must already have been checked with Do_batch_check.
+//Destructor, free all memory that was requested. Call Finish first, so that all relations are checked; without it, the batches in progress are dropped.
 Batch_smooth::~Batch_smooth(void)
 {
 	{
@@ -421,6 +424,7 @@ bool Batch_smooth::Set_three_lp_handling(Batch_smooth* second_stage, string cand
 //(uint64)low and (uint64)high 64 bits of the cofactor.
 void Batch_smooth::Send_candidates(Batch_slot& s)
 {
+	s.candidate_bytes = -1;
 	if (result_sink)
 	{
 		return; //an other_stage gives its candidates to the writer, in Output_solutions
@@ -470,6 +474,20 @@ void Batch_smooth::Send_candidates(Batch_slot& s)
 	}
 
 	s.candidate_index.clear();
+
+	//The size of the candidate file with the candidates of this batch, for the resume position of the batch.
+	if (candidate_file != NULL)
+	{
+		if (fflush(candidate_file) != 0 || ferror(candidate_file))
+		{
+			candidate_failed = true;
+		}
+#ifdef _WIN32
+		s.candidate_bytes = _ftelli64(candidate_file);
+#else
+		s.candidate_bytes = (long long)ftello(candidate_file);
+#endif
+	}
 }
 
 void Batch_smooth::Finish()
@@ -665,14 +683,22 @@ Batch_smooth::cofactor_result Batch_smooth::Check_two_primes(Batch_slot& s, unsi
 	return COFACTOR_SMOOTH;
 }
 
-//Split a 2LP cofactor that 64-bit rho could not with tinyqs, and check the two factors. Not thread safe.
+//tinyqs keeps its state in global variables, and two objects can need it at the same time: the checks of the batches run in one
+//thread, and those of the batch check of the other side's norms (other_stage) in the thread of the writer.
+static mutex tinyqs_lock;
+
+//Split a 2LP cofactor that 64-bit rho could not with tinyqs, and check the two factors. One call at a time for each object.
 bool Batch_smooth::Split_with_tinyqs(Batch_slot& s, mpz_class& number, unsigned int index)
 {
 	*factor1 = 0;
 	*factor2 = 0;
-	int qs_sucess = tinyqs(number.get_mpz_t(), factor1->get_mpz_t(), factor2->get_mpz_t());
+	int qs_sucess;
+	{
+		lock_guard<mutex> guard(tinyqs_lock);
+		qs_sucess = tinyqs(number.get_mpz_t(), factor1->get_mpz_t(), factor2->get_mpz_t());
+	}
 
-	if (qs_sucess == 0)
+	if (qs_sucess == 0 || *factor1 * *factor2 != number)
 	{
 		//unsuccesful
 		return false;
@@ -810,6 +836,12 @@ void Batch_smooth::Run_trees(Batch_slot& s)
 		if (*value < 0)
 		{
 			*value *= -1;
+		}
+		if (*value == 0)
+		{
+			//A root of the polynomial is no relation, and the trees cannot hold a zero.
+			*value = 1;
+			s.is_smooth[index] = false;
 		}
 	}
 	t = profile_add(profile, PROF_POLY_EVAL, t);
@@ -1357,6 +1389,8 @@ void Batch_smooth::Output_solutions(Batch_slot& s)
 		s.lp2[index] = 0;
 	}
 	o->batch_end = (writer == this);
+	o->candidate_bytes = s.candidate_bytes;
+	o->failed = candidate_failed;
 	o->position[0] = s.position[0];
 	o->position[1] = s.position[1];
 	profile_add(profile, PROF_WRITE, t);
@@ -1383,7 +1417,10 @@ void Batch_smooth::Queue_output(Output_batch* o)
 		Writer_take(o);
 		return;
 	}
-	lock_guard<mutex> guard(output_lock);
+	//The checks wait when the writer falls behind, so that the relations found do not pile up in memory, and the position that is
+	//saved for a resume stays close to the one that is read.
+	unique_lock<mutex> guard(output_lock);
+	output_changed.wait(guard, [this] { return output_queue.size() < MAX_OUTPUT_QUEUE || writer_stopping; });
 	output_queue.push_back(o);
 	output_changed.notify_all();
 }
@@ -1494,6 +1531,14 @@ void Batch_smooth::Create_other_stage()
 //the norms apart, and the whole norms.
 void Batch_smooth::Submit_fallback()
 {
+	//This thread also takes the results, so it must leave room for the (up to two) jobs submitted here: a batch of very many
+	//relations found can fill many trees of other_stage before any of its lines are written.
+	while (pending_jobs.size() + 2 > OTHER_JOBS)
+	{
+		const int oldest = pending_jobs.front();
+		pending_jobs.pop_front();
+		Take_one_job(oldest);
+	}
 	if (!split_tickets.empty())
 	{
 		const int job = other_factoring->Submit_values(split_limbs.data(), split_sizes.data(), (int)split_sizes.size());
@@ -1716,28 +1761,34 @@ void Batch_smooth::Write_batch(Output_batch& o)
 	}
 	t = profile_add(profile, PROF_OTHER_SIDE, t);
 
-	if (output == NULL)
+	if (output == NULL && !output_failed)
 	{
 		output = fopen(save_filename.c_str(), "a");
 		if (output == NULL)
 		{
-			console_message("Could not open output file for writing relations.");
+			console_message("Could not open the output file " + save_filename + " for writing relations.");
+			output_failed = true;
 		}
 	}
 
 	int written = 0;
 	output_size = -1;
-	if (output != NULL)
+	if (output != NULL && !output_failed)
 	{
+		bool ok = true;
 		for (const string& line : o.lines)
 		{
 			if (!line.empty())
 			{
-				fputs(line.c_str(), output);
+				ok = fputs(line.c_str(), output) >= 0 && ok;
 				written++;
 			}
 		}
-		fflush(output);
+		if (fflush(output) != 0 || !ok)
+		{
+			console_message("Could not write relations to the output file " + save_filename + " (is the disk full?).");
+			output_failed = true;
+		}
 #ifdef _WIN32
 		_fseeki64(output, 0, SEEK_END);
 		output_size = _ftelli64(output);
@@ -1749,8 +1800,19 @@ void Batch_smooth::Write_batch(Output_batch& o)
 	num_relations_written += written;
 	profile_add(profile, PROF_WRITE, t);
 
+	if (o.failed && !output_failed)
+	{
+		console_message("Could not write to the 3LP candidate file (is the disk full?).");
+		output_failed = true;
+	}
+	if (output_failed)
+	{
+		//The position of this batch is not reported, so that a run that is started again does it once more.
+		return;
+	}
 	if (o.batch_end && batch_done)
 	{
+		candidate_bytes_written = o.candidate_bytes;
 		batch_done(o.position, output_size, num_relations_written);
 	}
 }
