@@ -115,9 +115,6 @@ Then, in the main folder of NFS_factory:
   make utils           only the utilities of the Utilities folder, build/RelationsToBinaryFormat and build/RelationFilterSplit
   make both            all of them
 
-RelationFilterSplit.cpp is saved as UTF-16, which GCC does not read; the Makefile compiles a UTF-8 copy that iconv (part of
-the C library tools on Linux) writes to build/utils.
-
 MPIR is linked statically. MPIR_DIR=<folder> sets where MPIR is installed (default /opt/mpir). The GPU build compiles for the GPUs
 of the machine (CUDA_ARCH=native); CUDA_ARCH="75 86 120" builds for others. nvcc needs a host compiler that its CUDA version
 supports, set with NVCC_CCBIN, for example make gpu NVCC_CCBIN=g++-13 for CUDA 12.4.

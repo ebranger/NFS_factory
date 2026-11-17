@@ -7,8 +7,7 @@
 #   make clean
 #
 # Needs MPIR built and installed with its C++ interface (see "Compiling the code.txt"), linked statically as in the Windows build.
-# Linux/include/intrin.h stands in for MSVC's intrinsics. Utilities/RelationFilterSplit.cpp is saved as UTF-16, which GCC cannot
-# read, so it is compiled from a UTF-8 copy made by iconv in build/utils/.
+# Linux/include/intrin.h stands in for MSVC's intrinsics.
 #
 # Settings, on the command line (make gpu CUDA_ARCH="75 86" NVCC_CCBIN=g++-13):
 #   MPIR_DIR     where MPIR is installed, with include/mpir.h and lib/libmpir.a (default /opt/mpir)
@@ -78,11 +77,8 @@ build/utils/RelationsToBinaryFormat.o: Utilities/RelationsToBinaryFormat.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c -o $@ $<
 
-build/utils/RelationFilterSplit.cpp: Utilities/RelationFilterSplit.cpp
+build/utils/RelationFilterSplit.o: Utilities/RelationFilterSplit.cpp
 	@mkdir -p $(@D)
-	iconv -f UTF-16 -t UTF-8 $< > $@
-
-build/utils/RelationFilterSplit.o: build/utils/RelationFilterSplit.cpp
 	$(CXX) $(CPPFLAGS) -INFS_factory $(CXXFLAGS) -c -o $@ $<
 
 build/cpu/%.o: %.cpp
