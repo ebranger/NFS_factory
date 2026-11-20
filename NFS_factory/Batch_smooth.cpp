@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <time.h>
 #include <limits.h>
+#include <chrono>
 #include "cofactorize.h"
 
 #include "Profile.h"
@@ -1473,8 +1474,16 @@ void Batch_smooth::Flush_writer()
 	writer->output_changed.wait(guard, [this] { return writer->output_queue.empty() && !writer->writer_busy && !writer->flush_requested; });
 }
 
-//The other_stage of the writer, if the other side's norms are factored on the GPU.
-void Batch_smooth::Create_other_stage()
+//The other_stage of the writer, if the other side's norms are factored on the GPU, when the first relations whose other side is
+//rebuilt are written (first).
+//Its bound is chosen from the norms of a sample of those relations (OTHER_STAGE_SAMPLE), factored on the CPU: the smallest 2^k with
+//on average at most OTHER_STAGE_PRIMES_ABOVE primes above it per norm. The tree then finds most of the primes, and the split of the
+//cofactor into one or two large primes most of the rest; the few norms with more primes above the bound are factored by Pollard
+//rho. A higher bound makes the tree slower, and a lower one leaves more norms to Pollard rho. For SNFS-184 (primes up to 2^26) 2^22
+//was best (68 s for 1.2G relations, against 80 s with 2^26 and 91 s with 2^28; 2.5 primes above 2^22 on average), and for SNFS-240
+//(lpb 29) 2^28 (66 s to rebuild 5.9M relations, 69 s with 2^26 and 87 s with 2^24; 2.0 primes above 2^28). The output does not
+//depend on the bound.
+void Batch_smooth::Create_other_stage(const Output_batch& first)
 {
 	other_stage_tried = true;
 	if (other_factoring == NULL || other_poly == NULL)
@@ -1488,8 +1497,98 @@ void Batch_smooth::Create_other_stage()
 		coefficient_bits = max(coefficient_bits, (int)mpz_sizeinbase(other_poly->get_coefficient((uint8)i).get_mpz_t(), 2));
 	}
 	const int norm_bits = coefficient_bits + 34 * other_poly->get_degree() + 4;
-	console_message("The factor lists of the other side of the relations found are batch checked against the primes up to 2^28.");
-	other_stage = new Batch_smooth(OTHER_STAGE_BOUND, OTHER_STAGE_LARGE_PRIME_BITS, OTHER_STAGE_MAX_COFACTOR_BITS, norm_bits, save_filename, other_poly,
+	int max_bits = 0;
+	while ((1LL << (max_bits + 1)) <= OTHER_STAGE_BOUND)
+	{
+		max_bits++;
+	}
+	if (other_large_prime_bits > 0)
+	{
+		max_bits = max(OTHER_STAGE_MIN_BOUND_BITS, min(max_bits, other_large_prime_bits));
+	}
+	const string lpb_name = string("lpb") + (side == 0 ? "a" : "r");
+
+	//The sample: for each norm, the number of its primes above 2^k (k from OTHER_STAGE_MIN_BOUND_BITS to max_bits), or -1 if it did
+	//not factor; and whether it has a prime of 2^lpb or more.
+	const int num_bounds = max_bits - OTHER_STAGE_MIN_BOUND_BITS + 1;
+	const int n = (int)min(first.waiting.size(), (size_t)OTHER_STAGE_SAMPLE);
+	vector<int> above((size_t)n * num_bounds, 0);
+	vector<char> over_lpb(n, 0);
+	const auto start = chrono::steady_clock::now();
+	parallel_for(n, 16, [&](int i)
+	{
+		mpz_class norm;
+		other_poly->evaluate_polynomial_homogenous(&norm, (int64)first.waiting[i].a, (int64)first.waiting[i].b);
+		norm = abs(norm);
+		unsigned int factors[MAX_FACTORS_IN_RELATION];
+		const int count = (norm == 0) ? -1 : factor_general(factors, norm.get_mpz_t(), MAX_FACTORS_IN_RELATION);
+		int* row = &above[(size_t)i * num_bounds];
+		for (int j = 0; j < count; j++)
+		{
+			if (other_large_prime_bits > 0 && other_large_prime_bits < 32 && factors[j] >= (1u << other_large_prime_bits))
+			{
+				over_lpb[i] = 1;
+			}
+			for (int k = 0; k < num_bounds; k++)
+			{
+				row[k] += (factors[j] > (1u << (OTHER_STAGE_MIN_BOUND_BITS + k)));
+			}
+		}
+		if (count < 0)
+		{
+			row[0] = -1;
+		}
+	});
+	int failed = 0, large = 0;
+	for (int i = 0; i < n; i++)
+	{
+		failed += (above[(size_t)i * num_bounds] < 0);
+		large += over_lpb[i];
+	}
+	int bound_bits = max_bits;
+	double mean = 0;
+	if (n - failed > 0)
+	{
+		for (int k = 0; k < num_bounds; k++)
+		{
+			long long total = 0;
+			for (int i = 0; i < n; i++)
+			{
+				const int* row = &above[(size_t)i * num_bounds];
+				total += (row[0] < 0) ? 0 : row[k];
+			}
+			mean = (double)total / (n - failed);
+			if (mean <= OTHER_STAGE_PRIMES_ABOVE)
+			{
+				bound_bits = OTHER_STAGE_MIN_BOUND_BITS + k;
+				break;
+			}
+		}
+	}
+	const double seconds = chrono::duration<double>(chrono::steady_clock::now() - start).count();
+	char text[64];
+	snprintf(text, sizeof(text), "%.1f primes above it on average, %.1f s", mean, seconds);
+	console_message("The factor lists of the other side of the relations found are batch checked against the primes up to 2^" + to_string(bound_bits) +
+		" (from " + to_string(n - failed) + " norms factored on the CPU: " + text + ").");
+	//A relation was sieved with primes below 2^lpb on this side, so its norm factors with them: a few that do not can be spurious, but
+	//more than 1 % mean a wrong lpb (or relations of another polynomial).
+	if (100 * (failed + large) > n)
+	{
+		string what;
+		if (large > 0)
+		{
+			what = to_string(large) + " have a prime of 2^" + to_string(other_large_prime_bits) + " or more";
+		}
+		if (failed > 0)
+		{
+			what += string(what.empty() ? "" : ", and ") + to_string(failed) + " did not factor with primes below 2^32";
+		}
+		console_message("Error: of the " + to_string(n) + " norms of the other side factored on the CPU, " + what + ". " +
+			(large > 0 ? "The relations were sieved with a larger bound than " + lpb_name + " " + to_string(other_large_prime_bits) +
+				" in the polynomial file: set it to the bound they were sieved with. " : "Are they relations of this polynomial? ") +
+			"The run goes on, and the factor lists of the other side are rebuilt all the same.");
+	}
+	other_stage = new Batch_smooth(1LL << bound_bits, OTHER_STAGE_LARGE_PRIME_BITS, OTHER_STAGE_MAX_COFACTOR_BITS, norm_bits, save_filename, other_poly,
 		1 - side, 1, NULL, false, OTHER_STAGE_LEVELS, backend_kind, false, 1);
 	other_stage->profile = profile_cycles_other;
 	other_stage->result_sink = [this](long long ticket, long long a, long long b, bool factored, vector<unsigned long long>& primes,
@@ -1625,7 +1724,7 @@ void Batch_smooth::Writer_take(Output_batch* o)
 	unsigned long long t = profile_now();
 	if (!o->waiting.empty() && !other_stage_tried)
 	{
-		Create_other_stage();
+		Create_other_stage(*o);
 	}
 	for (Output_batch::Waiting& w : o->waiting)
 	{

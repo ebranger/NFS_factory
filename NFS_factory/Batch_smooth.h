@@ -18,7 +18,11 @@ using namespace std;
 
 #define MAX_SAVED_PRIMES 64 //Most primes in the saved factor list of a relation from a binary relation file.
 #define MAX_COFACTOR_PRIMES 96 //Most prime factors of a 3LP cofactor, which is less than 2^96.
-#define OTHER_STAGE_BOUND (1 << 28) //The norms of the other side of the relations found are batch checked against the primes up to this
+#define OTHER_STAGE_BOUND (1 << 28) //The norms of the other side of the relations found are batch checked against the primes up to at most this
+//(and at most 2^lpb of that side: Batch_smooth::other_large_prime_bits), chosen from a sample (OTHER_STAGE_SAMPLE),
+#define OTHER_STAGE_MIN_BOUND_BITS 16 //and at least 2^this:
+#define OTHER_STAGE_SAMPLE 1000 //the norms of up to this many of the first relations found are factored on the CPU, and the bound is
+#define OTHER_STAGE_PRIMES_ABOVE 2.5 //the smallest power of two with at most this many primes above it per norm on average;
 #define OTHER_STAGE_LARGE_PRIME_BITS 32 //and their cofactors split into two large primes of up to this many bits (see Batch_smooth);
 #define OTHER_STAGE_MAX_COFACTOR_BITS 128 //larger cofactors of up to this many bits are factored apart from the rest of the norm.
 #define MAX_OUTPUT_QUEUE 4 //Batches of relations found that can wait for the writer before the checks wait for it.
@@ -166,7 +170,8 @@ private:
 	bool writer_stopping;
 	bool flush_requested;
 
-	//The batch check of the other side's norms (on the GPU): a Batch_smooth of the other side, with the primes up to OTHER_STAGE_BOUND
+	//The batch check of the other side's norms (on the GPU): a Batch_smooth of the other side, with the primes up to a bound chosen by
+	//Create_other_stage
 	//and two large primes, which the writer makes when the first norms come. A relation was already found, so its norm is smooth: the
 	//tree leaves a cofactor of the large primes, which the checks split, and the rest is factored with the leaves. Its results come
 	//back to the writer by number (ticket), through result_sink. For the norms with more large primes (about a quarter on SNFS-240),
@@ -191,7 +196,7 @@ private:
 	unordered_map<int, vector<long long>> job_tickets; //the tickets of the jobs not yet taken, in their order in the job
 	unordered_map<int, bool> job_split; //a job of values, two for each ticket
 	deque<int> pending_jobs; //in the order they were submitted, which is the order their results must be taken in
-	void Create_other_stage();
+	void Create_other_stage(const Output_batch& first);
 	void Submit_fallback();
 	void Take_job(int job);
 	void Take_one_job(int job);
@@ -224,6 +229,10 @@ public:
 	//"format: keys": write only a,b of the relations found, without factoring them or rebuilding the other side (for building
 	//a store of pairs, where only smoothness matters).
 	bool keys_only = false;
+	//lpbr or lpba of the side whose factor lists are rebuilt (0 if not known): the relations were sieved with that large prime bound,
+	//so their norms have no larger primes. It caps the bound of the batch check of those norms (see Create_other_stage), and a sample
+	//of them is checked against it. Larger primes, if a norm has them, are still found, with the cofactor.
+	int other_large_prime_bits = 0;
 private:
 
 	bool using_snfs_deg4_binomial;

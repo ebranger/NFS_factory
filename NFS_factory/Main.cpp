@@ -1667,6 +1667,8 @@ int main(int argc, char* argv[])
 	bool rational = (param->smoothness_checking_side == 0);
 	long long lim = rational ? param->rlim : param->alim;
 	int lbp = rational ? param->lbpr : param->lbpa;
+	//The large prime bound of the other side, for rebuilding its factor lists (Batch_smooth::other_large_prime_bits).
+	const int other_lbp = rational ? param->lbpa : param->lbpr;
 	int mfb = rational ? param->mfbr : param->mfba;
 	string side_name = rational ? "r" : "a";
 
@@ -1736,11 +1738,13 @@ int main(int argc, char* argv[])
 		cout << "Checking 3LP candidates against all primes up to 2^" << lbp << "." << endl;
 		batch = new Batch_smooth(lim, lbp, mfb, 3 * lbp, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->cado_format, param->tree_levels_3lp, param->backend, true);
 		batch->keys_only = param->keys_only;
+		batch->other_large_prime_bits = other_lbp;
 	}
 	else
 	{
 		batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->cado_format, param->tree_levels, param->backend, false, param->pipeline);
 		batch->keys_only = param->keys_only;
+		batch->other_large_prime_bits = other_lbp;
 	}
 
 	if (three_lp)
@@ -1764,6 +1768,7 @@ int main(int argc, char* argv[])
 			cout << "Checking 3LP candidates of up to " << mfb << " bits against all primes up to 2^" << lbp << " during the run." << endl;
 			second_stage = new Batch_smooth(lim, lbp, mfb, 3 * lbp, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->cado_format, param->tree_levels, param->backend, true);
 			second_stage->keys_only = param->keys_only;
+			second_stage->other_large_prime_bits = other_lbp;
 		}
 
 		if (!batch->Set_three_lp_handling(second_stage, candidate_filename))
