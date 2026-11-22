@@ -23,12 +23,21 @@ using namespace std;
 #define OTHER_STAGE_MIN_BOUND_BITS 16 //and at least 2^this:
 #define OTHER_STAGE_SAMPLE 1000 //the norms of up to this many of the first relations found are factored on the CPU, and the bound is
 #define OTHER_STAGE_PRIMES_ABOVE 2.5 //the smallest power of two with at most this many primes above it per norm on average;
-#define OTHER_STAGE_LARGE_PRIME_BITS 32 //and their cofactors split into two large primes of up to this many bits (see Batch_smooth);
+#define OTHER_STAGE_LARGE_PRIME_BITS 32 //and their cofactors split into two large primes of up to this many bits (see Batch_smooth),
+//or as many as the large prime bound of that side, if that is more;
+#define MAX_LARGE_PRIME_BITS 34 //The largest large prime bound (lpbr, lpba) of either side.
 #define OTHER_STAGE_MAX_COFACTOR_BITS 128 //larger cofactors of up to this many bits are factored apart from the rest of the norm.
-#define MAX_OUTPUT_QUEUE 4 //Batches of relations found that can wait for the writer before the checks wait for it.
+#define MAX_OUTPUT_QUEUE 64 //Batches of relations found that can wait for the writer before the checks wait for it: the writer takes
+//them unevenly, a tree of the other side's norms at a time.
 #define OTHER_STAGE_LEVELS 18 //Levels of the tree of those norms: 2^17 of them at a time.
+#define OTHER_STAGE_PIPELINE 3 //Batches of those norms in progress at once, when the batches of the relations are checked in a pipeline.
+#define OTHER_STAGE_GPU_BYTES 1.5e9 //Memory of the GPU kept free for that check when the batches in progress are chosen (a tree is about 1 GB).
+#define DEFAULT_TREE_THREADS 2 //Threads of the trees of a pipeline (the trees option of the polynomial file).
+#define KEYS_TREE_THREADS 3 //The same with "format: keys", where the relations found are not factored, and the GPU has room for a third.
 
 class Batch_smooth;
+
+enum saved_list_kind { LIST_NONE, LIST_TEXT, LIST_BINARY }; //Batch_slot::has_list
 
 //The relations found in a batch (or a batch of the 3LP second stage), on their way to the output file: see Batch_smooth::Queue_output.
 struct Output_batch
@@ -56,21 +65,27 @@ struct Batch_slot
 {
 	Tree_backend* tree; //the product and remainder trees, with the relation values as leaves.
 	long long *a_vals, *b_vals;
-	char** list_of_factors; //holds the already known smooth side factor list, as text or (binary_lists) as the number of primes followed by the primes.
-	bool binary_lists;
+	char** list_of_factors; //holds the already known smooth side factor list, as text or as the number of primes followed by the primes:
+	unsigned char* has_list; //which of them for each relation (a batch can have relations of several files), or LIST_NONE for the
+	//relations added without one (Fill_done: pairs of only a and b), whose entry in list_of_factors is not set.
 	bool* is_smooth; //set by the batch check for relations that are smooth.
 	unsigned long long *lp1, *lp2; //the large primes of the relations
 	int entries;
 	long long sequence; //the number of the batch
+	unsigned long long stamp; //when its last stage ended (Batch_smooth::Stage)
 	long long position[2]; //the read position of its last relation, as given by Set_read_position
 	long long candidate_bytes; //see Output_batch
 	size_t root_bits; //of the product tree
 	bool tree_factors; //the tree factored the smooth relations of the batch (Tree_backend::Leaf_factors)
+	bool pairs_possible; //the tree can compute the values of the pairs itself (Tree_backend::Set_leaf_polynomial),
+	bool pairs; //and did so for this batch: its leaves are then not set on the CPU (Batch_smooth::Leaf_value)
 	mpz_class temp_number;
-	vector<unsigned char> leaf_result; //cofactor_result of each leaf
-	vector<string> relation_texts;
-	vector<unsigned char> relation_result;
-	vector<unsigned char> relation_waiting; //for the factors of its other side
+	vector<unsigned char> leaf_result; //cofactor_result of the leaves that are not ruled out:
+	vector<int> items; //those leaves, in increasing order, and for each of them (Batch_smooth::Run_checks)
+	vector<string> item_text; //the text of its relation,
+	vector<unsigned char> item_result; //its relation_status,
+	vector<unsigned char> item_waiting; //whether it waits for the factors of its other side,
+	vector<vector<unsigned long long>> item_found; //and in an other_stage, its prime factors.
 	vector<int> candidate_index; //3LP candidates of the batch, sent on after the batch is checked.
 	vector<mpz_class> candidate_cofactor;
 };
@@ -86,15 +101,22 @@ public:
 	//backend: the implementation of the tree computations.
 	//three_lp_stage: if true, this is the 3LP second stage. Its inputs are the cofactors given with Add_candidate, which are checked against all primes below 2^lbp (fblim and mfb are not used).
 	//pipeline: the number of batches in progress at once (see Batch_slot), each with its own tree, or 0 for the default of the
-	//backend (default_pipeline). 1 checks each batch when it is full, in the calling thread. With more, the batches are checked in a pipeline of threads while the next ones are read: the
-	//polynomial values and the trees (by up to four threads, as the trees use the GPU), then the cofactors and the factor lists of the
-	//relations found (one thread), and the output (one thread), both in the order of the batches, so that the output does not depend
-	//on the pipeline. The second stage always uses 1, and its relations are written by the writer of the first stage.
-	Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, bool rebuild_other_side, int max_tree_levels, tree_backend_kind backend, bool three_lp_stage = false, int pipeline = 1);
+	//backend (default_pipeline). 1 checks each batch when it is full, in the calling thread. With more, the batches are checked in a
+	//pipeline of threads while the next ones are read: the trees (tree_threads of them, 0 for DEFAULT_TREE_THREADS), then the
+	//cofactors and the factor lists of the relations found (Run_checks, by a thread for each of the other batches in progress, which
+	//mostly wait for the GPU), then the steps that must be done in the order of the batches (one thread), and the output (one
+	//thread), so that the output does not depend on the pipeline. The second stage always uses 1, and its relations are written by
+	//the writer of the first stage.
+	Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, bool rebuild_other_side, int max_tree_levels, tree_backend_kind backend, bool three_lp_stage = false, int pipeline = 1, int tree_threads = 0);
 	~Batch_smooth(void);
 	void Finish(); //Check the remaining relations, and any 3LP candidates in the second stage. Call once, after the last relation.
 	bool Add_number(long long a_val, long long b_val, const char* relation_factor_list);
 	bool Add_number_binary(long long a_val, long long b_val, const unsigned int* primes, unsigned int num_primes);
+	//Relations of only a and b, many at once: Fill_room gives where the next a and b of the batch being filled go, and how many it
+	//still takes (at least 1). The caller writes up to that many, and Fill_done adds them, as Add_number_binary without primes does
+	//one at a time; a batch that is full is handed on.
+	int Fill_room(long long*& a, long long*& b);
+	void Fill_done(int count);
 	bool Add_candidate(long long a_val, long long b_val, const unsigned int* primes, unsigned int num_primes, mpz_srcptr cofactor);
 	long long Get_num_relations_found(); //including the 3LP second stage, and those not yet written (see Set_batch_done)
 	long long Get_num_3lp_relations_found(); //by the 3LP second stage
@@ -139,14 +161,20 @@ private:
 	void Submit();
 	void Run_trees(Batch_slot& s);
 	void Run_checks(Batch_slot& s);
+	void Make_item(Batch_slot& s, int k);
+	void Leaf_value(Batch_slot& s, int index, mpz_class& value);
+	void Stage(Batch_slot& s, profile_stage stage);
+	void Order_checks(Batch_slot& s);
 	void Tree_worker();
+	void Collect_worker();
 	void Check_worker();
 	void Output_solutions(Batch_slot& s);
 	enum relation_status { RELATION_WRITTEN, RELATION_FACTORING_FAILED, RELATION_OTHER_SIDE_FAILED };
 	relation_status Format_relation(Batch_slot& s, int index, string& relation_text, bool& waiting);
-	relation_status Factor_checked_side(Batch_slot& s, int index, unsigned int* large, int& num_large, unsigned int* factors, int& num_factors);
+	relation_status Factor_checked_side(Batch_slot& s, int index, unsigned long long* large, int& num_large, unsigned long long* factors, int& num_factors);
 	string Relation_line(long long a, long long b, const string& checked_side, const string& other_side);
-	bool Complete_other_side(long long a, long long b, vector<unsigned long long>& primes, const unsigned int* factors, int num_factors, string& list);
+	bool Complete_other_side(long long a, long long b, vector<unsigned long long>& primes, const unsigned long long* factors, int num_factors, string& list);
+	int Other_prime_bits();
 	bool Saved_list_divides(Batch_slot& s, int index);
 
 	//The output. The relations found in each batch go, in order, to the writer: with a pipeline its own thread, otherwise the thread
@@ -181,7 +209,7 @@ private:
 	Batch_smooth* other_stage;
 	bool other_stage_tried, other_stage_finished;
 	long long other_tickets; //norms given to other_stage
-	enum other_state { OTHER_FACTORED, OTHER_FAILED, OTHER_IN_JOB };
+	enum other_state { OTHER_FACTORED, OTHER_FAILED, OTHER_IN_JOB, OTHER_SKIPPED }; //OTHER_SKIPPED: the norm is not smooth
 	struct Other_result
 	{
 		other_state state;
@@ -203,6 +231,9 @@ private:
 	//Set if this is an other_stage. For a norm that was not factored, cofactor is the part with the primes above the bound of the tree,
 	//if it is a candidate (NULL if not), and norm the norm.
 	function<void(long long ticket, long long a, long long b, bool factored, vector<unsigned long long>& primes, const mpz_class* cofactor, const mpz_class* norm)> result_sink;
+	function<void()> sink_batch_done; //called after the results of a batch of an other_stage were given to result_sink
+	mutex other_lock; //for other_results and the lists of norms for other_factoring, which other_stage fills from a thread of its own
+	bool results_arrived; //other_stage gave results since the writer last looked (under output_lock)
 	long long sink_next; //the ticket of the next relation of an other_stage
 	mutex output_lock;
 	condition_variable output_changed;
@@ -227,8 +258,9 @@ private:
 	bool rebuild_all; //for every relation, not only those without a saved list
 public:
 	//"format: keys": write only a,b of the relations found, without factoring them or rebuilding the other side (for building
-	//a store of pairs, where only smoothness matters).
+	//a store of pairs, where only smoothness matters). Set with Set_keys_only, before the first relation.
 	bool keys_only = false;
+	void Set_keys_only();
 	//lpbr or lpba of the side whose factor lists are rebuilt (0 if not known): the relations were sieved with that large prime bound,
 	//so their norms have no larger primes. It caps the bound of the batch check of those norms (see Create_other_stage), and a sample
 	//of them is checked against it. Larger primes, if a norm has them, are still found, with the cofactor.
@@ -277,7 +309,8 @@ private:
 	condition_variable changed;
 	deque<Batch_slot*> free_slots;
 	deque<Batch_slot*> tree_queue;
-	vector<Batch_slot*> trees_done; //waiting for the checks
+	deque<Batch_slot*> collect_queue; //the trees are done: waiting for Run_checks
+	vector<Batch_slot*> trees_done; //waiting for the checks in the order of the batches
 	long long submitted; //batches submitted
 	long long checked; //batches checked and written
 	bool stopping;

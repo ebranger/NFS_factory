@@ -17,6 +17,7 @@ typedef unsigned int u32;
 #define RHO_MPZ_MAX_ITERATIONS (1 << 19) //The same for rho in MPIR arithmetic on values of more than 128 bits, which is slower, so it gives up sooner.
 #define RHO_GCD_INTERVAL 64 //Iterations between the gcd computations in rho.
 #define MAX_PENDING 128 //Most cofactors waiting to be split.
+#define MAX_WIDE_FACTORS 512 //Most factors of a value: each is at least 2, and the values have at most 512 bits.
 
 static const u32 small_primes[] = { 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97 };
 
@@ -245,8 +246,26 @@ static inline u128 difference(const u128& a, const u128& b)
 	return d;
 }
 
-//Find a nontrivial factor of the odd composite n with Pollard-Brent rho. Returns false if none was found.
-static bool rho(const u128& n, u128* factor)
+static bool sprp2_64(u64 n);
+static bool sprp2_128(const u128& n);
+
+//Whether a strong probable prime to base 2 is a prime: MPIR's test, for the very few composites that pass the first.
+static bool is_prime_mpz(const u128& n)
+{
+	mpz_t value;
+	mpz_init_set_ui(value, (mpir_ui)n.hi);
+	mpz_mul_2exp(value, value, 64);
+	mpz_add_ui(value, value, (mpir_ui)n.lo);
+	const bool prime = mpz_probab_prime_p(value, 12) != 0;
+	mpz_clear(value);
+	return prime;
+}
+
+//Find a nontrivial factor of the odd composite n with Pollard-Brent rho. Returns false if none was found. With stop_at_limit, a
+//walk that reaches RHO_MAX_ITERATIONS without a factor is the last: n then has no prime factor below 2^32 (a walk finds one in
+//about 2^16 steps, and one of 2^20 steps misses it with a probability of about exp(-100)), and the other constants, which are
+//for walks that find all factors in the same step, would only take five times as long to say the same.
+static bool rho(const u128& n, u128* factor, bool stop_at_limit = false, u64 limit = RHO_MAX_ITERATIONS)
 {
 	u64 ninv = montgomery_inverse(n.lo);
 	u128 one = { 1, 0 };
@@ -257,7 +276,7 @@ static bool rho(const u128& n, u128* factor)
 		u128 y = { 2, 0 }, x = y, saved_y = y, q = one, g = one;
 		u64 r = 1;
 
-		while (equal(g, one) && r <= RHO_MAX_ITERATIONS)
+		while (equal(g, one) && r <= limit)
 		{
 			x = y;
 			for (u64 i = 0; i < r; i++)
@@ -279,6 +298,10 @@ static bool rho(const u128& n, u128* factor)
 			r *= 2;
 		}
 
+		if (stop_at_limit && equal(g, one))
+		{
+			return false;
+		}
 		if (equal(g, n))
 		{
 			//Several factors were found at once, go back and take one step at a time.
@@ -338,8 +361,8 @@ static u64 gcd64(u64 a, u64 b)
 	return a;
 }
 
-//Pollard-Brent rho for an odd composite n < 2^64. Returns false if no factor was found.
-static bool rho64(u64 n, u64* factor)
+//Pollard-Brent rho for an odd composite n < 2^64. Returns false if no factor was found. stop_at_limit: as for rho.
+static bool rho64(u64 n, u64* factor, bool stop_at_limit = false, u64 limit = RHO_MAX_ITERATIONS)
 {
 	u64 ninv = montgomery_inverse(n);
 
@@ -348,7 +371,7 @@ static bool rho64(u64 n, u64* factor)
 		u64 y = 2, x = y, saved_y = y, q = 1, g = 1;
 		u64 r = 1;
 
-		while (g == 1 && r <= RHO_MAX_ITERATIONS)
+		while (g == 1 && r <= limit)
 		{
 			x = y;
 			for (u64 i = 0; i < r; i++)
@@ -370,6 +393,10 @@ static bool rho64(u64 n, u64* factor)
 			r *= 2;
 		}
 
+		if (stop_at_limit && g == 1)
+		{
+			return false;
+		}
 		if (g == n || g == 0)
 		{
 			//Several factors were found at once, go back and take one step at a time.
@@ -458,7 +485,83 @@ static bool is_prime32(u64 n)
 	return true;
 }
 
-int factor_smooth(unsigned int* factors, mpz_srcptr value, int max_factors)
+static inline u64 montgomery_multiply64(u64 a, u64 b, u64 n, u64 ninv);
+static u64 montgomery_inverse(u64 n);
+
+//Strong probable prime test to the base b (less than 64), for odd n >= 2^32 that b does not divide, with Montgomery arithmetic.
+static bool sprp64(u64 n, u64 b)
+{
+	const u64 ninv = montgomery_inverse(n);
+	const u64 one = (0 - n) % n; //2^64 mod n
+	const u64 minus_one = n - one;
+	//b in Montgomery form: b times one modulo n, by doubling and adding.
+	u64 base = 0;
+	for (int bit = 5; bit >= 0; bit--)
+	{
+		u64 doubled = base + base;
+		if (doubled < base || doubled >= n)
+		{
+			doubled -= n;
+		}
+		base = doubled;
+		if ((b >> bit) & 1)
+		{
+			u64 sum = base + one;
+			if (sum < base || sum >= n)
+			{
+				sum -= n;
+			}
+			base = sum;
+		}
+	}
+	unsigned long s;
+	_BitScanForward64(&s, n - 1);
+	const u64 d = (n - 1) >> s;
+	unsigned long top;
+	_BitScanReverse64(&top, d);
+	u64 x = one;
+	for (int i = (int)top; i >= 0; i--)
+	{
+		x = montgomery_multiply64(x, x, n, ninv);
+		if ((d >> i) & 1)
+		{
+			x = montgomery_multiply64(x, base, n, ninv);
+		}
+	}
+	if (x == one || x == minus_one)
+	{
+		return true;
+	}
+	for (unsigned long i = 1; i < s; i++)
+	{
+		x = montgomery_multiply64(x, x, n, ninv);
+		if (x == minus_one)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool is_prime64(unsigned long long n)
+{
+	if (n < ((u64)1 << 32))
+	{
+		return is_prime32(n);
+	}
+	//Strong probable prime to the primes up to 37, which leaves no composite below 2^64.
+	static const u64 bases[] = { 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37 };
+	for (u64 b : bases)
+	{
+		if (n % b == 0 || !sprp64(n, b))
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+int factor_smooth_wide(unsigned long long* factors, mpz_srcptr value, int max_factors, int max_prime_bits)
 {
 	int size = abs(value->_mp_size);
 	if (size == 0 || size > 2)
@@ -469,6 +572,8 @@ int factor_smooth(unsigned int* factors, mpz_srcptr value, int max_factors)
 	u128 n = { value->_mp_d[0], (size > 1) ? value->_mp_d[1] : 0 };
 	u128 one = { 1, 0 };
 	int count = 0;
+	//The walks of rho are four times as long for each two bits more of the primes.
+	const u64 rho_limit = (u64)RHO_MAX_ITERATIONS << ((max_prime_bits > 32) ? (max_prime_bits - 31) / 2 : 0);
 
 	//Factors of 2.
 	while ((n.lo & 1) == 0)
@@ -513,17 +618,18 @@ int factor_smooth(unsigned int* factors, mpz_srcptr value, int max_factors)
 	{
 		u128 c = pending[--num_pending];
 
-		if (c.hi == 0 && c.lo < ((u64)1 << 32) && is_prime32(c.lo))
+		if (c.hi == 0 && (max_prime_bits >= 64 || (c.lo >> max_prime_bits) == 0) && is_prime64(c.lo))
 		{
 			if (count >= max_factors)
 			{
 				return -1;
 			}
-			factors[count++] = (u32)c.lo;
+			factors[count++] = c.lo;
 			continue;
 		}
 
-		//c is composite, unless it has a prime factor above 2^32, in which case rho fails.
+		//c is composite, or a prime of 2^max_prime_bits or more: the value then has a prime factor that is too large, which is
+		//known at once from a primality test, where rho would walk all its steps without finding a factor.
 		u128 d = { 0, 0 };
 		if (num_pending + 2 > MAX_PENDING)
 		{
@@ -533,12 +639,12 @@ int factor_smooth(unsigned int* factors, mpz_srcptr value, int max_factors)
 		if (c.hi == 0)
 		{
 			//Rho with 64-bit arithmetic was about twice as fast as SQUFOF here.
-			if (!rho64(c.lo, &d.lo))
+			if ((sprp2_64(c.lo) && is_prime_mpz(c)) || !rho64(c.lo, &d.lo, true, rho_limit))
 			{
 				return -1;
 			}
 		}
-		else if (!rho(c, &d))
+		else if ((sprp2_128(c) && is_prime_mpz(c)) || !rho(c, &d, true, rho_limit))
 		{
 			return -1;
 		}
@@ -563,9 +669,20 @@ int factor_smooth(unsigned int* factors, mpz_srcptr value, int max_factors)
 	return count;
 }
 
+int factor_smooth(unsigned int* factors, mpz_srcptr value, int max_factors)
+{
+	u64 wide[MAX_WIDE_FACTORS];
+	const int count = factor_smooth_wide(wide, value, std::min(max_factors, MAX_WIDE_FACTORS), 32);
+	for (int i = 0; i < count; i++)
+	{
+		factors[i] = (u32)wide[i];
+	}
+	return count;
+}
+
 //Find a nontrivial factor of the odd composite n, of more than 128 bits, with Pollard-Brent rho in MPIR arithmetic.
 //Returns false if none was found.
-static bool rho_mpz(mpz_srcptr n, mpz_ptr factor)
+static bool rho_mpz(mpz_srcptr n, mpz_ptr factor, u64 limit = RHO_MPZ_MAX_ITERATIONS)
 {
 	mpz_t x, y, saved_y, q, t;
 	mpz_inits(x, y, saved_y, q, t, NULL);
@@ -578,7 +695,8 @@ static bool rho_mpz(mpz_srcptr n, mpz_ptr factor)
 		mpz_set_ui(factor, 1);
 		u64 r = 1;
 
-		while (mpz_cmp_ui(factor, 1) == 0 && r <= RHO_MPZ_MAX_ITERATIONS)
+		bool walked_out = false; //the walk reached its limit without a factor: n has none below 2^32 (see rho)
+		while (mpz_cmp_ui(factor, 1) == 0 && r <= limit)
 		{
 			mpz_set(x, y);
 			for (u64 i = 0; i < r; i++)
@@ -604,6 +722,11 @@ static bool rho_mpz(mpz_srcptr n, mpz_ptr factor)
 				mpz_gcd(factor, q, n);
 			}
 			r *= 2;
+		}
+		walked_out = mpz_cmp_ui(factor, 1) == 0;
+		if (walked_out)
+		{
+			break;
 		}
 
 		if (mpz_cmp(factor, n) == 0 || mpz_sgn(factor) == 0)
@@ -651,11 +774,11 @@ static const std::vector<u32>& trial_division_primes()
 	return primes;
 }
 
-int factor_general(unsigned int* factors, mpz_srcptr value, int max_factors)
+int factor_general_wide(unsigned long long* factors, mpz_srcptr value, int max_factors, int max_prime_bits)
 {
 	if (abs(value->_mp_size) <= 2)
 	{
-		int count = factor_smooth(factors, value, max_factors);
+		int count = factor_smooth_wide(factors, value, max_factors, max_prime_bits);
 		if (count >= 0 || value->_mp_size == 0)
 		{
 			return count;
@@ -709,7 +832,7 @@ int factor_general(unsigned int* factors, mpz_srcptr value, int max_factors)
 
 		if (abs(c->_mp_size) <= 2)
 		{
-			int found = factor_smooth(factors + count, c, max_factors - count);
+			int found = factor_smooth_wide(factors + count, c, max_factors - count, max_prime_bits);
 			failed = found < 0;
 			count += failed ? 0 : found;
 			mpz_clear(pending[--num_pending]);
@@ -717,7 +840,8 @@ int factor_general(unsigned int* factors, mpz_srcptr value, int max_factors)
 		}
 
 		//More than 128 bits: a prime that large cannot be a factor below 2^32.
-		failed = num_pending + 1 > MAX_PENDING || mpz_probab_prime_p(c, 1) != 0 || !rho_mpz(c, d);
+		failed = num_pending + 1 > MAX_PENDING || mpz_probab_prime_p(c, 1) != 0 ||
+			!rho_mpz(c, d, (u64)RHO_MPZ_MAX_ITERATIONS << ((max_prime_bits > 32) ? (max_prime_bits - 31) / 2 : 0));
 		if (!failed)
 		{
 			mpz_divexact(c, c, d);
@@ -739,10 +863,39 @@ int factor_general(unsigned int* factors, mpz_srcptr value, int max_factors)
 	return count;
 }
 
+int factor_general(unsigned int* factors, mpz_srcptr value, int max_factors)
+{
+	u64 wide[MAX_WIDE_FACTORS];
+	const int count = factor_general_wide(wide, value, std::min(max_factors, MAX_WIDE_FACTORS), 32);
+	for (int i = 0; i < count; i++)
+	{
+		factors[i] = (u32)wide[i];
+	}
+	return count;
+}
+
 //Find a nontrivial factor of an odd composite n < 2^64 with Pollard-Brent rho. Returns false if none was found.
 bool split_composite64(unsigned long long n, unsigned long long* factor)
 {
 	return rho64(n, factor);
+}
+
+//The same for an odd composite of up to 128 bits (lo, hi), with the factor as two limbs.
+bool split_composite128(unsigned long long lo, unsigned long long hi, unsigned long long* factor_lo, unsigned long long* factor_hi)
+{
+	u128 n = { lo, hi }, factor = { 0, 0 };
+	if (hi == 0)
+	{
+		*factor_hi = 0;
+		return rho64(lo, factor_lo);
+	}
+	if (!rho(n, &factor))
+	{
+		return false;
+	}
+	*factor_lo = factor.lo;
+	*factor_hi = factor.hi;
+	return true;
 }
 
 //Strong probable prime test to base 2 for odd n, 2^32 <= n < 2^64. one is 2^64 mod n, the Montgomery form of 1.

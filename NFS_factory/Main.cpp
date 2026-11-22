@@ -57,6 +57,7 @@ using namespace std;
 #define READ_AHEAD_BLOCKS 4 //Reads of READ_BUFFER_SIZE in flight at once (Windows): a hard disk then reads at full speed.
 #define AB_HEADER_BYTES 16 //The (a,b)-only relation format (.ab): see read_batch_from_ab_file.
 #define AB_RECORD_BYTES 12
+#define AB_PIECE_RECORDS 4096 //Records of an .ab file added to a batch at once, between checks whether the run should stop.
 #define AB_VERSION 1
 #define STAGE2_ONLY_TREE_LEVELS 22 //Default maximum number of levels in the remainder tree of a run on a 3LP candidate file. Such runs are few, so they can use more memory than the runs on relation files.
 
@@ -81,6 +82,7 @@ struct nfs_parameters {
 	string file_3lp; // File for the saved 3LP candidates. Empty means the default name.
 	tree_backend_kind backend; // How the products of the trees are computed.
 	int pipeline; // Batches in progress at once (see Batch_smooth). 0 means the default: on the GPU from its free memory, otherwise 1.
+	int tree_threads; // Threads of the trees of a pipeline (see Batch_smooth). 0 means the default.
 };
 
 //Remove leading and trailing whitespace.
@@ -295,6 +297,16 @@ bool read_polynomial(string filename, nfs_parameters* params)
 				if (params->pipeline < 1)
 				{
 					cout << "pipeline on line " << line_number << " of the polynomial file must be at least 1." << endl;
+					return false;
+				}
+			}
+			//The threads of the trees of a pipeline.
+			else if (data == "trees")
+			{
+				params->tree_threads = stoi(line);
+				if (params->tree_threads < 1)
+				{
+					cout << "trees on line " << line_number << " of the polynomial file must be at least 1." << endl;
 					return false;
 				}
 			}
@@ -738,7 +750,13 @@ struct run_progress
 	//reading should stop.
 	bool Relation_added(long long records_read, nfs_parameters* param)
 	{
-		relations_added++;
+		return Relations_added(1, records_read, param);
+	}
+
+	//The same after count relations added at once (Batch_smooth::Fill_done).
+	bool Relations_added(long long count, long long records_read, nfs_parameters* param)
+	{
+		relations_added += count;
 		read_records = records_read;
 		if (target_reached || Check_target() || batch->Output_failed())
 		{
@@ -1370,30 +1388,46 @@ read_result read_batch_from_ab_file(string filename, Batch_smooth* batch, nfs_pa
 		return READ_FAILED;
 	}
 
-	while (input.ensure(AB_RECORD_BYTES))
+	//The records in the buffer go straight into the batch being filled, in pieces of up to AB_PIECE_RECORDS (and no more than
+	//the batch has room for, or maxrels allows), after each of which the run can stop.
+	while (!stopped && input.ensure(AB_RECORD_BYTES))
 	{
-		long long a;
-		unsigned int b;
-		const unsigned char* record = input.data.data() + input.position;
-		memcpy(&a, record, sizeof(long long));
-		memcpy(&b, record + 8, sizeof(unsigned int));
-		input.position += AB_RECORD_BYTES;
-		records++;
-
-		if (!relation_in_range(a, b, param))
+		size_t available = (input.filled - input.position) / AB_RECORD_BYTES;
+		while (available > 0 && !stopped)
 		{
-			skipped_relations++;
-			continue;
-		}
-
-		progress.Adding(records);
-		batch->Add_number_binary(a, b, NULL, 0);
-		relation_num++;
-
-		if (progress.Relation_added(records, param))
-		{
-			stopped = true;
-			break;
+			long long *a_out, *b_out;
+			size_t piece = std::min(available, (size_t)AB_PIECE_RECORDS);
+			piece = std::min(piece, (size_t)batch->Fill_room(a_out, b_out));
+			if (param->maxrels > 0)
+			{
+				piece = std::min(piece, (size_t)(param->maxrels - progress.relations_added));
+			}
+			const unsigned char* record = input.data.data() + input.position;
+			const long long maxa = param->maxa, maxb = param->maxb;
+			int added = 0;
+			for (size_t i = 0; i < piece; i++, record += AB_RECORD_BYTES)
+			{
+				long long a;
+				unsigned int b;
+				memcpy(&a, record, sizeof(long long));
+				memcpy(&b, record + 8, sizeof(unsigned int));
+				//As relation_in_range.
+				const bool in_range = a != LLONG_MIN && (a < 0 ? -a : a) <= maxa && b > 0 && (long long)b <= maxb;
+				a_out[added] = a;
+				b_out[added] = b;
+				added += in_range;
+			}
+			skipped_relations += (long long)piece - added;
+			input.position += piece * AB_RECORD_BYTES;
+			records += (long long)piece;
+			available -= piece;
+			if (added > 0)
+			{
+				progress.Adding(records);
+				batch->Fill_done(added);
+				relation_num += added;
+				stopped = progress.Relations_added(added, records, param);
+			}
 		}
 	}
 
@@ -1584,6 +1618,7 @@ int main(int argc, char* argv[])
 	//Wall-clock time: clock() is wall time with MSVC, but the CPU time of all threads on Linux.
 	std::chrono::steady_clock::time_point time;
 	unsigned long long program_start = profile_now();
+	const auto program_start_time = chrono::steady_clock::now();
 
 	nfs_parameters* param = new nfs_parameters();
 	param->maxa = LLONG_MAX; //No limit unless set in the polynomial file.
@@ -1597,6 +1632,7 @@ int main(int argc, char* argv[])
 	param->tree_levels_3lp = STAGE2_ONLY_TREE_LEVELS;
 	param->save_3lp = false;
 	param->pipeline = 0;
+	param->tree_threads = 0;
 #ifdef NFS_GPU
 	param->backend = TREE_BACKEND_GPU;
 #else
@@ -1685,9 +1721,16 @@ int main(int argc, char* argv[])
 		return -1;
 	}
 
-	if (lbp < 1 || lbp > 32)
+	//The large primes of the relations can have more than 32 bits, up to MAX_LARGE_PRIME_BITS, on either side.
+	if (lbp < 1 || lbp > MAX_LARGE_PRIME_BITS)
 	{
-		cout << "The large prime bound lpb" << side_name << " is missing, or larger than 32 bits, in the polynomial file." << endl;
+		cout << "The large prime bound lpb" << side_name << " is missing, or larger than " << MAX_LARGE_PRIME_BITS << " bits, in the polynomial file." << endl;
+		return -1;
+	}
+
+	if (other_lbp > MAX_LARGE_PRIME_BITS)
+	{
+		cout << "The large prime bound lpb" << (rational ? "a" : "r") << " of the other side is larger than " << MAX_LARGE_PRIME_BITS << " bits in the polynomial file." << endl;
 		return -1;
 	}
 
@@ -1706,6 +1749,16 @@ int main(int argc, char* argv[])
 
 	//A file of 3LP candidates is checked in the 3LP second stage only.
 	bool candidate_input = listfile.empty() && inputfile.size() > 4 && inputfile.compare(inputfile.size() - 4, 4, ".3lp") == 0;
+
+	//The 3LP second stage checks against all primes below 2^lpb, which the batch check takes up to 32 bits (and the candidate
+	//file holds 32-bit primes).
+	if ((mfb > 2 * lbp || candidate_input) && lbp > 32)
+	{
+		cout << "Three large primes are only supported for lpb" << side_name << " up to 32: with lpb" << side_name << " " << lbp
+			<< (candidate_input ? ", a file of 3LP candidates cannot be checked." : ", use mfb" + side_name + " of at most " + to_string(2 * lbp) + ".") << endl;
+		return -1;
+	}
+
 	bool three_lp = mfb > 2 * lbp && !candidate_input;
 
 	//Estimate size needed to hold the value of the algebraic/rational polynomial values.
@@ -1737,13 +1790,19 @@ int main(int argc, char* argv[])
 		//The cofactors are less than 2^(3 lbp). The tree size is limited by 3lptreelevels instead of treelevels.
 		cout << "Checking 3LP candidates against all primes up to 2^" << lbp << "." << endl;
 		batch = new Batch_smooth(lim, lbp, mfb, 3 * lbp, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->cado_format, param->tree_levels_3lp, param->backend, true);
-		batch->keys_only = param->keys_only;
+		if (param->keys_only)
+		{
+			batch->Set_keys_only();
+		}
 		batch->other_large_prime_bits = other_lbp;
 	}
 	else
 	{
-		batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->cado_format, param->tree_levels, param->backend, false, param->pipeline);
-		batch->keys_only = param->keys_only;
+		batch = new Batch_smooth(lim, lbp, mfb, tree_bits, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->cado_format, param->tree_levels, param->backend, false, param->pipeline, (param->tree_threads > 0) ? param->tree_threads : (param->keys_only ? KEYS_TREE_THREADS : 0));
+		if (param->keys_only)
+		{
+			batch->Set_keys_only();
+		}
 		batch->other_large_prime_bits = other_lbp;
 	}
 
@@ -1767,7 +1826,10 @@ int main(int argc, char* argv[])
 		{
 			cout << "Checking 3LP candidates of up to " << mfb << " bits against all primes up to 2^" << lbp << " during the run." << endl;
 			second_stage = new Batch_smooth(lim, lbp, mfb, 3 * lbp, outputfile, checked_poly, param->smoothness_checking_side, param->print_limit, other_poly, param->cado_format, param->tree_levels, param->backend, true);
-			second_stage->keys_only = param->keys_only;
+			if (param->keys_only)
+			{
+				second_stage->Set_keys_only();
+			}
 			second_stage->other_large_prime_bits = other_lbp;
 		}
 
@@ -1935,7 +1997,7 @@ int main(int argc, char* argv[])
 		return -1;
 	}
 
-	print_profile(profile_now() - program_start);
+	print_profile(profile_now() - program_start, chrono::duration<double>(chrono::steady_clock::now() - program_start_time).count());
 	cout << "Batch checking complete." << endl;
 	return 0;
 }

@@ -14,10 +14,20 @@ int factor_smooth(unsigned int* factors, mpz_srcptr value, int max_factors);
 //of 2^32 or more, has more than max_factors factors, or could not be factored.
 int factor_general(unsigned int* factors, mpz_srcptr value, int max_factors);
 
+//factor_smooth and factor_general for a value whose prime factors are all below 2^max_prime_bits (32 to 64), which are stored as
+//64-bit numbers: for a side with a large prime bound of more than 32 bits. A prime factor of 2^max_prime_bits or more gives -1.
+int factor_smooth_wide(unsigned long long* factors, mpz_srcptr value, int max_factors, int max_prime_bits);
+int factor_general_wide(unsigned long long* factors, mpz_srcptr value, int max_factors, int max_prime_bits);
+
+//Whether n is a prime: exact for all 64-bit numbers.
+bool is_prime64(unsigned long long n);
+
 //Find a nontrivial factor of an odd composite n < 2^64. Returns false if none was found.
 bool split_composite64(unsigned long long n, unsigned long long* factor);
+//The same for an odd composite of up to 128 bits (lo and hi), with the factor found as two limbs.
+bool split_composite128(unsigned long long lo, unsigned long long hi, unsigned long long* factor_lo, unsigned long long* factor_hi);
 
 //Primality test for a positive number. Below 2^32 the answer is exact. Up to 128 bits it is a strong probable prime test
 //to base 2 with native arithmetic, which never calls a prime composite, and calls very few composites prime. Larger numbers
-//use MPIR.
+//use MPIR. It decides whether a cofactor is split; the large primes of a relation are tested with is_prime64.
 bool is_probable_prime(mpz_srcptr value);

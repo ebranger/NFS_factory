@@ -735,9 +735,9 @@ static unsigned int grid_size_leaves(size_t count)
 }
 
 //The checks of the cofactors on the GPU, one thread per leaf: Batch_smooth::Classify_cofactor for cofactors of up to two limbs,
-//with the same primality tests and the same Pollard-Brent rho as Smooth_factor.cpp, so that the results are the same. Cofactors
-//that need more (the rare factoring of a one large prime cofactor, and cofactors of more than 128 bits in a range that is checked)
-//are left to the CPU.
+//with the same primality tests as Smooth_factor.cpp, and Pollard rho for the cofactors of two large primes (k_rho), which gives
+//the same two primes as the rho of the CPU, so that the results are the same. Cofactors that need more (the rare factoring of a
+//one large prime cofactor, and cofactors of more than 128 bits in a range that is checked) are left to the CPU.
 namespace
 {
 
@@ -805,51 +805,6 @@ __device__ uint64_t gcd64(uint64_t a, uint64_t b)
 		b -= a;
 	}
 	return a << shift;
-}
-
-//Pollard-Brent rho for an odd composite n < 2^64, as rho64 in Smooth_factor.cpp. Returns 0 if no factor was found.
-__device__ uint64_t rho64(uint64_t n)
-{
-	const uint64_t ninv = montgomery_inverse64(n);
-	for (uint64_t c = 1; c <= 5; c++)
-	{
-		uint64_t y = 2, x = y, saved_y = y, q = 1, g = 1;
-		uint64_t r = 1;
-		while (g == 1 && r <= RHO_MAX_ITERATIONS)
-		{
-			x = y;
-			for (uint64_t i = 0; i < r; i++)
-			{
-				y = rho_step64(y, c, n, ninv);
-			}
-			for (uint64_t k = 0; k < r && g == 1; k += RHO_GCD_INTERVAL)
-			{
-				saved_y = y;
-				const uint64_t steps = (r - k < RHO_GCD_INTERVAL) ? r - k : RHO_GCD_INTERVAL;
-				for (uint64_t i = 0; i < steps; i++)
-				{
-					y = rho_step64(y, c, n, ninv);
-					q = montgomery_multiply64(q, (x > y) ? x - y : y - x, n, ninv);
-				}
-				g = gcd64(q, n);
-			}
-			r *= 2;
-		}
-		if (g == n || g == 0)
-		{
-			//Several factors were found at once, go back and take one step at a time.
-			do
-			{
-				saved_y = rho_step64(saved_y, c, n, ninv);
-				g = gcd64((x > saved_y) ? x - saved_y : saved_y - x, n);
-			} while (g == 1);
-		}
-		if (g != 1 && g != n)
-		{
-			return g;
-		}
-	}
-	return 0;
 }
 
 //Deterministic Miller-Rabin for n < 2^32, with the bases 2, 7 and 61.
@@ -1016,6 +971,92 @@ __device__ void montgomery_square128(uint64_t& alo, uint64_t& ahi, uint64_t nlo,
 	reduce_once128(alo, ahi, c4, nlo, nhi);
 }
 
+//a = a b / 2^128 mod n for a, b < n and odd n of two limbs: the product, and then the two reduction steps of
+//montgomery_square128.
+__device__ void montgomery_multiply128(uint64_t& alo, uint64_t& ahi, uint64_t blo, uint64_t bhi, uint64_t nlo, uint64_t nhi, uint64_t ninv)
+{
+	uint64_t t0 = alo * blo, t1 = __umul64hi(alo, blo);
+	uint64_t t2 = ahi * bhi, t3 = __umul64hi(ahi, bhi);
+	uint64_t lo = alo * bhi, hi = __umul64hi(alo, bhi);
+	uint64_t c = 0;
+	add_carry(t1, lo, c);
+	add_carry(t2, hi, c);
+	add_carry(t3, 0, c);
+	lo = ahi * blo;
+	hi = __umul64hi(ahi, blo);
+	c = 0;
+	add_carry(t1, lo, c);
+	add_carry(t2, hi, c);
+	add_carry(t3, 0, c);
+	uint64_t c4 = 0;
+	uint64_t m = t0 * ninv;
+	lo = m * nlo;
+	hi = __umul64hi(m, nlo);
+	c = 0;
+	add_carry(t0, lo, c);
+	uint64_t h = hi;
+	lo = m * nhi;
+	hi = __umul64hi(m, nhi);
+	add_carry(t1, h, c);
+	hi += c;
+	c = 0;
+	add_carry(t1, lo, c);
+	add_carry(t2, hi, c);
+	add_carry(t3, 0, c);
+	c4 += c;
+	m = t1 * ninv;
+	lo = m * nlo;
+	hi = __umul64hi(m, nlo);
+	c = 0;
+	add_carry(t1, lo, c);
+	h = hi;
+	lo = m * nhi;
+	hi = __umul64hi(m, nhi);
+	add_carry(t2, h, c);
+	hi += c;
+	c = 0;
+	add_carry(t2, lo, c);
+	add_carry(t3, hi, c);
+	c4 += c;
+	alo = t2;
+	ahi = t3;
+	reduce_once128(alo, ahi, c4, nlo, nhi);
+}
+
+//gcd(a, n) for an odd n of two limbs (at most), by the binary algorithm in registers: n for a = 0.
+__device__ void gcd128_odd(uint64_t alo, uint64_t ahi, uint64_t nlo, uint64_t nhi, uint64_t& glo, uint64_t& ghi)
+{
+	glo = nlo;
+	ghi = nhi;
+	while ((alo | ahi) != 0)
+	{
+		//a without its trailing zeros
+		if (alo == 0)
+		{
+			alo = ahi;
+			ahi = 0;
+		}
+		const int z = __ffsll((long long)alo) - 1;
+		if (z != 0)
+		{
+			alo = (alo >> z) | (ahi << (64 - z));
+			ahi >>= z;
+		}
+		//Both odd: the larger minus the smaller.
+		if (ahi < ghi || (ahi == ghi && alo < glo))
+		{
+			const uint64_t tlo = alo, thi = ahi;
+			alo = glo;
+			ahi = ghi;
+			glo = tlo;
+			ghi = thi;
+		}
+		const uint64_t borrow = (alo < glo);
+		alo -= glo;
+		ahi -= ghi + borrow;
+	}
+}
+
 __device__ __forceinline__ void double_mod128(uint64_t& lo, uint64_t& hi, uint64_t nlo, uint64_t nhi)
 {
 	const uint64_t carry = hi >> 63;
@@ -1080,7 +1121,11 @@ __device__ bool sprp2_128(uint64_t nlo, uint64_t nhi)
 	return false;
 }
 
-//is_probable_prime of Smooth_factor.cpp, for numbers of up to two limbs.
+template <int N> __device__ bool is_prime_limbs(const uint64_t* n);
+
+//is_probable_prime of Smooth_factor.cpp, for numbers of up to two limbs: exact below 2^32, and a strong probable prime test to
+//base 2 above. It decides whether a cofactor is worth splitting, and most cofactors that pass are primes: one test is all the
+//time it gets. What is accepted as a large prime goes through is_large_prime.
 __device__ bool is_probable_prime128(uint64_t lo, uint64_t hi)
 {
 	if ((lo & 1) == 0)
@@ -1098,6 +1143,17 @@ __device__ bool is_probable_prime128(uint64_t lo, uint64_t hi)
 	return sprp2_64(lo);
 }
 
+//Whether p is a prime, exactly: for the large primes of a relation. Those of 2^32 and more (a large prime bound of more than 32
+//bits) take the bases of is_prime_limbs after base 2, since a pseudoprime to base 2 would be written as a prime.
+__device__ bool is_large_prime(uint64_t p)
+{
+	if (p < (1ULL << 32))
+	{
+		return (p & 1) ? is_prime32(p) : (p == 2);
+	}
+	return (p & 1) && sprp2_64(p) && is_prime_limbs<1>(&p);
+}
+
 __device__ __forceinline__ int bits64(uint64_t x)
 {
 	return (x == 0) ? 0 : 64 - __clzll((long long)x);
@@ -1110,7 +1166,7 @@ __device__ unsigned char check_two_primes(uint64_t p, uint64_t q, const Leaf_che
 	{
 		return LEAF_NOT_SMOOTH;
 	}
-	if (!is_probable_prime128(p, 0) || !is_probable_prime128(q, 0))
+	if (!is_large_prime(p) || !is_large_prime(q))
 	{
 		return LEAF_NOT_SMOOTH;
 	}
@@ -1119,10 +1175,12 @@ __device__ unsigned char check_two_primes(uint64_t p, uint64_t q, const Leaf_che
 	return LEAF_SMOOTH;
 }
 
-//The cofactors that rho splits are listed (rho_list, rho_count) for k_rho, and are LEAF_TINYQS until then: rho takes long,
-//and a few of them would hold up most blocks.
+//The cofactors that rho splits are listed for k_rho (rho_list, rho_count: those of up to 63 bits; rho_list2, rho_count2: the
+//larger ones, of up to two limbs, if that list is given), and are LEAF_TINYQS until then: rho takes long, and a few of them
+//would hold up most blocks.
 __global__ void k_classify(const uint64_t* __restrict__ c, size_t stride, const uint32_t* __restrict__ size, size_t count, Leaf_check check,
-	unsigned char* __restrict__ result, uint64_t* __restrict__ lp, uint32_t* __restrict__ rho_list, uint32_t* __restrict__ rho_count)
+	const unsigned char* __restrict__ zero, unsigned char* __restrict__ result, uint64_t* __restrict__ lp, uint32_t* __restrict__ rho_list,
+	uint32_t* __restrict__ rho_count, uint32_t* __restrict__ rho_list2, uint32_t* __restrict__ rho_count2)
 {
 	for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < count; i += (size_t)gridDim.x * blockDim.x)
 	{
@@ -1132,7 +1190,11 @@ __global__ void k_classify(const uint64_t* __restrict__ c, size_t stride, const 
 		const uint64_t lo = (n > 0) ? x[0] : 0, hi = (n > 1) ? x[1] : 0;
 		uint64_t primes[2] = { 0, 0 };
 		unsigned char r;
-		if (bits > check.max_cofactor_bits)
+		if (zero != NULL && zero[i])
+		{
+			r = LEAF_NOT_SMOOTH; //The value of the pair is 0 (k_leaf_values).
+		}
+		else if (bits > check.max_cofactor_bits)
 		{
 			//Can still have three large primes, if composite and at least fblim^3.
 			const bool at_least_min = (n > 2) || hi > check.three_lp_min[1] || (hi == check.three_lp_min[1] && lo >= check.three_lp_min[0]);
@@ -1162,6 +1224,11 @@ __global__ void k_classify(const uint64_t* __restrict__ c, size_t stride, const 
 				{
 					rho_list[atomicAdd(rho_count, 1u)] = (uint32_t)i;
 				}
+				else if (rho_list2 != NULL && (lo & 1))
+				{
+					//Of 64 bits or more (large primes of more than 31 bits): split with two limbs.
+					rho_list2[atomicAdd(rho_count2, 1u)] = (uint32_t)i;
+				}
 			}
 		}
 		else if (bits > check.one_lp_bits)
@@ -1172,9 +1239,9 @@ __global__ void k_classify(const uint64_t* __restrict__ c, size_t stride, const 
 		{
 			r = LEAF_SMOOTH;
 		}
-		else if (n <= 2 && (hi != 0 || lo > check.max_batch_prime) && is_probable_prime128(lo, hi))
+		else if (n == 1 && lo > check.max_batch_prime && is_large_prime(lo))
 		{
-			primes[0] = lo; //bits <= one_lp_bits, so it fits in one limb
+			primes[0] = lo; //bits <= one_lp_bits, so it is one limb
 			r = LEAF_SMOOTH;
 		}
 		else
@@ -1187,100 +1254,16 @@ __global__ void k_classify(const uint64_t* __restrict__ c, size_t stride, const 
 	}
 }
 
-//Pollard rho on the cofactors that k_classify listed, one thread each, in small blocks so that they are spread over the GPU.
-//A cofactor that rho does not split stays LEAF_TINYQS, as on the CPU.
-__global__ void k_rho(const uint64_t* __restrict__ c, size_t stride, const uint32_t* __restrict__ rho_list, const uint32_t* __restrict__ rho_count, Leaf_check check,
-	unsigned char* __restrict__ result, uint64_t* __restrict__ lp)
-{
-	const uint32_t count = *rho_count;
-	for (uint32_t j = blockIdx.x * blockDim.x + threadIdx.x; j < count; j += gridDim.x * blockDim.x)
-	{
-		const uint32_t i = rho_list[j];
-		const uint64_t n = c[(size_t)i * stride];
-		const uint64_t factor = rho64(n);
-		if (factor != 0)
-		{
-			uint64_t primes[2] = { 0, 0 };
-			result[i] = check_two_primes(factor, n / factor, check, primes);
-			lp[2 * (size_t)i] = primes[0];
-			lp[2 * (size_t)i + 1] = primes[1];
-		}
-	}
-}
-
-//Factoring of the smooth leaves for the output, one warp per leaf: the value of the leaf without its large primes is factored as by
-//factor_general of Smooth_factor.cpp: 2s and trial division (the small primes up to 128 bits, as factor_smooth, and below 2^16
-//above), then rho until the parts are primes, and primes below 2^32 by is_prime32. But each rho runs 32 walks at once, one per
-//lane with constants 1 to 32, and takes the factor of the first lane that finds one. The shortest of 32 walks is about sqrt(32)
-//times shorter than one, and the lanes do the same steps. The factors found are primes below 2^32, so the factorization is the
-//one that factor_general finds. A leaf that this does not factor (more than FACTOR_LIMBS limbs after its large primes, more than
-//FACTOR_MAX factors, or walks of more than FACTOR_RHO_LIMIT) is factored on the CPU.
-#define FACTOR_MAX 64 //the most factors of a value factored on the GPU
+//Factoring of the smooth leaves for the output: the value of a leaf without its large primes is factored as by factor_general of
+//Smooth_factor.cpp, by trial division and Pollard rho, with a thread per value (see k_factor_start below). The factors found are
+//primes below 2^32, so the factorization is the one that factor_general finds. A value that this does not factor (more than
+//FACTOR_LIMBS limbs after its large primes, or more than FACTOR_MAX factors) is factored on the CPU.
+#define FACTOR_MAX 40 //the most factors of a value factored on the GPU
 #define FACTOR_LIMBS 4 //the most limbs of a value factored on the GPU, and of the leaves
-#define FACTOR_PENDING 24 //cofactors waiting to be split. After trial division, a value below 2^256 has at most 16 prime factors,
-                          //and one below 2^128 at most 17, so this is never reached.
-#define FACTOR_TRIAL_PRIMES 6541 //the odd primes below 2^16
-#define FACTOR_POOL_PER_LEAF 8 //the room for factors in a batch, per leaf at first (usually a few percent of the leaves are smooth)
-#define FACTOR_RHO_LIMIT (1 << 15) //the longest cycle length r of the walks before giving up, about 2^16 steps
-#define FULL_WARP 0xFFFFFFFFu
-
-//The factor of the lowest lane of the warp whose walk found one (found: the lanes that did), the same in all lanes.
-__device__ __forceinline__ uint64_t first_found(unsigned int found, uint64_t factor)
-{
-	return __shfl_sync(FULL_WARP, factor, __ffs(found) - 1);
-}
-
-//A nontrivial factor of the odd composite n < 2^64, by Pollard-Brent rho with a walk per lane, or 0 if none was found with cycle
-//lengths up to limit. Called by the whole warp, with the same n.
-__device__ uint64_t warp_rho64(uint64_t n, uint64_t limit)
-{
-	const uint64_t ninv = montgomery_inverse64(n);
-	uint64_t c = (threadIdx.x & 31) + 1;
-	uint64_t y = 2, x = y, q = 1;
-	for (uint64_t r = 1; r <= limit; r *= 2)
-	{
-		x = y;
-		for (uint64_t i = 0; i < r; i++)
-		{
-			y = rho_step64(y, c, n, ninv);
-		}
-		for (uint64_t k = 0; k < r; k += RHO_GCD_INTERVAL)
-		{
-			const uint64_t saved_y = y;
-			const uint64_t steps = (r - k < RHO_GCD_INTERVAL) ? r - k : RHO_GCD_INTERVAL;
-			for (uint64_t i = 0; i < steps; i++)
-			{
-				y = rho_step64(y, c, n, ninv);
-				q = montgomery_multiply64(q, (x > y) ? x - y : y - x, n, ninv);
-			}
-			uint64_t g = gcd64(q, n);
-			if (g == n || g == 0)
-			{
-				//Several factors were found at once, go back and take one step at a time.
-				uint64_t t = saved_y;
-				g = 1;
-				for (uint64_t i = 0; i < steps && g == 1; i++)
-				{
-					t = rho_step64(t, c, n, ninv);
-					g = gcd64((x > t) ? x - t : t - x, n);
-				}
-			}
-			const unsigned int found = __ballot_sync(FULL_WARP, g != 1 && g != n);
-			if (found != 0)
-			{
-				return first_found(found, g);
-			}
-			if (g != 1)
-			{
-				//This walk found all factors at once: a new one, with another constant.
-				c += 32;
-				x = y = 2;
-				q = 1;
-			}
-		}
-	}
-	return 0;
-}
+#define FACTOR_TRIAL_BITS 13 //the primes below 2^this are found by trial division
+#define FACTOR_TRIAL_PRIMES 1027 //the odd primes below 2^FACTOR_TRIAL_BITS
+#define FACTOR_POOL_PER_LEAF 2 //the room for factors in a batch, per leaf at first (usually a few percent of the leaves are smooth)
+#define FACTOR_POOL_PER_VALUE 20 //and per value where every leaf is smooth (a norm of 200 bits has about 12 prime factors)
 
 //x / d in place, for odd d that divides x (n limbs), by Hensel division. Returns the size of the quotient.
 __device__ int divide_exact(uint64_t* x, int n, uint64_t d)
@@ -1601,244 +1584,740 @@ template <int N> __device__ __forceinline__ bool is_one(const uint64_t* a)
 	return one;
 }
 
-//warp_rho64 for an odd composite n of N limbs, with the factor in f (N limbs, zero above its size). Returns false if no factor
-//was found.
-template <int N> __device__ bool warp_rho_limbs(const uint64_t* n, uint64_t limit, uint64_t* f)
+//The odd primes below 2^FACTOR_TRIAL_BITS for the trial division, and their inverses modulo 2^64.
+__device__ uint64_t factor_trial[2 * FACTOR_TRIAL_PRIMES];
+
+//One thread factors one value (a warp with a walk per thread on the same value finds a factor in sqrt(32) times fewer steps, but
+//with 32 times the threads). The threads of a warp only run at once while they are in the same part of the code, and a warp
+//lasts as long as its slowest thread, so the work is arranged in kernels that each do one thing, on records (Factor_record) that
+//hold a value as it is taken apart: k_factor_start divides out the small primes, all threads together; then k_factor_walk<N>
+//walks the values of N limbs, for N = 4, 3, 2 and 1 (a value moves on to the next as its factors are taken out), each thread on
+//a value of its own with the same steps between the gcds, and taking the next value when one is done, so that all threads walk
+//until the values run out; and k_factor_finish gathers the factors.
+//
+//All prime factors of a value are below a known bound (the primes of the batch check, or the large prime bound of the side), and
+//a walk finds a prime p before its cycle and tail are longer than k sqrt(p) with a probability of about 1 - exp(-k^2 / 2). A walk
+//that goes on for longer than FACTOR_LIMIT_FACTOR sqrt(bound) therefore shows that the value has no such factor: it is not smooth
+//(FACTOR_NOT_SMOOTH), as is one with a prime factor of 2^32 or more, which a primality test shows. The CPU is then not asked to
+//look for a factor that is not there.
+#define FACTOR_RHO_CONSTANTS 3 //walks with other constants, when a walk finds all prime factors in the same step
+#define FACTOR_NOT_SMOOTH -2
+#define FACTOR_LIMIT_FACTOR 8
+#define FACTOR_STACK 4 //factors found that are not primes (several primes found in the same steps), waiting to be split: rare
+
+//x = 2 x mod n, for x < n.
+template <int N> __device__ __forceinline__ void double_mod_limbs(uint64_t* x, const uint64_t* n)
 {
-	const uint64_t ninv = montgomery_inverse64(n[0]);
-	uint64_t c = (threadIdx.x & 31) + 1;
-	uint64_t y[N], x[N], q[N], saved[N], d[N], g[N];
+	uint64_t carry = 0;
 	for (int k = 0; k < N; k++)
 	{
-		y[k] = x[k] = q[k] = 0;
+		const uint64_t t = x[k];
+		x[k] = (t << 1) | carry;
+		carry = t >> 63;
 	}
-	y[0] = x[0] = 2;
-	q[0] = 1;
-	for (uint64_t r = 1; r <= limit; r *= 2)
+	if (carry != 0 || at_least<N>(x, n))
 	{
-		for (int k = 0; k < N; k++)
+		subtract_limbs<N>(x, n);
+	}
+}
+
+//x = x + y mod n, for x, y < n.
+template <int N> __device__ __forceinline__ void add_mod_limbs(uint64_t* x, const uint64_t* y, const uint64_t* n)
+{
+	uint64_t carry = 0;
+	for (int k = 0; k < N; k++)
+	{
+		const uint64_t s = x[k] + y[k];
+		const uint64_t c1 = (s < y[k]);
+		x[k] = s + carry;
+		carry = c1 + (x[k] < s);
+	}
+	if (carry != 0 || at_least<N>(x, n))
+	{
+		subtract_limbs<N>(x, n);
+	}
+}
+
+//Strong probable prime to the base b (from 2 to 63), for an odd n of N limbs (the top one nonzero) that b does not divide.
+template <int N> __device__ bool sprp_limbs(const uint64_t* n, int b)
+{
+	const uint64_t ninv = montgomery_inverse64(n[0]);
+	//one = 2^(64 N) mod n, by doubling 2^(bits - 1) < n.
+	const int top = 63 - __clzll((long long)n[N - 1]);
+	uint64_t one[N], minus_one[N], x[N], d[N], t[N];
+	for (int k = 0; k < N; k++)
+	{
+		one[k] = 0;
+	}
+	one[N - 1] = 1ULL << top;
+	for (int i = 64 * (N - 1) + top; i < 64 * N; i++)
+	{
+		double_mod_limbs<N>(one, n);
+	}
+	for (int k = 0; k < N; k++)
+	{
+		minus_one[k] = n[k];
+		d[k] = n[k];
+	}
+	subtract_limbs<N>(minus_one, one);
+	//n - 1 = d 2^s
+	d[0] -= 1; //n is odd
+	int s = 0;
+	while (d[s / 64] == 0)
+	{
+		s += 64;
+	}
+	s += __ffsll((long long)d[s / 64]) - 1;
+	const int dn = shift_right_limbs(d, N, s);
+	const int d_top = 64 * (dn - 1) + 63 - __clzll((long long)d[dn - 1]);
+	for (int k = 0; k < N; k++)
+	{
+		x[k] = one[k];
+	}
+	for (int i = d_top; i >= 0; i--)
+	{
+		montgomery_multiply_limbs<N>(x, x, n, ninv);
+		if ((d[i / 64] >> (i % 64)) & 1)
 		{
-			x[k] = y[k];
-		}
-		for (uint64_t i = 0; i < r; i++)
-		{
-			rho_step_limbs<N>(y, c, n, ninv);
-		}
-		for (uint64_t s = 0; s < r; s += RHO_GCD_INTERVAL)
-		{
+			//x *= b, by doubling and adding from the top bit of b down.
 			for (int k = 0; k < N; k++)
 			{
-				saved[k] = y[k];
+				t[k] = x[k];
 			}
-			const uint64_t steps = (r - s < RHO_GCD_INTERVAL) ? r - s : RHO_GCD_INTERVAL;
-			for (uint64_t i = 0; i < steps; i++)
+			for (int bit = 4 - (b < 32) - (b < 16) - (b < 8) - (b < 4); bit >= 0; bit--)
 			{
-				rho_step_limbs<N>(y, c, n, ninv);
-				difference_limbs<N>(x, y, d);
-				montgomery_multiply_limbs<N>(q, d, n, ninv);
-			}
-			for (int k = 0; k < N; k++)
-			{
-				d[k] = q[k];
-				g[k] = n[k];
-			}
-			gcd_limbs<N>(d, g);
-			if (equal_limbs<N>(g, n))
-			{
-				//Several factors were found at once, go back and take one step at a time.
-				for (uint64_t i = 0; i < steps && (i == 0 || is_one<N>(g)); i++)
+				double_mod_limbs<N>(x, n);
+				if ((b >> bit) & 1)
 				{
-					rho_step_limbs<N>(saved, c, n, ninv);
-					difference_limbs<N>(x, saved, d);
-					for (int k = 0; k < N; k++)
-					{
-						g[k] = n[k];
-					}
-					gcd_limbs<N>(d, g);
+					add_mod_limbs<N>(x, t, n);
 				}
 			}
-			const bool one = is_one<N>(g), all = equal_limbs<N>(g, n);
-			const unsigned int found = __ballot_sync(FULL_WARP, !one && !all);
-			if (found != 0)
-			{
-				for (int k = 0; k < N; k++)
-				{
-					f[k] = first_found(found, g[k]);
-				}
-				return true;
-			}
-			if (!one)
-			{
-				//This walk found all factors at once: a new one, with another constant.
-				c += 32;
-				for (int k = 0; k < N; k++)
-				{
-					y[k] = x[k] = q[k] = 0;
-				}
-				y[0] = x[0] = 2;
-				q[0] = 1;
-			}
+		}
+	}
+	if (equal_limbs<N>(x, one) || equal_limbs<N>(x, minus_one))
+	{
+		return true;
+	}
+	for (int i = 1; i < s; i++)
+	{
+		montgomery_multiply_limbs<N>(x, x, n, ninv);
+		if (equal_limbs<N>(x, minus_one))
+		{
+			return true;
 		}
 	}
 	return false;
 }
 
-//The odd primes below 2^16 for the trial division of the values of more than two limbs, and their inverses modulo 2^64.
-__device__ uint64_t factor_trial[2 * FACTOR_TRIAL_PRIMES];
-
-//The factors of the value x of n limbs (at most FACTOR_LIMBS, changed), by the whole warp (see above), in f by lane 0, in
-//increasing order. Returns their number, or -1 if it was not factored.
-__device__ int warp_factor(uint64_t* x, int n, uint32_t* f, uint64_t limit)
+//Whether an odd n of N limbs with no prime factor below 2^16 is a prime: a strong probable prime to the bases 2, 3, 5 and 7, and
+//for one limb to the primes up to 37 (which leaves no composite below 2^64). Almost every composite fails the first.
+template <int N> __device__ bool is_prime_limbs(const uint64_t* n)
 {
-	const int lane = threadIdx.x & 31;
-	if (n == 0)
+	const int bases[12] = { 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37 };
+	for (int k = 0; k < ((N == 1) ? 12 : 4); k++)
 	{
-		return -1;
-	}
-	int count = 0;
-	int twos = 0;
-	while (x[twos / 64] == 0)
-	{
-		twos += 64;
-	}
-	twos += __ffsll((long long)x[twos / 64]) - 1;
-	if (twos > FACTOR_MAX)
-	{
-		return -1;
-	}
-	for (int k = 0; k < twos; k++)
-	{
-		if (lane == 0)
+		if (!sprp_limbs<N>(n, bases[k]))
 		{
-			f[count] = 2;
-		}
-		count++;
-	}
-	if (twos > 0)
-	{
-		n = shift_right_limbs(x, n, twos);
-	}
-
-	//Trial division by the first 32 odd primes (up to 137), a lane each, and above two limbs by the odd primes below 2^16 until the
-	//rest has two limbs.
-	for (int first = 0; first < FACTOR_TRIAL_PRIMES && (first == 0 || n > 2); first += 32)
-	{
-		const int k = first + lane;
-		unsigned int divides = __ballot_sync(FULL_WARP, k < FACTOR_TRIAL_PRIMES && divisible(x, n, factor_trial[2 * k], factor_trial[2 * k + 1]));
-		while (divides != 0)
-		{
-			const int i = first + __ffs(divides) - 1;
-			divides &= divides - 1;
-			const uint64_t p = factor_trial[2 * i], inverse = factor_trial[2 * i + 1];
-			do
-			{
-				if (count >= FACTOR_MAX)
-				{
-					return -1;
-				}
-				if (lane == 0)
-				{
-					f[count] = (uint32_t)p;
-				}
-				count++;
-				n = divide_exact(x, n, p);
-			} while (divisible(x, n, p, inverse));
+			return false;
 		}
 	}
+	return true;
+}
 
-	//Split the rest. All cofactors are odd, and have no prime factors below 137.
-	uint64_t pending[FACTOR_PENDING][FACTOR_LIMBS];
-	int pending_size[FACTOR_PENDING];
-	int num_pending = 0;
-	if (!(n == 1 && x[0] == 1))
+//A value being factored: what is left of it (x, of n limbs, odd and without primes below 2^FACTOR_TRIAL_BITS after
+//k_factor_start, and composite or of more than 32 bits while it is being split), the factors found, and the composite factors
+//found that are still to be split.
+struct Factor_record
+{
+	uint64_t x[FACTOR_LIMBS];
+	int n;
+	int count;
+	int status; //0 while it is being factored, 1 when done, or the result if negative
+	int stacked;
+	uint64_t f[FACTOR_MAX];
+	uint64_t stack[FACTOR_STACK][FACTOR_LIMBS];
+	int stack_n[FACTOR_STACK];
+};
+
+__device__ __forceinline__ void record_emit(Factor_record& L, uint64_t p)
+{
+	if (L.count >= FACTOR_MAX)
+	{
+		L.status = -1;
+		return;
+	}
+	L.f[L.count++] = p;
+}
+
+//Whether a number of one limb without prime factors below 2^FACTOR_TRIAL_BITS is a prime (or 1) of at most max_prime (which is
+//at least 2^32 - 1): a prime factor of a value, then.
+__device__ __forceinline__ bool part_is_prime(uint64_t x, uint64_t max_prime)
+{
+	if (x < (1ULL << (2 * FACTOR_TRIAL_BITS)))
+	{
+		return true;
+	}
+	if (x < (1ULL << 32))
+	{
+		return is_odd_prime32(x);
+	}
+	return x <= max_prime && is_prime_limbs<1>(&x);
+}
+
+//After x changed: while it is 1 or a prime of at most max_prime, it is done, and the next composite is taken from the stack,
+//until a composite, or a number of more than max_prime, is in x, or nothing is left.
+__device__ void record_settle(Factor_record& L, uint64_t max_prime)
+{
+	while (L.status == 0 && L.n <= 1 && part_is_prime(L.x[0], max_prime))
+	{
+		if (L.n == 1 && L.x[0] > 1)
+		{
+			record_emit(L, L.x[0]);
+		}
+		if (L.stacked == 0)
+		{
+			L.status = (L.status == 0) ? 1 : L.status;
+			return;
+		}
+		L.stacked--;
+		for (int k = 0; k < FACTOR_LIMBS; k++)
+		{
+			L.x[k] = L.stack[L.stacked][k];
+		}
+		L.n = L.stack_n[L.stacked];
+	}
+}
+
+//The factor g (N limbs) of x was found: x / g replaces x, and g is a prime factor if it is a prime of at most max_prime, and
+//otherwise goes on the stack.
+template <int N> __device__ void record_split(Factor_record& L, const uint64_t* g, uint64_t max_prime)
+{
+	uint64_t d[FACTOR_LIMBS] = { 0, 0, 0, 0 };
+	int dn = 0;
+	for (int k = 0; k < N; k++)
+	{
+		d[k] = g[k];
+		dn = (g[k] != 0) ? k + 1 : dn;
+	}
+	L.n = divide_exact_limbs(L.x, L.n, d, dn);
+	if (dn == 1 && part_is_prime(d[0], max_prime))
+	{
+		record_emit(L, d[0]);
+	}
+	else if (L.stacked < FACTOR_STACK)
 	{
 		for (int k = 0; k < FACTOR_LIMBS; k++)
 		{
-			pending[0][k] = (k < n) ? x[k] : 0;
+			L.stack[L.stacked][k] = d[k];
 		}
-		pending_size[0] = n;
-		num_pending = 1;
+		L.stack_n[L.stacked] = dn;
+		L.stacked++;
 	}
-	while (num_pending > 0)
+	else
 	{
-		num_pending--;
-		uint64_t c[FACTOR_LIMBS];
-		for (int k = 0; k < FACTOR_LIMBS; k++)
+		L.status = -1;
+	}
+	record_settle(L, max_prime);
+}
+
+//The arithmetic of a walk modulo n of N limbs: one limb with the 64-bit functions.
+template <int N> __device__ __forceinline__ void walk_step(uint64_t* y, const uint64_t* x0, uint64_t* q, uint64_t c, const uint64_t* n, uint64_t ninv)
+{
+	if (N == 1)
+	{
+		y[0] = rho_step64(y[0], c, n[0], ninv);
+		q[0] = montgomery_multiply64(q[0], (x0[0] > y[0]) ? x0[0] - y[0] : y[0] - x0[0], n[0], ninv);
+	}
+	else if (N == 2)
+	{
+		//Two limbs in registers: the same numbers as with the functions for N limbs.
+		uint64_t ylo = y[0], yhi = y[1];
+		montgomery_square128(ylo, yhi, n[0], n[1], ninv);
+		const uint64_t sum = ylo + c;
+		const uint64_t carry = (sum < c);
+		ylo = sum;
+		yhi += carry;
+		reduce_once128(ylo, yhi, (uint64_t)(yhi < carry), n[0], n[1]);
+		y[0] = ylo;
+		y[1] = yhi;
+		uint64_t dlo, dhi;
+		if (x0[1] > yhi || (x0[1] == yhi && x0[0] >= ylo))
 		{
-			c[k] = pending[num_pending][k];
-		}
-		const int cn = pending_size[num_pending];
-		if (cn == 1 && c[0] < (1ULL << 32) && is_odd_prime32(c[0]))
-		{
-			if (count >= FACTOR_MAX)
-			{
-				return -1;
-			}
-			if (lane == 0)
-			{
-				f[count] = (uint32_t)c[0];
-			}
-			count++;
-			continue;
-		}
-		if (num_pending + 2 > FACTOR_PENDING)
-		{
-			return -1;
-		}
-		uint64_t d[FACTOR_LIMBS] = { 0, 0, 0, 0 };
-		bool found;
-		if (cn == 1)
-		{
-			d[0] = warp_rho64(c[0], limit);
-			found = (d[0] != 0);
-		}
-		else if (cn == 2)
-		{
-			found = warp_rho_limbs<2>(c, limit, d);
-		}
-		else if (cn == 3)
-		{
-			found = warp_rho_limbs<3>(c, limit, d);
+			dlo = x0[0] - ylo;
+			dhi = x0[1] - yhi - (x0[0] < ylo);
 		}
 		else
 		{
-			found = warp_rho_limbs<4>(c, limit, d);
+			dlo = ylo - x0[0];
+			dhi = yhi - x0[1] - (ylo < x0[0]);
 		}
-		if (!found)
+		uint64_t qlo = q[0], qhi = q[1];
+		montgomery_multiply128(qlo, qhi, dlo, dhi, n[0], n[1], ninv);
+		q[0] = qlo;
+		q[1] = qhi;
+	}
+	else
+	{
+		uint64_t d[N];
+		rho_step_limbs<N>(y, c, n, ninv);
+		difference_limbs<N>(x0, y, d);
+		montgomery_multiply_limbs<N>(q, d, n, ninv);
+	}
+}
+
+//g = gcd(|a - b|, n) if b is not NULL, else gcd(a, n): n for a = 0 (or a = b).
+template <int N> __device__ __forceinline__ void walk_gcd(const uint64_t* a, const uint64_t* b, const uint64_t* n, uint64_t* g)
+{
+	if (N == 1)
+	{
+		const uint64_t v = (b == NULL) ? a[0] : ((a[0] > b[0]) ? a[0] - b[0] : b[0] - a[0]);
+		g[0] = gcd64(v, n[0]);
+	}
+	else if (N == 2)
+	{
+		uint64_t dlo = a[0], dhi = a[1];
+		if (b != NULL)
 		{
-			return -1;
+			if (a[1] > b[1] || (a[1] == b[1] && a[0] >= b[0]))
+			{
+				dlo = a[0] - b[0];
+				dhi = a[1] - b[1] - (a[0] < b[0]);
+			}
+			else
+			{
+				dlo = b[0] - a[0];
+				dhi = b[1] - a[1] - (b[0] < a[0]);
+			}
 		}
-		int dn = cn;
-		while (d[dn - 1] == 0)
+		gcd128_odd(dlo, dhi, n[0], n[1], g[0], g[1]);
+	}
+	else
+	{
+		uint64_t d[N];
+		if (b == NULL)
 		{
-			dn--;
+			for (int k = 0; k < N; k++)
+			{
+				d[k] = a[k];
+			}
 		}
-		const int en = divide_exact_limbs(c, cn, d, dn);
-		for (int k = 0; k < FACTOR_LIMBS; k++)
+		else
 		{
-			pending[num_pending][k] = d[k];
-			pending[num_pending + 1][k] = (k < en) ? c[k] : 0;
+			difference_limbs<N>(a, b, d);
 		}
-		pending_size[num_pending] = dn;
-		pending_size[num_pending + 1] = en;
-		num_pending += 2;
+		for (int k = 0; k < N; k++)
+		{
+			g[k] = n[k];
+		}
+		gcd_limbs<N>(d, g);
+	}
+}
+
+//The state of the walk of a thread: Pollard-Brent rho, y -> y^2 + c from y = 2, compared with the y at the last power of two of
+//steps (x0), the differences multiplied into q, and a gcd every RHO_GCD_INTERVAL steps. A cycle of length up to mark = 2^k is
+//found within the steps up to 2 mark, once the tail is at most mark, so a walk of 2 limit steps without a factor ends it.
+template <int N> struct Walk
+{
+	uint64_t n[N], y[N], x0[N], q[N];
+	uint64_t ninv, c, steps, mark;
+
+	__device__ __forceinline__ void Start(const uint64_t* value, uint64_t constant)
+	{
+		for (int k = 0; k < N; k++)
+		{
+			n[k] = value[k];
+			y[k] = x0[k] = q[k] = 0;
+		}
+		ninv = montgomery_inverse64(n[0]);
+		y[0] = x0[0] = 2;
+		q[0] = 1;
+		c = constant;
+		steps = 0;
+		mark = 1;
 	}
 
-	if (lane == 0)
+	//RHO_GCD_INTERVAL steps, and then g = gcd(q, n): 1 if no factor was found. If it is n (several factors in these steps, or
+	//q became 0), the steps are taken again from where they started, with a gcd after each: g is then n only if all prime
+	//factors were found in the same step (or 1, which cannot be), and the walk needs another constant.
+	__device__ void Block(uint64_t* g)
 	{
-		for (int i = 1; i < count; i++)
+		uint64_t saved_y[N], saved_x0[N];
+		for (int k = 0; k < N; k++)
 		{
-			const uint32_t y = f[i];
-			int j = i - 1;
-			while (j >= 0 && f[j] > y)
+			saved_y[k] = y[k];
+			saved_x0[k] = x0[k];
+		}
+		const uint64_t saved_steps = steps, saved_mark = mark;
+		for (int i = 0; i < RHO_GCD_INTERVAL; i++)
+		{
+			walk_step<N>(y, x0, q, c, n, ninv);
+			steps++;
+			if (steps == mark)
 			{
-				f[j + 1] = f[j];
-				j--;
+				for (int k = 0; k < N; k++)
+				{
+					x0[k] = y[k];
+				}
+				mark *= 2;
 			}
-			f[j + 1] = y;
+		}
+		walk_gcd<N>(q, NULL, n, g);
+		if (!equal_limbs<N>(g, n))
+		{
+			return;
+		}
+		for (int k = 0; k < N; k++)
+		{
+			y[k] = saved_y[k];
+			x0[k] = saved_x0[k];
+			g[k] = 0;
+		}
+		g[0] = 1;
+		steps = saved_steps;
+		mark = saved_mark;
+		uint64_t unused[N];
+		for (int k = 0; k < N; k++)
+		{
+			unused[k] = 0;
+		}
+		unused[0] = 1;
+		for (int i = 0; i < RHO_GCD_INTERVAL && is_one<N>(g); i++)
+		{
+			walk_step<N>(y, x0, unused, c, n, ninv);
+			walk_gcd<N>(x0, y, n, g);
+			steps++;
+			if (steps == mark)
+			{
+				for (int k = 0; k < N; k++)
+				{
+					x0[k] = y[k];
+				}
+				mark *= 2;
+			}
+		}
+		if (is_one<N>(g))
+		{
+			for (int k = 0; k < N; k++)
+			{
+				g[k] = n[k];
+			}
 		}
 	}
-	return count;
+};
+
+//The records of the values to factor: record j is value list[j] without its large primes (lp, two per value, or none), with
+//its twos and its odd primes below 2^FACTOR_TRIAL_BITS divided out, by all threads together, until what is left is 1 or less than
+//the square of the next prime (a prime). Rho does badly on values with many small primes, and what it then splits has few
+//factors, each found in at least 2^6 steps. A value that is left as a prime of 2^32 or more is not smooth. Records beyond
+//capacity are not set up (their values are left to the CPU).
+__global__ void k_factor_start(const uint32_t* __restrict__ list, const uint32_t* __restrict__ list_count, const uint64_t* __restrict__ values, size_t stride,
+	const uint32_t* __restrict__ size, const uint64_t* __restrict__ lp, Factor_record* __restrict__ records, uint32_t capacity, uint64_t max_prime)
+{
+	const uint32_t count = (*list_count < capacity) ? *list_count : capacity;
+	for (uint32_t j = blockIdx.x * blockDim.x + threadIdx.x; j < count; j += gridDim.x * blockDim.x)
+	{
+		const uint32_t i = list[j];
+		Factor_record L;
+		L.n = (int)size[i];
+		L.count = 0;
+		L.stacked = 0;
+		L.status = (L.n == 0 || L.n > FACTOR_LIMBS) ? -1 : 0;
+		for (int k = 0; k < FACTOR_LIMBS; k++)
+		{
+			L.x[k] = (L.status == 0 && k < L.n) ? values[(size_t)i * stride + k] : 0;
+		}
+		if (L.status == 0)
+		{
+			for (int k = 0; k < 2; k++)
+			{
+				const uint64_t p = (lp != NULL) ? lp[2 * (size_t)i + k] : 0;
+				if (p > 1)
+				{
+					L.n = divide_exact(L.x, L.n, p);
+				}
+			}
+			int twos = 0;
+			while (L.x[twos / 64] == 0)
+			{
+				twos += 64;
+			}
+			twos += __ffsll((long long)L.x[twos / 64]) - 1;
+			if (twos > FACTOR_MAX)
+			{
+				L.status = -1;
+			}
+			else
+			{
+				for (int k = 0; k < twos; k++)
+				{
+					L.f[L.count++] = 2;
+				}
+				if (twos > 0)
+				{
+					L.n = shift_right_limbs(L.x, L.n, twos);
+				}
+			}
+		}
+		for (int k = 0; k < FACTOR_TRIAL_PRIMES; k++)
+		{
+			const uint64_t p = factor_trial[2 * k], inverse = factor_trial[2 * k + 1];
+			if (L.status != 0 || (L.n == 1 && L.x[0] < p * p))
+			{
+				continue;
+			}
+			while (L.status == 0 && divisible(L.x, L.n, p, inverse))
+			{
+				record_emit(L, p);
+				L.n = divide_exact(L.x, L.n, p);
+			}
+		}
+		record_settle(L, max_prime);
+		if (L.status == 0 && (L.n > 1 || L.x[0] >= (1ULL << 32)))
+		{
+			const bool prime = (L.n == 1) ? is_prime_limbs<1>(L.x) : ((L.n == 2) ? is_prime_limbs<2>(L.x) : ((L.n == 3) ? is_prime_limbs<3>(L.x) : is_prime_limbs<4>(L.x)));
+			if (prime)
+			{
+				L.status = FACTOR_NOT_SMOOTH;
+			}
+		}
+		records[j] = L;
+	}
+}
+
+#define FACTOR_THREADS 32 //threads in a block of the walks: a warp, so that the values are spread over the GPU
+#define FACTOR_VALUES_PER_THREAD 2 //the walks use a thread for this many values (but at least FACTOR_MIN_THREADS), so that most
+#define FACTOR_MIN_THREADS 256 //of them are busy until the values run out; the others of the launch return at once
+
+//The walks of the records whose value has N limbs: each thread takes the next such record (next counts those taken), walks until
+//the value has fewer limbs or is factored, and takes another. A walk of 2 limit steps without a factor shows that the value is
+//not smooth (see above), as does a primality test when a walk has gone a quarter of the way.
+template <int N> __global__ void __launch_bounds__(FACTOR_THREADS) k_factor_walk(Factor_record* __restrict__ records, const uint32_t* __restrict__ list_count,
+	uint32_t capacity, uint32_t* __restrict__ next, uint64_t limit, uint64_t max_prime)
+{
+	const uint32_t count = (*list_count < capacity) ? *list_count : capacity;
+	const uint32_t wanted = count / FACTOR_VALUES_PER_THREAD;
+	if (blockIdx.x * blockDim.x + threadIdx.x >= ((wanted > FACTOR_MIN_THREADS) ? wanted : FACTOR_MIN_THREADS))
+	{
+		return;
+	}
+	Factor_record L;
+	Walk<N> walk;
+	uint32_t j = 0;
+	bool have = false, tested = false;
+	for (;;)
+	{
+		if (!have)
+		{
+			j = atomicAdd(next, 1u);
+			if (j >= count)
+			{
+				break;
+			}
+			if (records[j].status != 0 || records[j].n != N)
+			{
+				continue;
+			}
+			L = records[j];
+			walk.Start(L.x, 1);
+			have = true;
+			tested = false;
+		}
+		uint64_t g[N];
+		walk.Block(g);
+		if (is_one<N>(g))
+		{
+			if (walk.steps >= 2 * limit)
+			{
+				L.status = FACTOR_NOT_SMOOTH;
+			}
+			else if (!tested && walk.steps >= limit / 2)
+			{
+				tested = true;
+				if (is_prime_limbs<N>(walk.n))
+				{
+					L.status = FACTOR_NOT_SMOOTH;
+				}
+			}
+		}
+		else if (equal_limbs<N>(g, walk.n))
+		{
+			//All prime factors in the same step: a walk with another constant. Unless the value is a prime (one a little above
+			//the bound, left by a split, whose own cycle closes before the walk is long enough for the test above): not smooth.
+			if (!tested)
+			{
+				tested = true;
+				if (is_prime_limbs<N>(walk.n))
+				{
+					L.status = FACTOR_NOT_SMOOTH;
+				}
+			}
+			if (L.status != 0)
+			{
+			}
+			else if (walk.c >= FACTOR_RHO_CONSTANTS)
+			{
+				L.status = -1;
+			}
+			else
+			{
+				walk.Start(L.x, walk.c + 1);
+			}
+		}
+		else
+		{
+			record_split<N>(L, g, max_prime);
+			if (L.status == 0 && L.n == N)
+			{
+				walk.Start(L.x, 1);
+				tested = false;
+			}
+		}
+		if (L.status != 0 || L.n != N)
+		{
+			records[j] = L;
+			have = false;
+		}
+	}
+}
+
+#define RHO_WALK_LIMIT (1 << 20) //the cycle length up to which k_rho looks for a factor, as RHO_MAX_ITERATIONS in Smooth_factor.cpp
+//(twice that with two limbs, where the primes have up to 34 bits)
+
+//Pollard rho on the cofactors that k_classify listed (odd composites of N limbs: N = 1 for those of up to 63 bits, 2 for the
+//larger ones): each thread takes the next of them (next counts those taken), walks until it finds a factor, and takes another,
+//as k_factor_walk. The two factors are then checked as large primes (check_two_primes). A cofactor that the walks do not split
+//stays LEAF_TINYQS, for the CPU.
+template <int N> __global__ void __launch_bounds__(FACTOR_THREADS) k_rho(const uint64_t* __restrict__ c, size_t stride, const uint32_t* __restrict__ rho_list,
+	const uint32_t* __restrict__ rho_count, uint32_t* __restrict__ next, Leaf_check check, unsigned char* __restrict__ result, uint64_t* __restrict__ lp)
+{
+	const uint32_t count = *rho_count;
+	const uint32_t wanted = count / FACTOR_VALUES_PER_THREAD;
+	if (blockIdx.x * blockDim.x + threadIdx.x >= ((wanted > FACTOR_MIN_THREADS) ? wanted : FACTOR_MIN_THREADS))
+	{
+		return;
+	}
+	Walk<N> walk;
+	uint32_t i = 0;
+	bool have = false;
+	for (;;)
+	{
+		if (!have)
+		{
+			const uint32_t j = atomicAdd(next, 1u);
+			if (j >= count)
+			{
+				break;
+			}
+			i = rho_list[j];
+			uint64_t n[N];
+			for (int k = 0; k < N; k++)
+			{
+				n[k] = c[(size_t)i * stride + k];
+			}
+			walk.Start(n, 1); //(a cofactor of exactly 64 bits has a zero top limb here, which the walk allows)
+			have = true;
+		}
+		uint64_t g[N];
+		walk.Block(g);
+		if (is_one<N>(g))
+		{
+			have = walk.steps < 2 * (uint64_t)RHO_WALK_LIMIT * N;
+		}
+		else if (equal_limbs<N>(g, walk.n))
+		{
+			//All prime factors in the same step: a walk with another constant.
+			have = walk.c < FACTOR_RHO_CONSTANTS;
+			if (have)
+			{
+				uint64_t n[N];
+				for (int k = 0; k < N; k++)
+				{
+					n[k] = walk.n[k];
+				}
+				walk.Start(n, walk.c + 1);
+			}
+		}
+		else
+		{
+			//The two factors must both be large primes, of one limb.
+			uint64_t primes[2] = { 0, 0 };
+			unsigned char r = LEAF_NOT_SMOOTH;
+			if (N == 1)
+			{
+				r = check_two_primes(g[0], walk.n[0] / g[0], check, primes);
+			}
+			else
+			{
+				uint64_t d[FACTOR_LIMBS] = { 0, 0, 0, 0 }, q[FACTOR_LIMBS] = { 0, 0, 0, 0 };
+				int dn = 0;
+				for (int k = 0; k < N; k++)
+				{
+					d[k] = g[k];
+					q[k] = walk.n[k];
+					dn = (g[k] != 0) ? k + 1 : dn;
+				}
+				const int qn = divide_exact_limbs(q, N, d, dn);
+				if (dn == 1 && qn == 1)
+				{
+					r = check_two_primes(d[0], q[0], check, primes);
+				}
+			}
+			result[i] = r;
+			lp[2 * (size_t)i] = primes[0];
+			lp[2 * (size_t)i + 1] = primes[1];
+			have = false;
+		}
+	}
+}
+
+//The factors of the records, in increasing order: factor_count[j] of them for record j (-1 if it is left to the CPU,
+//FACTOR_NOT_SMOOTH if the value is not smooth), from factor_offset[j] in the pool, which has room for pool_capacity. pool_used
+//counts the room they need, also beyond pool_capacity: those that do not fit are left to the CPU, as are the values beyond the
+//capacity of the records, and a record that is not done (which cannot be).
+__global__ void k_factor_finish(const Factor_record* __restrict__ records, const uint32_t* __restrict__ list_count, uint32_t capacity, int* __restrict__ factor_count,
+	uint32_t* __restrict__ factor_offset, uint64_t* __restrict__ pool, uint32_t* __restrict__ pool_used, uint32_t pool_capacity)
+{
+	const uint32_t count = *list_count;
+	for (uint32_t j = blockIdx.x * blockDim.x + threadIdx.x; j < count; j += gridDim.x * blockDim.x)
+	{
+		int result = -1;
+		uint32_t offset = 0;
+		if (j < capacity)
+		{
+			const Factor_record& L = records[j];
+			result = (L.status == 1) ? L.count : ((L.status < 0) ? L.status : -1);
+			uint64_t f[FACTOR_MAX];
+			for (int k = 0; k < result; k++)
+			{
+				f[k] = L.f[k];
+			}
+			for (int i = 1; i < result; i++)
+			{
+				const uint64_t y = f[i];
+				int k = i - 1;
+				while (k >= 0 && f[k] > y)
+				{
+					f[k + 1] = f[k];
+					k--;
+				}
+				f[k + 1] = y;
+			}
+			if (result > 0)
+			{
+				offset = atomicAdd(pool_used, (uint32_t)result);
+				if (offset + result > pool_capacity)
+				{
+					result = -1;
+				}
+				for (int k = 0; k < result; k++)
+				{
+					pool[offset + k] = f[k];
+				}
+			}
+		}
+		factor_count[j] = result;
+		factor_offset[j] = offset;
+	}
 }
 
 //The leaves to factor, in any order: LEAF_SMOOTH if they were checked (classes), and otherwise those with cofactor 1, except the
@@ -1857,61 +2336,42 @@ __global__ void k_list_smooth(const unsigned char* __restrict__ classes, const u
 	}
 }
 
-#define FACTOR_BLOCK 128 //threads in a block of k_factor_smooth
-
-//The factors of the listed leaves without their large primes (lp, two per leaf, or none), a warp each: factor_count[j] of them for list[j] (or -1 if it is
-//left to the CPU), from factor_offset[j] in the pool, which has room for pool_capacity. pool_used counts the room they need, also
-//beyond pool_capacity: those that do not fit are left to the CPU.
-__global__ void __launch_bounds__(FACTOR_BLOCK) k_factor_smooth(const uint32_t* __restrict__ list, const uint32_t* __restrict__ list_count, const uint64_t* __restrict__ leaves,
-	size_t stride, const uint32_t* __restrict__ size, const uint64_t* __restrict__ lp, int* __restrict__ factor_count, uint32_t* __restrict__ factor_offset,
-	uint32_t* __restrict__ pool, uint32_t* __restrict__ pool_used, uint32_t pool_capacity)
+//The cycle length up to which the walks look for a prime factor of up to max_prime: a power of two, at least
+//FACTOR_LIMIT_FACTOR sqrt(max_prime).
+static uint64_t factor_rho_limit(uint64_t max_prime)
 {
-	__shared__ uint32_t found[FACTOR_BLOCK / 32][FACTOR_MAX];
-	uint32_t* f = found[threadIdx.x / 32];
-	const uint32_t count = *list_count;
-	const uint32_t warps = gridDim.x * (FACTOR_BLOCK / 32);
-	for (uint32_t j = blockIdx.x * (FACTOR_BLOCK / 32) + threadIdx.x / 32; j < count; j += warps)
+	uint64_t limit = 1 << 10;
+	while ((double)limit * limit < (double)FACTOR_LIMIT_FACTOR * FACTOR_LIMIT_FACTOR * (double)max_prime)
 	{
-		const uint32_t i = list[j];
-		int n = (int)size[i];
-		int result = -1;
-		if (n <= FACTOR_LIMBS)
-		{
-			uint64_t x[FACTOR_LIMBS];
-			for (int k = 0; k < FACTOR_LIMBS; k++)
-			{
-				x[k] = (k < n) ? leaves[(size_t)i * stride + k] : 0;
-			}
-			for (int k = 0; k < 2; k++)
-			{
-				const uint64_t p = (lp != NULL) ? lp[2 * (size_t)i + k] : 0;
-				if (p > 1)
-				{
-					n = divide_exact(x, n, p);
-				}
-			}
-			result = warp_factor(x, n, f, FACTOR_RHO_LIMIT);
-		}
-		if ((threadIdx.x & 31) == 0)
-		{
-			uint32_t offset = 0;
-			if (result > 0)
-			{
-				offset = atomicAdd(pool_used, (uint32_t)result);
-				if (offset + result > pool_capacity)
-				{
-					result = -1;
-				}
-				for (int k = 0; k < result; k++)
-				{
-					pool[offset + k] = f[k];
-				}
-			}
-			factor_count[j] = result;
-			factor_offset[j] = offset;
-		}
-		__syncwarp();
+		limit *= 2;
 	}
+	return limit;
+}
+
+//The kernels that factor the listed values on a stream (see above): at most max_count of them, of which the records hold
+//capacity. next: four counters for the walks of each of the two rounds, the second of which is for the composite factors that a
+//walk left for values of more limbs (rare).
+static void launch_factoring(const uint32_t* list, const uint32_t* list_count, size_t max_count, const uint64_t* values, size_t stride, const uint32_t* size,
+	const uint64_t* lp, uint64_t limit, uint64_t max_prime, Factor_record* records, uint32_t capacity, uint32_t* next, int* factor_count, uint32_t* factor_offset,
+	uint64_t* pool, uint32_t* pool_used, uint32_t pool_capacity, cudaStream_t stream)
+{
+	const size_t most = (max_count < capacity) ? max_count : capacity;
+	const unsigned int start_blocks = (unsigned int)std::min<size_t>(65535, std::max<size_t>(1, (most + FACTOR_THREADS - 1) / FACTOR_THREADS));
+	size_t threads = most / FACTOR_VALUES_PER_THREAD;
+	threads = (threads > FACTOR_MIN_THREADS) ? threads : FACTOR_MIN_THREADS;
+	const unsigned int walk_blocks = (unsigned int)std::min<size_t>(65535, (threads + FACTOR_THREADS - 1) / FACTOR_THREADS);
+	CUDA_CHECK(cudaMemsetAsync(next, 0, 8 * sizeof(uint32_t), stream));
+	k_factor_start<<<start_blocks, FACTOR_THREADS, 0, stream>>>(list, list_count, values, stride, size, lp, records, capacity, max_prime);
+	for (int round = 0; round < 2; round++)
+	{
+		k_factor_walk<4><<<walk_blocks, FACTOR_THREADS, 0, stream>>>(records, list_count, capacity, next + 4 * round, limit, max_prime);
+		k_factor_walk<3><<<walk_blocks, FACTOR_THREADS, 0, stream>>>(records, list_count, capacity, next + 4 * round + 1, limit, max_prime);
+		k_factor_walk<2><<<walk_blocks, FACTOR_THREADS, 0, stream>>>(records, list_count, capacity, next + 4 * round + 2, limit, max_prime);
+		k_factor_walk<1><<<walk_blocks, FACTOR_THREADS, 0, stream>>>(records, list_count, capacity, next + 4 * round + 3, limit, max_prime);
+	}
+	const unsigned int finish_blocks = (unsigned int)std::min<size_t>(65535, std::max<size_t>(1, (max_count + 127) / 128));
+	k_factor_finish<<<finish_blocks, 128, 0, stream>>>(records, list_count, capacity, factor_count, factor_offset, pool, pool_used, pool_capacity);
+	CUDA_CHECK(cudaGetLastError());
 }
 
 #define OTHER_MAX_DEGREE 8 //the largest degree of the other side's polynomial on the GPU
@@ -1939,10 +2399,65 @@ __device__ __forceinline__ void negate_wide(uint64_t* x)
 	}
 }
 
-//The norms |F(a, b)| = |sum c_k a^k b^(d - k)| of the other side of the listed leaves (ab: a and b of each leaf; coefficients: of
-//OTHER_WIDTH limbs each, two's complement, from c_0), as numbers of up to FACTOR_LIMBS limbs (values, at the stride FACTOR_LIMBS, and
-//sizes, by leaf). Norms that may not fit in OTHER_WIDTH limbs (from the sizes of a, b and the coefficients), or do not fit in
-//FACTOR_LIMBS, get the size FACTOR_LIMBS + 1, which k_factor_smooth leaves to the CPU.
+//|F(a, b)| = |sum c_k a^k b^(d - k)| in sum (OTHER_WIDTH limbs), for coefficients of OTHER_WIDTH limbs each, two's complement,
+//from c_0. Returns its size in limbs (0 for 0), or -1 if it may not fit in OTHER_WIDTH limbs (from the sizes of a, b and the
+//coefficients).
+__device__ int polynomial_value(int64_t a, int64_t b, const uint64_t* __restrict__ coefficients, int degree, int coefficient_bits, uint64_t* sum)
+{
+	const uint64_t abs_a = (a < 0) ? 0 - (uint64_t)a : (uint64_t)a, abs_b = (b < 0) ? 0 - (uint64_t)b : (uint64_t)b;
+	const uint64_t larger = (abs_a > abs_b) ? abs_a : abs_b;
+	const int larger_bits = 64 - __clzll((long long)larger);
+	if (coefficient_bits + degree * larger_bits + 4 > 64 * OTHER_WIDTH - 1)
+	{
+		return -1;
+	}
+	uint64_t term[OTHER_WIDTH];
+	for (int k = 0; k < OTHER_WIDTH; k++)
+	{
+		sum[k] = 0;
+	}
+	for (int e = 0; e <= degree; e++)
+	{
+		for (int k = 0; k < OTHER_WIDTH; k++)
+		{
+			term[k] = coefficients[e * OTHER_WIDTH + k];
+		}
+		for (int k = 0; k < e; k++)
+		{
+			multiply_scalar_wide(term, abs_a);
+		}
+		for (int k = e; k < degree; k++)
+		{
+			multiply_scalar_wide(term, abs_b);
+		}
+		if (((a < 0) && (e & 1)) != ((b < 0) && ((degree - e) & 1)))
+		{
+			negate_wide(term);
+		}
+		uint64_t carry = 0;
+		for (int k = 0; k < OTHER_WIDTH; k++)
+		{
+			const uint64_t t = sum[k] + term[k];
+			const uint64_t c1 = (t < term[k]);
+			sum[k] = t + carry;
+			carry = c1 + (sum[k] < t);
+		}
+	}
+	if (sum[OTHER_WIDTH - 1] >> 63)
+	{
+		negate_wide(sum);
+	}
+	int n = OTHER_WIDTH;
+	while (n > 0 && sum[n - 1] == 0)
+	{
+		n--;
+	}
+	return n;
+}
+
+//The norms |F(a, b)| of the other side of the listed leaves (ab: a and b of each leaf), as numbers of up to FACTOR_LIMBS limbs
+//(values, at the stride FACTOR_LIMBS, and sizes, by leaf). Norms that may not fit in OTHER_WIDTH limbs, or do not fit in
+//FACTOR_LIMBS, get the size FACTOR_LIMBS + 1, which the factoring leaves to the CPU.
 __global__ void k_other_norms(const uint32_t* __restrict__ list, const uint32_t* __restrict__ list_count, const int64_t* __restrict__ ab,
 	const uint64_t* __restrict__ coefficients, int degree, int coefficient_bits, uint64_t* __restrict__ values, uint32_t* __restrict__ sizes)
 {
@@ -1950,57 +2465,9 @@ __global__ void k_other_norms(const uint32_t* __restrict__ list, const uint32_t*
 	for (uint32_t j = blockIdx.x * blockDim.x + threadIdx.x; j < count; j += gridDim.x * blockDim.x)
 	{
 		const uint32_t i = list[j];
-		const int64_t a = ab[2 * (size_t)i], b = ab[2 * (size_t)i + 1];
-		const uint64_t abs_a = (a < 0) ? 0 - (uint64_t)a : (uint64_t)a, abs_b = (b < 0) ? 0 - (uint64_t)b : (uint64_t)b;
-		const uint64_t larger = (abs_a > abs_b) ? abs_a : abs_b;
-		const int larger_bits = 64 - __clzll((long long)larger);
-		if (coefficient_bits + degree * larger_bits + 4 > 64 * OTHER_WIDTH - 1)
-		{
-			sizes[i] = FACTOR_LIMBS + 1;
-			continue;
-		}
-		uint64_t sum[OTHER_WIDTH], term[OTHER_WIDTH];
-		for (int k = 0; k < OTHER_WIDTH; k++)
-		{
-			sum[k] = 0;
-		}
-		for (int e = 0; e <= degree; e++)
-		{
-			for (int k = 0; k < OTHER_WIDTH; k++)
-			{
-				term[k] = coefficients[e * OTHER_WIDTH + k];
-			}
-			for (int k = 0; k < e; k++)
-			{
-				multiply_scalar_wide(term, abs_a);
-			}
-			for (int k = e; k < degree; k++)
-			{
-				multiply_scalar_wide(term, abs_b);
-			}
-			if (((a < 0) && (e & 1)) != ((b < 0) && ((degree - e) & 1)))
-			{
-				negate_wide(term);
-			}
-			uint64_t carry = 0;
-			for (int k = 0; k < OTHER_WIDTH; k++)
-			{
-				const uint64_t s = sum[k] + term[k];
-				const uint64_t c1 = (s < term[k]);
-				sum[k] = s + carry;
-				carry = c1 + (sum[k] < s);
-			}
-		}
-		if (sum[OTHER_WIDTH - 1] >> 63)
-		{
-			negate_wide(sum);
-		}
-		int n = OTHER_WIDTH;
-		while (n > 0 && sum[n - 1] == 0)
-		{
-			n--;
-		}
-		if (n > FACTOR_LIMBS)
+		uint64_t sum[OTHER_WIDTH];
+		const int n = polynomial_value(ab[2 * (size_t)i], ab[2 * (size_t)i + 1], coefficients, degree, coefficient_bits, sum);
+		if (n < 0 || n > FACTOR_LIMBS)
 		{
 			sizes[i] = FACTOR_LIMBS + 1;
 			continue;
@@ -2010,6 +2477,37 @@ __global__ void k_other_norms(const uint32_t* __restrict__ list, const uint32_t*
 			values[(size_t)i * FACTOR_LIMBS + k] = sum[k];
 		}
 		sizes[i] = (uint32_t)n;
+	}
+}
+
+//The leaves of a tree from the pairs of a batch: leaf i is |F(a_i, b_i)| for i < pairs, and 1 for the others, at the stride of
+//the leaves, which the values fit in (the caller knows from the largest a and b), with its size, and its size in bits. A value of
+//0 is no relation, and the trees cannot hold a zero: its leaf is 1, and zero[i] is set, so that k_classify rules it out.
+__global__ void k_leaf_values(const int64_t* __restrict__ a, const int64_t* __restrict__ b, size_t pairs, const uint64_t* __restrict__ coefficients, int degree,
+	int coefficient_bits, uint64_t* __restrict__ leaves, size_t stride, uint32_t* __restrict__ size, uint32_t* __restrict__ bits, size_t count,
+	unsigned char* __restrict__ zero)
+{
+	for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < count; i += (size_t)gridDim.x * blockDim.x)
+	{
+		uint64_t sum[OTHER_WIDTH];
+		int n = 0;
+		if (i < pairs)
+		{
+			n = polynomial_value(a[i], b[i], coefficients, degree, coefficient_bits, sum);
+		}
+		const bool is_zero = (i < pairs && n <= 0);
+		if (i >= pairs || n <= 0)
+		{
+			sum[0] = 1;
+			n = 1;
+		}
+		for (size_t k = 0; k < stride; k++)
+		{
+			leaves[i * stride + k] = (k < (size_t)n) ? sum[k] : 0;
+		}
+		size[i] = (uint32_t)n;
+		bits[i] = 64 * (uint32_t)(n - 1) + (64 - __clzll((long long)sum[n - 1]));
+		zero[i] = is_zero;
 	}
 }
 
@@ -2048,9 +2546,11 @@ public:
 	bool Set_leaf_check(const Leaf_check& check);
 	const unsigned char* Leaf_classes();
 	const unsigned long long* Leaf_large_primes();
-	bool Set_leaf_factoring();
+	bool Set_leaf_factoring(unsigned long long max_prime, bool enabled, bool all);
+	bool Set_leaf_polynomial(const std::vector<mpz_class>& coefficients);
+	bool Set_leaf_pairs(const long long* a, const long long* b, int count);
 	bool Leaf_factors_ready();
-	int Leaf_factors(int index, const unsigned int** factors);
+	int Leaf_factors(int index, const unsigned long long** factors);
 
 private:
 	//The nodes of a depth: the product tree, and then the fractions of the remainder tree.
@@ -2076,10 +2576,23 @@ private:
 	Gpu_root* root;
 	Gpu_number fraction; //of the root
 	size_t leaf_limbs; //the most limbs of a leaf
+	//The leaves from pairs (Set_leaf_pairs): the polynomial on the GPU (as that of k_other_norms) and on the host, the pairs of the
+	//batch, and the leaves whose value is 0.
+	uint64_t* leaf_coefficients;
+	std::vector<mpz_class> leaf_polynomial;
+	int leaf_degree, leaf_coefficient_bits;
+	bool pairs; //the leaves of this batch are from pairs
+	const long long *host_a, *host_b;
+	int pair_count;
+	size_t pair_limbs; //that the values of the pairs fit in
+	int64_t *pair_a, *pair_b;
+	unsigned char* leaf_zero;
+	size_t pair_a_capacity, pair_b_capacity, leaf_zero_capacity;
 	Gpu_level cofactors; //of the leaves
 	size_t cofactor_limb_capacity, cofactor_size_capacity;
 	bool checking; //the cofactors, with check
 	bool factoring; //the smooth leaves, with Start_factoring
+	bool all_smooth; //nearly all leaves are smooth (Set_leaf_factoring), for the memory of their factoring
 	Leaf_check check;
 	bool classes_valid; //for this batch
 	unsigned char* classes; //on the GPU, and host_classes
@@ -2087,7 +2600,9 @@ private:
 	uint64_t* large_primes; //on the GPU, two per leaf, and host_large_primes
 	size_t large_primes_capacity;
 	uint32_t* rho_list; //the leaves for k_rho, and their count at rho_list[0]
-	size_t rho_list_capacity;
+	uint32_t* rho_next; //the counters of k_rho
+	uint32_t* rho_list2; //the same for the cofactors of two limbs
+	size_t rho_list_capacity, rho_next_capacity, rho_list2_capacity;
 	cudaStream_t rho_stream; //k_rho runs on a stream of its own, after classified (on the stream of the thread)
 	cudaEvent_t classified, rho_done; //k_rho of the batch, which the thread that checks the batch waits for (Leaf_classes)
 	bool rho_pending;
@@ -2096,13 +2611,19 @@ private:
 	//factors need in the pool), and for each its number of factors and their offset in the pool (factor_primes).
 	uint32_t* factor_list;
 	int* factor_counts;
-	uint32_t *factor_offsets, *factor_primes;
+	uint32_t* factor_offsets;
+	uint64_t* factor_primes;
 	size_t factor_list_capacity, factor_counts_capacity, factor_offsets_capacity, factor_primes_capacity;
 	uint32_t factor_pool; //the room in the pool for this batch: FACTOR_POOL_PER_LEAF per leaf, or what the last batch needed
+	uint64_t factor_limit; //the cycle length up to which the walks look for a factor (factor_rho_limit)
+	Factor_record* factor_records; //of the leaves being factored (launch_factoring), and the counters of its walks
+	uint32_t* factor_next;
+	size_t factor_records_capacity, factor_next_capacity, record_capacity;
 	cudaEvent_t factored;
 	bool factors_pending, factors_valid;
 	void Start_factoring(int K);
-	std::vector<uint32_t> host_factor_list, host_factor_offsets, host_factor_primes;
+	std::vector<uint32_t> host_factor_list, host_factor_offsets;
+	std::vector<unsigned long long> host_factor_primes;
 	std::vector<int> host_factor_counts, host_factor_entry; //host_factor_entry: the entry of each leaf in the list, or -1
 	Pinned<unsigned char> host_classes;
 	Pinned<unsigned long long> host_large_primes;
@@ -2131,7 +2652,7 @@ static void set_trial_primes()
 	static std::once_flag done;
 	std::call_once(done, []
 	{
-		const uint32_t limit = 1 << 16;
+		const uint32_t limit = 1 << FACTOR_TRIAL_BITS;
 		std::vector<bool> composite(limit, false);
 		std::vector<uint64_t> table;
 		for (uint32_t i = 3; i < limit; i += 2)
@@ -2154,7 +2675,7 @@ static void set_trial_primes()
 		}
 		if (table.size() != 2 * FACTOR_TRIAL_PRIMES)
 		{
-			fprintf(stderr, "Gpu_tree_backend: %zu odd primes below 2^16\n", table.size() / 2);
+			fprintf(stderr, "Gpu_tree_backend: %zu odd primes below 2^%d\n", table.size() / 2, FACTOR_TRIAL_BITS);
 			exit(3);
 		}
 		CUDA_CHECK(cudaMemcpyToSymbol(factor_trial, table.data(), table.size() * sizeof(uint64_t)));
@@ -2198,6 +2719,15 @@ Gpu_tree_backend::Gpu_tree_backend(int levels, int max_bits_in_input) : Cpu_tree
 	shift = precision = NULL;
 	shift_capacity = precision_capacity = 0;
 	leaf_limbs = 1;
+	leaf_coefficients = NULL;
+	leaf_degree = leaf_coefficient_bits = 0;
+	pairs = false;
+	host_a = host_b = NULL;
+	pair_count = 0;
+	pair_limbs = 0;
+	pair_a = pair_b = NULL;
+	leaf_zero = NULL;
+	pair_a_capacity = pair_b_capacity = leaf_zero_capacity = 0;
 	cofactors.limbs = NULL;
 	cofactors.size = NULL;
 	cofactors.stride = 0;
@@ -2205,6 +2735,7 @@ Gpu_tree_backend::Gpu_tree_backend(int levels, int max_bits_in_input) : Cpu_tree
 	cofactor_limb_capacity = cofactor_size_capacity = 0;
 	checking = false;
 	factoring = false;
+	all_smooth = false;
 	gather_list = gather_sizes = NULL;
 	gather_limbs = NULL;
 	gather_list_capacity = gather_sizes_capacity = gather_limbs_capacity = 0;
@@ -2212,17 +2743,24 @@ Gpu_tree_backend::Gpu_tree_backend(int levels, int max_bits_in_input) : Cpu_tree
 	classes = NULL;
 	large_primes = NULL;
 	rho_list = NULL;
-	classes_capacity = large_primes_capacity = rho_list_capacity = 0;
+	rho_next = NULL;
+	rho_list2 = NULL;
+	classes_capacity = large_primes_capacity = rho_list_capacity = rho_next_capacity = rho_list2_capacity = 0;
 	CUDA_CHECK(cudaStreamCreateWithFlags(&rho_stream, cudaStreamNonBlocking));
 	CUDA_CHECK(cudaEventCreateWithFlags(&classified, cudaEventDisableTiming));
-	CUDA_CHECK(cudaEventCreateWithFlags(&rho_done, cudaEventDisableTiming));
+	CUDA_CHECK(cudaEventCreateWithFlags(&rho_done, cudaEventDisableTiming | cudaEventBlockingSync));
 	rho_pending = false;
 	factor_list = NULL;
 	factor_counts = NULL;
-	factor_offsets = factor_primes = NULL;
+	factor_offsets = NULL;
+	factor_primes = NULL;
 	factor_list_capacity = factor_counts_capacity = factor_offsets_capacity = factor_primes_capacity = 0;
 	factor_pool = 0;
-	CUDA_CHECK(cudaEventCreateWithFlags(&factored, cudaEventDisableTiming));
+	factor_limit = factor_rho_limit(1ULL << 32);
+	factor_records = NULL;
+	factor_next = NULL;
+	factor_records_capacity = factor_next_capacity = record_capacity = 0;
+	CUDA_CHECK(cudaEventCreateWithFlags(&factored, cudaEventDisableTiming | cudaEventBlockingSync));
 	factors_pending = factors_valid = false;
 }
 
@@ -2261,12 +2799,20 @@ Gpu_tree_backend::~Gpu_tree_backend()
 	cudaFree(factor_counts);
 	cudaFree(factor_offsets);
 	cudaFree(factor_primes);
+	cudaFree(factor_records);
+	cudaFree(factor_next);
+	cudaFree(leaf_coefficients);
+	cudaFree(pair_a);
+	cudaFree(pair_b);
+	cudaFree(leaf_zero);
 	cudaEventDestroy(rho_done);
 	cudaEventDestroy(classified);
 	cudaStreamDestroy(rho_stream);
 	cudaFree(classes);
 	cudaFree(large_primes);
 	cudaFree(rho_list);
+	cudaFree(rho_next);
+	cudaFree(rho_list2);
 }
 
 bool Gpu_tree_backend::Set_leaf_check(const Leaf_check& leaf_check)
@@ -2304,9 +2850,11 @@ const unsigned long long* Gpu_tree_backend::Leaf_large_primes()
 	return classes_valid ? host_large_primes.data() : NULL;
 }
 
-bool Gpu_tree_backend::Set_leaf_factoring()
+bool Gpu_tree_backend::Set_leaf_factoring(unsigned long long max_prime, bool enabled, bool all)
 {
-	factoring = true;
+	factoring = enabled;
+	all_smooth = all;
+	factor_limit = factor_rho_limit((max_prime > 0 && max_prime < (1ULL << 32)) ? max_prime : (1ULL << 32));
 	return true;
 }
 
@@ -2317,7 +2865,10 @@ void Gpu_tree_backend::Start_factoring(int K)
 	Depth& leaves = depth_data[levels - 1];
 	CUDA_CHECK(cudaEventRecord(classified, 0));
 	CUDA_CHECK(cudaStreamWaitEvent(rho_stream, classified, 0));
-	factor_pool = (factor_pool > FACTOR_POOL_PER_LEAF * (uint32_t)num_leaves) ? factor_pool : FACTOR_POOL_PER_LEAF * (uint32_t)num_leaves;
+	//Room for the factors: FACTOR_POOL_PER_LEAF per leaf, where a few percent of the leaves are smooth, and FACTOR_POOL_PER_VALUE
+	//per leaf if all are, or what the last batch needed.
+	const uint32_t least_pool = (all_smooth ? FACTOR_POOL_PER_VALUE : FACTOR_POOL_PER_LEAF) * (uint32_t)num_leaves;
+	factor_pool = (factor_pool > least_pool) ? factor_pool : least_pool;
 	reserve(factor_list, factor_list_capacity, (size_t)num_leaves + 2);
 	reserve(factor_counts, factor_counts_capacity, (size_t)num_leaves);
 	reserve(factor_offsets, factor_offsets_capacity, (size_t)num_leaves);
@@ -2325,8 +2876,15 @@ void Gpu_tree_backend::Start_factoring(int K)
 	CUDA_CHECK(cudaMemsetAsync(factor_list, 0, 2 * sizeof(uint32_t), rho_stream));
 	k_list_smooth<<<grid_size_leaves(num_leaves), 128, 0, rho_stream>>>(checking ? classes : NULL, cofactors.limbs, K, cofactors.size, leaves.level.limbs,
 		leaves.level.stride, leaves.level.size, num_leaves, factor_list + 2, factor_list);
-	k_factor_smooth<<<1024, FACTOR_BLOCK, 0, rho_stream>>>(factor_list + 2, factor_list, leaves.level.limbs, leaves.level.stride, leaves.level.size,
-		checking ? large_primes : NULL, factor_counts, factor_offsets, factor_primes, factor_list + 1, factor_pool);
+	//Records for a sixteenth of the leaves (or for all of them, if all are smooth: the tree of the other side's norms), or as
+	//many as the last batch needed.
+	const size_t least_records = all_smooth ? (size_t)num_leaves : std::max<size_t>(4096, (size_t)num_leaves / 16);
+	record_capacity = (record_capacity > least_records) ? record_capacity : least_records;
+	reserve(factor_records, factor_records_capacity, record_capacity);
+	reserve(factor_next, factor_next_capacity, 8);
+	launch_factoring(factor_list + 2, factor_list, (size_t)num_leaves, leaves.level.limbs, leaves.level.stride, leaves.level.size, checking ? large_primes : NULL,
+		factor_limit, (1ULL << 32) - 1, factor_records, (uint32_t)record_capacity, factor_next, factor_counts, factor_offsets, factor_primes, factor_list + 1,
+		factor_pool, rho_stream);
 	CUDA_CHECK(cudaGetLastError());
 	CUDA_CHECK(cudaEventRecord(factored, rho_stream));
 	factors_pending = true;
@@ -2353,12 +2911,17 @@ bool Gpu_tree_backend::Leaf_factors_ready()
 		CUDA_CHECK(cudaMemcpy(host_factor_list.data(), factor_list + 2, count * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 		CUDA_CHECK(cudaMemcpy(host_factor_counts.data(), factor_counts, count * sizeof(int), cudaMemcpyDeviceToHost));
 		CUDA_CHECK(cudaMemcpy(host_factor_offsets.data(), factor_offsets, count * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-		CUDA_CHECK(cudaMemcpy(host_factor_primes.data(), factor_primes, host_factor_primes.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+		CUDA_CHECK(cudaMemcpy(host_factor_primes.data(), factor_primes, host_factor_primes.size() * sizeof(uint64_t), cudaMemcpyDeviceToHost));
 	}
 	if (header[1] > factor_pool)
 	{
 		//The pool was too small, and the CPU factors the leaves that did not fit. Room for all of them in the next batch.
 		factor_pool = header[1] + header[1] / 4;
+	}
+	if (count > record_capacity)
+	{
+		//The same for the records.
+		record_capacity = (size_t)count + count / 4;
 	}
 	host_factor_entry.assign(num_leaves, -1);
 	for (uint32_t j = 0; j < count; j++)
@@ -2370,7 +2933,7 @@ bool Gpu_tree_backend::Leaf_factors_ready()
 	return true;
 }
 
-int Gpu_tree_backend::Leaf_factors(int index, const unsigned int** factors)
+int Gpu_tree_backend::Leaf_factors(int index, const unsigned long long** factors)
 {
 	const int j = factors_valid ? host_factor_entry[index] : -1;
 	if (j < 0)
@@ -2379,6 +2942,101 @@ int Gpu_tree_backend::Leaf_factors(int index, const unsigned int** factors)
 	}
 	*factors = host_factor_primes.data() + host_factor_offsets[j];
 	return host_factor_counts[j];
+}
+
+//The polynomial of the leaves on the GPU, as numbers of OTHER_WIDTH limbs in two's complement (see create_gpu_other_side_factoring).
+bool Gpu_tree_backend::Set_leaf_polynomial(const std::vector<mpz_class>& coefficients)
+{
+	const int degree = (int)coefficients.size() - 1;
+	if (!checking || degree < 1 || degree > OTHER_MAX_DEGREE)
+	{
+		return false;
+	}
+	int bits = 0;
+	std::vector<uint64_t> words((size_t)(degree + 1) * OTHER_WIDTH, 0);
+	for (int e = 0; e <= degree; e++)
+	{
+		mpz_srcptr c = coefficients[e].get_mpz_t();
+		const int c_bits = (int)mpz_sizeinbase(c, 2);
+		if (c_bits + degree * 32 + 4 > 64 * OTHER_WIDTH - 1)
+		{
+			return false; //too large even for a and b of 32 bits
+		}
+		bits = (c_bits > bits) ? c_bits : bits;
+		uint64_t* x = &words[(size_t)e * OTHER_WIDTH];
+		for (size_t k = 0; k < mpz_size(c); k++)
+		{
+			x[k] = mpz_getlimbn(c, k);
+		}
+		if (mpz_sgn(c) < 0)
+		{
+			uint64_t carry = 1;
+			for (int k = 0; k < OTHER_WIDTH; k++)
+			{
+				x[k] = ~x[k] + carry;
+				carry = (x[k] < carry);
+			}
+		}
+	}
+	gpu_start();
+	cudaFree(leaf_coefficients);
+	CUDA_CHECK(cudaMalloc(&leaf_coefficients, words.size() * sizeof(uint64_t)));
+	CUDA_CHECK(cudaMemcpy(leaf_coefficients, words.data(), words.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
+	leaf_polynomial = coefficients;
+	leaf_degree = degree;
+	leaf_coefficient_bits = bits;
+	return true;
+}
+
+//The pairs of the next batch. Their values are at most sum |c_k| A^k B^(d - k) for |a| <= A and |b| <= B, which gives the limbs
+//of the leaves; false if that may not fit in the numbers of k_leaf_values, or is too large for the kernel of the leaves.
+bool Gpu_tree_backend::Set_leaf_pairs(const long long* a, const long long* b, int count)
+{
+	pairs = false;
+	if (leaf_coefficients == NULL || count < 0 || count > num_leaves)
+	{
+		return false;
+	}
+	unsigned long long largest_a = 1, largest_b = 1;
+	for (int i = 0; i < count; i++)
+	{
+		const unsigned long long abs_a = (a[i] < 0) ? 0 - (unsigned long long)a[i] : (unsigned long long)a[i];
+		const unsigned long long abs_b = (b[i] < 0) ? 0 - (unsigned long long)b[i] : (unsigned long long)b[i];
+		largest_a = (abs_a > largest_a) ? abs_a : largest_a;
+		largest_b = (abs_b > largest_b) ? abs_b : largest_b;
+	}
+	const unsigned long long larger = (largest_a > largest_b) ? largest_a : largest_b;
+	int larger_bits = 0;
+	while (larger_bits < 64 && (larger >> larger_bits) != 0)
+	{
+		larger_bits++;
+	}
+	if (leaf_coefficient_bits + leaf_degree * larger_bits + 4 > 64 * OTHER_WIDTH - 1)
+	{
+		return false;
+	}
+	mpz_class bound = 0, term, power_a = 1, A, B;
+	mpz_import(A.get_mpz_t(), 1, -1, sizeof(unsigned long long), 0, 0, &largest_a);
+	mpz_import(B.get_mpz_t(), 1, -1, sizeof(unsigned long long), 0, 0, &largest_b);
+	for (int k = 0; k <= leaf_degree; k++)
+	{
+		mpz_pow_ui(term.get_mpz_t(), B.get_mpz_t(), (unsigned long)(leaf_degree - k));
+		term *= power_a;
+		term *= abs(leaf_polynomial[k]);
+		bound += term;
+		power_a *= A;
+	}
+	const size_t limbs = (mpz_sizeinbase(bound.get_mpz_t(), 2) + 63) / 64;
+	if (Gpu_ntt::Leaf_kernel_limbs((int)limbs) == 0)
+	{
+		return false;
+	}
+	host_a = a;
+	host_b = b;
+	pair_count = count;
+	pair_limbs = limbs;
+	pairs = true;
+	return true;
 }
 
 void Gpu_tree_backend::Set_stride(Depth& d, size_t count, size_t stride)
@@ -2468,15 +3126,42 @@ mp_bitcnt_t Gpu_tree_backend::Build_product_tree()
 	//The leaves, with room for their fractions too.
 	const int leaf_depth = levels - 1;
 	size_t max_leaf = 1;
-	for (int i = first_leaf; i < first_leaf + num_leaves; i++)
+	if (pairs)
 	{
-		node_bits[i] = mpz_sizeinbase(node[i].get_mpz_t(), 2);
-		size_t n = mpz_size(node[i].get_mpz_t());
-		max_leaf = (n > max_leaf) ? n : max_leaf;
+		//Computed on the GPU from the pairs.
+		Depth& leaves = depth_data[leaf_depth];
+		max_leaf = pair_limbs;
+		Set_stride(leaves, num_leaves, max_leaf + 1);
+		reserve(pair_a, pair_a_capacity, (size_t)num_leaves);
+		reserve(pair_b, pair_b_capacity, (size_t)num_leaves);
+		reserve(leaf_zero, leaf_zero_capacity, (size_t)num_leaves);
+		if (pair_count > 0)
+		{
+			CUDA_CHECK(cudaMemcpy(pair_a, host_a, (size_t)pair_count * sizeof(int64_t), cudaMemcpyHostToDevice));
+			CUDA_CHECK(cudaMemcpy(pair_b, host_b, (size_t)pair_count * sizeof(int64_t), cudaMemcpyHostToDevice));
+		}
+		k_leaf_values<<<grid_size_leaves(num_leaves), 128>>>(pair_a, pair_b, (size_t)pair_count, leaf_coefficients, leaf_degree, leaf_coefficient_bits,
+			leaves.level.limbs, leaves.level.stride, leaves.level.size, leaves.bits, (size_t)num_leaves, leaf_zero);
+		CUDA_CHECK(cudaGetLastError());
+		host_words.resize(num_leaves);
+		CUDA_CHECK(cudaMemcpy(host_words.data(), leaves.bits, (size_t)num_leaves * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+		for (int i = 0; i < num_leaves; i++)
+		{
+			node_bits[first_leaf + i] = host_words[i];
+		}
 	}
-	Set_stride(depth_data[leaf_depth], num_leaves, max_leaf + 1);
-	Upload(leaf_depth);
-	gpu->Bits(depth_data[leaf_depth].level, depth_data[leaf_depth].bits, 0);
+	else
+	{
+		for (int i = first_leaf; i < first_leaf + num_leaves; i++)
+		{
+			node_bits[i] = mpz_sizeinbase(node[i].get_mpz_t(), 2);
+			size_t n = mpz_size(node[i].get_mpz_t());
+			max_leaf = (n > max_leaf) ? n : max_leaf;
+		}
+		Set_stride(depth_data[leaf_depth], num_leaves, max_leaf + 1);
+		Upload(leaf_depth);
+		gpu->Bits(depth_data[leaf_depth].level, depth_data[leaf_depth].bits, 0);
+	}
 	leaf_limbs = max_leaf;
 
 	for (int depth = levels - 2; depth >= 0; depth--)
@@ -2629,7 +3314,15 @@ void Gpu_tree_backend::Leaf_cofactors()
 				reserve(large_primes, large_primes_capacity, 2 * (size_t)num_leaves);
 				reserve(rho_list, rho_list_capacity, (size_t)num_leaves + 1);
 				CUDA_CHECK(cudaMemsetAsync(rho_list, 0, sizeof(uint32_t)));
-				k_classify<<<grid_size_leaves(num_leaves), 128>>>(cofactors.limbs, K, cofactors.size, num_leaves, check, classes, large_primes, rho_list + 1, rho_list);
+				//Cofactors of two large primes of 64 bits or more (large primes of 32 bits or more) have a list of their own.
+				const bool wide = check.max_cofactor_bits > 63 && K >= 2;
+				if (wide)
+				{
+					reserve(rho_list2, rho_list2_capacity, (size_t)num_leaves + 1);
+					CUDA_CHECK(cudaMemsetAsync(rho_list2, 0, sizeof(uint32_t)));
+				}
+				k_classify<<<grid_size_leaves(num_leaves), 128>>>(cofactors.limbs, K, cofactors.size, num_leaves, check, pairs ? leaf_zero : NULL, classes,
+					large_primes, rho_list + 1, rho_list, wide ? rho_list2 + 1 : NULL, wide ? rho_list2 : NULL);
 				CUDA_CHECK(cudaGetLastError());
 			}
 			//The cofactors as numbers: only those that the CPU still needs, if they were checked (the classes and large primes are
@@ -2680,7 +3373,14 @@ void Gpu_tree_backend::Leaf_cofactors()
 				//then those cofactors are LEAF_TINYQS, and they are among the ones copied above.
 				CUDA_CHECK(cudaEventRecord(classified, 0));
 				CUDA_CHECK(cudaStreamWaitEvent(rho_stream, classified, 0));
-				k_rho<<<256, 32, 0, rho_stream>>>(cofactors.limbs, K, rho_list + 1, rho_list, check, classes, large_primes);
+				reserve(rho_next, rho_next_capacity, 2);
+				CUDA_CHECK(cudaMemsetAsync(rho_next, 0, 2 * sizeof(uint32_t), rho_stream));
+				const unsigned int rho_blocks = (unsigned int)std::min<size_t>(8192, std::max<size_t>(8, (size_t)num_leaves / (FACTOR_VALUES_PER_THREAD * FACTOR_THREADS)));
+				k_rho<1><<<rho_blocks, FACTOR_THREADS, 0, rho_stream>>>(cofactors.limbs, K, rho_list + 1, rho_list, rho_next, check, classes, large_primes);
+				if (check.max_cofactor_bits > 63 && K >= 2)
+				{
+					k_rho<2><<<rho_blocks, FACTOR_THREADS, 0, rho_stream>>>(cofactors.limbs, K, rho_list2 + 1, rho_list2, rho_next + 1, check, classes, large_primes);
+				}
 				CUDA_CHECK(cudaGetLastError());
 				CUDA_CHECK(cudaEventRecord(rho_done, rho_stream));
 				rho_pending = true;
@@ -2703,7 +3403,7 @@ void Gpu_tree_backend::Leaf_cofactors()
 #define OTHER_JOB_CAPACITY 4096 //norms of a job for which the memory is allocated up front (a batch of 2^19 relations has about 1500)
 
 //The factoring of the other side's norms of the relations found, as jobs apart from the trees: a job (the relations found in a batch)
-//is copied to the GPU, and its norms computed and factored (k_other_norms, k_factor_smooth, a warp per norm), on a stream of its own,
+//is copied to the GPU, and its norms computed and factored (k_other_norms, launch_factoring), on a stream of its own,
 //so that the jobs of several batches run at once. A norm takes several splits by Pollard rho, which take
 //tens of ms while the trees keep the GPU busy, so the results are only waited for when the relations are written, and the batches
 //go on meanwhile. Submit is called by one thread, and Results by one thread, in the order of the jobs.
@@ -2714,9 +3414,11 @@ public:
 	~Gpu_other_side_factoring();
 	int Submit(const long long* a, const long long* b, int count);
 	int Submit_values(const unsigned long long* limbs, const unsigned int* sizes, int count);
-	void Results(int job, std::vector<int>& counts, std::vector<unsigned int>& offsets, std::vector<unsigned int>& primes);
+	void Results(int job, std::vector<int>& counts, std::vector<unsigned int>& offsets, std::vector<unsigned long long>& primes);
+	void Set_prime_bits(int bits);
 
 private:
+	uint64_t factor_limit, max_prime;
 	struct Job
 	{
 		cudaStream_t stream;
@@ -2728,11 +3430,15 @@ private:
 		Pinned<uint32_t> host_sizes;
 		Pinned<uint32_t> host_header; //the number of norms, and the room their factors need in the pool
 		Pinned<int> host_counts;
-		Pinned<uint32_t> host_offsets, host_primes;
+		Pinned<uint32_t> host_offsets;
+		Pinned<uint64_t> host_primes;
 		int64_t* ab;
 		uint64_t* values;
-		uint32_t *header, *list, *sizes, *offsets, *primes;
+		uint32_t *header, *list, *sizes, *offsets;
+		uint64_t* primes;
 		int* counts;
+		Factor_record* records;
+		uint32_t* next; //the counters of the walks
 		size_t capacity; //norms
 	};
 	void Reserve(Job& j, size_t count);
@@ -2745,9 +3451,20 @@ private:
 	int degree, coefficient_bits;
 };
 
+void Gpu_other_side_factoring::Set_prime_bits(int bits)
+{
+	//Primes below 2^32 are found in any case, as before, also if the bound says less (a polynomial file with a large prime bound
+	//that is lower than the one the relations were sieved with): the walks are as long as primes of 32 bits need, or of the bound.
+	const int most = (bits > 32 && bits <= 62) ? bits : 32;
+	factor_limit = factor_rho_limit(1ULL << most);
+	max_prime = (1ULL << most) - 1;
+}
+
 Gpu_other_side_factoring::Gpu_other_side_factoring(const std::vector<uint64_t>& words, int degree, int coefficient_bits)
 	: submitted(0), taken(0), degree(degree), coefficient_bits(coefficient_bits)
 {
+	factor_limit = factor_rho_limit(1ULL << 32);
+	max_prime = (1ULL << 32) - 1;
 	gpu_start();
 	set_trial_primes();
 	CUDA_CHECK(cudaMalloc(&coefficients, words.size() * sizeof(uint64_t)));
@@ -2758,15 +3475,18 @@ Gpu_other_side_factoring::Gpu_other_side_factoring(const std::vector<uint64_t>& 
 	for (Job& j : jobs)
 	{
 		CUDA_CHECK(cudaStreamCreateWithPriority(&j.stream, cudaStreamNonBlocking, greatest_priority));
-		CUDA_CHECK(cudaEventCreateWithFlags(&j.done, cudaEventDisableTiming));
+		CUDA_CHECK(cudaEventCreateWithFlags(&j.done, cudaEventDisableTiming | cudaEventBlockingSync));
 		j.busy = false;
 		j.count = 0;
 		j.ab = NULL;
 		j.values = NULL;
-		j.header = j.list = j.sizes = j.offsets = j.primes = NULL;
+		j.header = j.list = j.sizes = j.offsets = NULL;
+		j.primes = NULL;
 		j.counts = NULL;
+		j.records = NULL;
 		j.capacity = 0;
 		CUDA_CHECK(cudaMalloc(&j.header, 2 * sizeof(uint32_t)));
+		CUDA_CHECK(cudaMalloc(&j.next, 8 * sizeof(uint32_t)));
 		j.host_header.resize(2);
 		Reserve(j, OTHER_JOB_CAPACITY);
 	}
@@ -2774,7 +3494,7 @@ Gpu_other_side_factoring::Gpu_other_side_factoring(const std::vector<uint64_t>& 
 	CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-//Room for count norms in a job, their factors, and the list of them (0, 1, ...), which k_other_norms and k_factor_smooth take.
+//Room for count norms in a job, their factors, and the list of them (0, 1, ...), which k_other_norms and the factoring take.
 //The memory is allocated up front, so that it is not freed and allocated while the GPU is busy.
 void Gpu_other_side_factoring::Reserve(Job& j, size_t count)
 {
@@ -2789,12 +3509,14 @@ void Gpu_other_side_factoring::Reserve(Job& j, size_t count)
 	cudaFree(j.offsets);
 	cudaFree(j.primes);
 	cudaFree(j.counts);
+	cudaFree(j.records);
+	CUDA_CHECK(cudaMalloc(&j.records, count * sizeof(Factor_record)));
 	CUDA_CHECK(cudaMalloc(&j.ab, 2 * count * sizeof(int64_t)));
 	CUDA_CHECK(cudaMalloc(&j.values, count * FACTOR_LIMBS * sizeof(uint64_t)));
 	CUDA_CHECK(cudaMalloc(&j.list, count * sizeof(uint32_t)));
 	CUDA_CHECK(cudaMalloc(&j.sizes, count * sizeof(uint32_t)));
 	CUDA_CHECK(cudaMalloc(&j.offsets, count * sizeof(uint32_t)));
-	CUDA_CHECK(cudaMalloc(&j.primes, count * FACTOR_MAX * sizeof(uint32_t)));
+	CUDA_CHECK(cudaMalloc(&j.primes, count * FACTOR_POOL_PER_VALUE * sizeof(uint64_t)));
 	CUDA_CHECK(cudaMalloc(&j.counts, count * sizeof(int)));
 	std::vector<uint32_t> identity(count);
 	for (size_t i = 0; i < count; i++)
@@ -2810,7 +3532,7 @@ void Gpu_other_side_factoring::Reserve(Job& j, size_t count)
 	j.host_sizes.resize(count);
 	j.host_counts.resize(count);
 	j.host_offsets.resize(count);
-	j.host_primes.resize(count * FACTOR_MAX);
+	j.host_primes.resize(count * FACTOR_POOL_PER_VALUE);
 	j.capacity = count;
 }
 
@@ -2827,13 +3549,15 @@ Gpu_other_side_factoring::~Gpu_other_side_factoring()
 		cudaFree(j.offsets);
 		cudaFree(j.primes);
 		cudaFree(j.counts);
+		cudaFree(j.records);
+		cudaFree(j.next);
 		cudaEventDestroy(j.done);
 		cudaStreamDestroy(j.stream);
 	}
 	cudaFree(coefficients);
 }
 
-//Start a job: the norms of the relations (a, b) and their factors, at most FACTOR_MAX each. Waits for the oldest job's results to be
+//Start a job: the norms of the relations (a, b) and their factors, FACTOR_POOL_PER_VALUE each on average at most. Waits for the oldest job's results to be
 //taken if all OTHER_JOBS are in use. Returns the number of the job.
 int Gpu_other_side_factoring::Submit(const long long* a, const long long* b, int count)
 {
@@ -2871,8 +3595,7 @@ int Gpu_other_side_factoring::Launch(const long long* a, const long long* b, con
 	j.host_header[1] = 0;
 	if (count > 0)
 	{
-		const uint32_t pool = (uint32_t)count * FACTOR_MAX;
-		const unsigned int blocks = (unsigned int)std::min(1024, (count + FACTOR_BLOCK / 32 - 1) / (FACTOR_BLOCK / 32));
+		const uint32_t pool = (uint32_t)count * FACTOR_POOL_PER_VALUE; //values whose factors do not fit are left to the CPU
 		CUDA_CHECK(cudaMemcpyAsync(j.header, j.host_header.data(), 2 * sizeof(uint32_t), cudaMemcpyHostToDevice, j.stream));
 		if (a != NULL)
 		{
@@ -2884,12 +3607,11 @@ int Gpu_other_side_factoring::Launch(const long long* a, const long long* b, con
 			CUDA_CHECK(cudaMemcpyAsync(j.values, j.host_values.data(), (size_t)count * FACTOR_LIMBS * sizeof(uint64_t), cudaMemcpyHostToDevice, j.stream));
 			CUDA_CHECK(cudaMemcpyAsync(j.sizes, j.host_sizes.data(), (size_t)count * sizeof(uint32_t), cudaMemcpyHostToDevice, j.stream));
 		}
-		k_factor_smooth<<<blocks, FACTOR_BLOCK, 0, j.stream>>>(j.list, j.header, j.values, FACTOR_LIMBS, j.sizes, NULL, j.counts, j.offsets, j.primes,
-			j.header + 1, pool);
-		CUDA_CHECK(cudaGetLastError());
+		launch_factoring(j.list, j.header, (size_t)count, j.values, FACTOR_LIMBS, j.sizes, NULL, factor_limit, max_prime, j.records, (uint32_t)j.capacity, j.next,
+			j.counts, j.offsets, j.primes, j.header + 1, pool, j.stream);
 		CUDA_CHECK(cudaMemcpyAsync(j.host_counts.data(), j.counts, (size_t)count * sizeof(int), cudaMemcpyDeviceToHost, j.stream));
 		CUDA_CHECK(cudaMemcpyAsync(j.host_offsets.data(), j.offsets, (size_t)count * sizeof(uint32_t), cudaMemcpyDeviceToHost, j.stream));
-		CUDA_CHECK(cudaMemcpyAsync(j.host_primes.data(), j.primes, (size_t)pool * sizeof(uint32_t), cudaMemcpyDeviceToHost, j.stream));
+		CUDA_CHECK(cudaMemcpyAsync(j.host_header.data(), j.header, 2 * sizeof(uint32_t), cudaMemcpyDeviceToHost, j.stream));
 	}
 	CUDA_CHECK(cudaEventRecord(j.done, j.stream));
 
@@ -2901,7 +3623,7 @@ int Gpu_other_side_factoring::Launch(const long long* a, const long long* b, con
 
 //The factors of the norms of a job, in the order they were submitted: for norm i, counts[i] of them (or -1 if it was not factored)
 //from offsets[i] in primes, in increasing order. The jobs must be taken in the order they were submitted.
-void Gpu_other_side_factoring::Results(int job, std::vector<int>& counts, std::vector<unsigned int>& offsets, std::vector<unsigned int>& primes)
+void Gpu_other_side_factoring::Results(int job, std::vector<int>& counts, std::vector<unsigned int>& offsets, std::vector<unsigned long long>& primes)
 {
 	Job& j = jobs[(taken % (1LL << 30)) % OTHER_JOBS];
 	if (job != (int)(taken % (1LL << 30)) || !j.busy)
@@ -2913,7 +3635,13 @@ void Gpu_other_side_factoring::Results(int job, std::vector<int>& counts, std::v
 	CUDA_CHECK(cudaEventSynchronize(j.done));
 	counts.assign(j.host_counts.data(), j.host_counts.data() + j.count);
 	offsets.assign(j.host_offsets.data(), j.host_offsets.data() + j.count);
-	primes.assign(j.host_primes.data(), j.host_primes.data() + (size_t)j.count * FACTOR_MAX);
+	//The factors that the job found: the part of the pool that is used.
+	const size_t used = (j.count > 0) ? std::min<size_t>(j.host_header[1], (size_t)j.count * FACTOR_POOL_PER_VALUE) : 0;
+	if (used > 0)
+	{
+		CUDA_CHECK(cudaMemcpy(j.host_primes.data(), j.primes, used * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+	}
+	primes.assign(j.host_primes.data(), j.host_primes.data() + used);
 	{
 		std::lock_guard<std::mutex> guard(lock);
 		j.busy = false;
@@ -3129,8 +3857,10 @@ void gpu_product_list(const uint32_t* factors, size_t n, mpz_class& result)
 }
 
 //As many trees as fit in 70 % of the free memory of the GPU (the rest is left for the second stage, the products of the setup,
-//and other programs), from 1 to GPU_MAX_PIPELINE. A tree takes about 20 to 25 bytes per bit of its leaves, measured for 17 to 21 levels.
-int gpu_pipeline(int levels, int max_bits_in_input, bool report)
+//and other programs), less reserve_bytes (for the batch check of the other side's norms, which comes later), from 1 to
+//GPU_MAX_PIPELINE. A tree takes about 20 to 25 bytes per bit of its leaves, measured for 17 to 21 levels, and about 150 bytes per
+//leaf for the checks of the cofactors and the factoring of the relations found.
+int gpu_pipeline(int levels, int max_bits_in_input, bool report, double reserve_bytes)
 {
 	gpu_start();
 	size_t free_bytes = 0, total_bytes = 0;
@@ -3138,8 +3868,9 @@ int gpu_pipeline(int levels, int max_bits_in_input, bool report)
 	{
 		return 2;
 	}
-	const double tree_bytes = 26.0 * (double)((size_t)1 << (levels - 1)) * max_bits_in_input + 64e6;
-	int trees = (int)(0.7 * (double)free_bytes / tree_bytes);
+	const double tree_bytes = (26.0 * max_bits_in_input + 150.0) * (double)((size_t)1 << (levels - 1)) + 64e6;
+	const double usable = 0.7 * (double)free_bytes - reserve_bytes;
+	int trees = (usable > 0) ? (int)(usable / tree_bytes) : 0;
 	if (trees < 1 && report)
 	{
 		printf("GPU: %.1f GB free may not be enough for a tree of about %.2f GB; treelevels in the polynomial file can make it smaller.\n", free_bytes / 1e9, tree_bytes / 1e9);

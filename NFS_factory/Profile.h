@@ -51,7 +51,24 @@ inline unsigned long long profile_add(profile_phase phase, unsigned long long st
 	return profile_add(profile_cycles, phase, start);
 }
 
-void print_profile(unsigned long long total_cycles);
+//The time that the batches of a pipeline spend in each of its stages, added up over the batches, for the batches of the relations
+//(index 0) and those of the batch check of the other side's norms (index 1), with the number of batches: what a batch waits for.
+enum profile_stage {
+	STAGE_WAIT_TREES,  //read, waiting for a thread of the trees
+	STAGE_TREES,       //in the trees
+	STAGE_WAIT_CHECKS, //waiting for a thread of the checks
+	STAGE_COFACTORS,   //waiting for the GPU to check the cofactors (rho), and their checks on the CPU
+	STAGE_FACTORS,     //waiting for the GPU to factor the relations found
+	STAGE_RELATIONS,   //the relations found, on the CPU
+	STAGE_WAIT_ORDER,  //waiting for the batches before it
+	STAGE_ORDER,       //the steps in the order of the batches, and handing the relations to the writer
+	STAGE_NUM
+};
+extern profile_counter profile_stages[2][STAGE_NUM];
+extern std::atomic<long long> profile_stage_batches[2];
+
+//seconds: the time of the run, for the times in ms (0: not printed).
+void print_profile(unsigned long long total_cycles, double seconds = 0);
 
 //The output during a run: a status line, which on a console is rewritten in place (at most twice a second), and otherwise written
 //as a line of its own at most once a minute, and messages, which are printed above the status line. Thread safe.

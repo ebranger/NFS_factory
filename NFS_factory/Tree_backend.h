@@ -66,6 +66,15 @@ public:
 	virtual void Leaf_cofactors() = 0;
 	virtual mpz_class* Leaf_cofactor(int index) = 0;
 
+	//The leaves as the values |F(a, b)| of a polynomial for the pairs of a batch, computed by the backend itself (the GPU) instead
+	//of set through Leaf. Set_leaf_polynomial gives the coefficients (from c_0), after Set_leaf_check, and returns false if the
+	//backend cannot do this (the CPU backends, or a polynomial that is too large). Set_leaf_pairs then gives the count pairs of a
+	//batch before Build_product_tree (the other leaves are 1): false if their values may be too large, and the caller then sets the
+	//leaves as otherwise. The arrays must stay as they are until Build_product_tree has returned. Leaf does not give these values,
+	//and a pair whose value is 0 is LEAF_NOT_SMOOTH in Leaf_classes.
+	virtual bool Set_leaf_polynomial(const std::vector<mpz_class>& coefficients) { return false; }
+	virtual bool Set_leaf_pairs(const long long* a, const long long* b, int count) { return false; }
+
 	//Have Leaf_cofactors check the cofactors too, if the backend can; false if it cannot. After Leaf_cofactors, Leaf_classes then
 	//gives the class of each leaf (or NULL if this batch was not checked), and Leaf_large_primes its two large primes for
 	//LEAF_SMOOTH (0 for none). Leaf_cofactor is then only set for the leaves that are not LEAF_SMOOTH or LEAF_NOT_SMOOTH.
@@ -78,9 +87,12 @@ public:
 	//otherwise those with cofactor 1. Leaf_factors_ready waits for the factors, and returns false if there are none for this
 	//batch. Leaf_factors then gives the factors of leaf i without its large primes, in increasing order, and returns their number,
 	//or -1 if the leaf was not factored. Leaf_factors is thread safe.
-	virtual bool Set_leaf_factoring() { return false; }
+	//max_prime: the values without their large primes have no larger prime factors (0 if not known), which limits the search.
+	//With enabled false, the leaves are not factored after all (when the factors turn out not to be needed). all: nearly all leaves
+	//are smooth (for the memory that their factoring is given at first; it grows as needed).
+	virtual bool Set_leaf_factoring(unsigned long long max_prime = 0, bool enabled = true, bool all = false) { return false; }
 	virtual bool Leaf_factors_ready() { return false; }
-	virtual int Leaf_factors(int index, const unsigned int** factors) { return -1; }
+	virtual int Leaf_factors(int index, const unsigned long long** factors) { return -1; }
 };
 
 //The prime factors of the norms |F(a, b)| of the side that is not batch checked, for the relations found, in the background (on the
@@ -88,7 +100,8 @@ public:
 //gives for its norm i counts[i] prime factors (-1 if it was not factored) from offsets[i] in primes, in increasing order. The jobs
 //are submitted by one thread, and their results taken by one thread, in the same order. At most OTHER_JOBS jobs can be in progress:
 //Submit waits for a result to be taken when they all are, so a thread that does both must take results before that.
-#define OTHER_JOBS 16
+#define OTHER_JOBS 8
+#define OTHER_NOT_SMOOTH -2
 class Other_side_factoring
 {
 public:
@@ -96,7 +109,11 @@ public:
 	virtual int Submit(const long long* a, const long long* b, int count) = 0;
 	//A job of count values instead of norms: of up to four limbs each, at limbs + 4 i, with their sizes in limbs.
 	virtual int Submit_values(const unsigned long long* limbs, const unsigned int* sizes, int count) = 0;
-	virtual void Results(int job, std::vector<int>& counts, std::vector<unsigned int>& offsets, std::vector<unsigned int>& primes) = 0;
+	virtual void Results(int job, std::vector<int>& counts, std::vector<unsigned int>& offsets, std::vector<unsigned long long>& primes) = 0;
+	//The norms and values have no prime factors of 2^bits or more, if bits is more than 32, and otherwise none of 2^32 or more
+	//(whatever bits says: prime factors below 2^32 are found in any case). This limits the search: counts[i] is OTHER_NOT_SMOOTH
+	//for a value in which no such factor was found, which is then not smooth; -1 is still any other failure.
+	virtual void Set_prime_bits(int bits) {}
 };
 
 //The factoring of the other side with polynomial coefficients (from c_0) for a backend, or NULL if it has none (the CPU backends),
@@ -108,9 +125,12 @@ Tree_backend* create_tree_backend(tree_backend_kind kind, int levels, int max_bi
 
 //The default number of batches in progress at once for a backend (see Batch_smooth), each with a tree of this size: 1 on the CPU,
 //and on the GPU as many as fit in its free memory, up to GPU_MAX_PIPELINE (1 if not even two fit). Also no more than fit in half of
-//the free memory of the computer. With report, the choice is printed.
-#define GPU_MAX_PIPELINE 6 //four trees on the GPU at once, with a batch being read and one checked
-int default_pipeline(tree_backend_kind kind, int levels, int max_bits_in_input, bool report = true);
+//the free memory of the computer. With report, the choice is printed. gpu_reserve_bytes: memory of the GPU that is kept free for
+//what is set up later.
+#define GPU_MAX_PIPELINE 12 //a batch being read, the trees of two or three on the GPU, and the others waiting for it to check their cofactors
+#define GPU_GOOD_PIPELINE 4 //a tree level more (see Batch_smooth) only if at least this many batches in progress still fit
+#define GPU_MIN_TREE_LEVELS 17 //the smallest tree on the GPU (if treelevels allows it)
+int default_pipeline(tree_backend_kind kind, int levels, int max_bits_in_input, bool report = true, double gpu_reserve_bytes = 0);
 
 #ifdef NFS_GPU
 //Use GPU number device (from 0) for the gpu backend. Returns false, after saying why, if there is no such CUDA GPU, or if it is

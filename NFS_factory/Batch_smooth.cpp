@@ -16,7 +16,7 @@
 
 using namespace std;
 
-#define MAX_TREE_LEVELS 20 //Default for the maximum number of levels, can be changed with treelevels in the polynomial file.
+#define MAX_TREE_LEVELS 21 //Default for the maximum number of levels, can be changed with treelevels in the polynomial file.
 //max 22 requires ~3GB of RAM. However, for SNFS-220 I seem to get the same speed for lower size, which saves a lot of RAM. 20 is ~7% slower, but saved 2GB of RAM, so worth it.
 //For larger factorizations, consider increasing this a little, but for every +1 the memory requirement for the tree roughly doubles.
 
@@ -27,7 +27,7 @@ using namespace std;
 static void append_prime(string& list, unsigned long long prime);
 
 //Initialize the batch smoothness class
-Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, bool rebuild_other_side, int max_tree_levels, tree_backend_kind backend, bool three_lp_stage, int pipeline)
+Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_input, string filename, Polynomial* input_poly, int batch_checking_side, int print_limit, Polynomial* other_side_poly, bool rebuild_other_side, int max_tree_levels, tree_backend_kind backend, bool three_lp_stage, int pipeline, int tree_threads)
 {
 	long long max_prime_limit = 1LL << lbp;
 
@@ -101,15 +101,28 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	//and 0.29 times (18 levels) about 5 % slower.
 	tree_size = (int)ceil(log2((double)mpz_sizeinbase(prime_product->get_mpz_t(), 2) / max_bits_in_input));
 	const int tree_cap = (max_tree_levels > 0) ? max_tree_levels : MAX_TREE_LEVELS;
-	//On the GPU, up to two levels more if that still leaves the most batches in progress (the memory of the GPU and of the computer
-	//allows it): the root, whose Newton inverse is most of its cost, is then shared by more relations. For SNFS-240 on an RTX 4070
-	//Ti SUPER, with alim 10^8, 20 levels (the root 1.15 times the prime product) were about 4 % faster than 19, with about 1.8 GB
-	//per batch; with alim 2^24.7, the trees took 155, 129 and 130 ms per million relations with 18, 19 and 20 levels (the root 1.2,
-	//2.4 and 4.8 times the prime product), and the smallest tree here has 17.
-	for (int extra = 0; extra < 2; extra++)
+	//Memory of the GPU that the batches of the relations leave free for the batch check of the other side's norms, which is set up
+	//when the first relations are found (see Create_other_stage): a tree of it, and the jobs of other_factoring.
+	const double gpu_reserve = (other_side_poly != NULL && !three_lp_stage) ? OTHER_STAGE_GPU_BYTES : 0;
+	//A tree on the GPU costs about as many kernel launches whatever its size, so it has at least GPU_MIN_TREE_LEVELS levels, also
+	//where the prime product is small against the values (the batch check of the other side's norms against a low bound, of 1024
+	//norms at a time otherwise, took 110 ms per batch).
+	if (backend == TREE_BACKEND_GPU && !three_lp_stage)
 	{
-		if (backend == TREE_BACKEND_GPU && !three_lp_stage && pipeline <= 0 && tree_size + 1 <= tree_cap &&
-			default_pipeline(backend, tree_size + 1, max_bits_in_input, false) >= GPU_MAX_PIPELINE)
+		tree_size = max(tree_size, GPU_MIN_TREE_LEVELS);
+	}
+	//And up to four levels more, while GPU_GOOD_PIPELINE batches in progress still fit in its memory (and in that of the
+	//computer), and the root in the longest transform. The root, whose Newton inverse is most of its cost, is then shared by more
+	//relations, and so are the kernel launches of a tree. A large tree needs few batches in progress: its trees take longer than
+	//the checks after them. On an RTX 5090, for x - 10^53 with a polynomial of degree 4 (alim 25M, a prime product of 13.5 Mbit):
+	//35, 39 and 42 million relations per second with 19, 20 and 21 levels (the root 2.4, 4.8 and 9.6 times the prime product),
+	//with 12, 12 and 6 batches in progress, and as fast with 4; for x^7 - 30 on the rational side (36 Mbit): 45, 49 and 47 with
+	//20, 21 and 22 levels.
+	for (int extra = 0; extra < 4; extra++)
+	{
+		const bool root_fits = ((unsigned long long)max_bits_in_input << tree_size) + 4096 <= ((unsigned long long)NTT_MAX_COEFFICIENT_BITS << NTT_MAX_LOG_LENGTH);
+		if (backend == TREE_BACKEND_GPU && !three_lp_stage && pipeline <= 0 && tree_size + 1 <= tree_cap && root_fits &&
+			default_pipeline(backend, tree_size + 1, max_bits_in_input, false, gpu_reserve) >= GPU_GOOD_PIPELINE)
 		{
 			tree_size++;
 		}
@@ -134,7 +147,7 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	num_relations_per_batch = max_entries_before_check;
 	if (pipeline <= 0)
 	{
-		pipeline = three_lp_stage ? 1 : default_pipeline(backend, tree_size, max_bits_in_input);
+		pipeline = three_lp_stage ? 1 : default_pipeline(backend, tree_size, max_bits_in_input, true, gpu_reserve);
 	}
 	pipelined = pipeline > 1 && !three_lp_stage;
 	const int num_slots = pipelined ? pipeline : 1;
@@ -168,7 +181,20 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	}
 	for (Batch_slot* s : slots)
 	{
-		s->tree->Set_leaf_factoring();
+		//Without their large primes, the values have no prime factors above the primes of the batch check.
+		s->tree->Set_leaf_factoring((unsigned long long)max_batch_prime);
+	}
+	//The trees compute the polynomial values themselves, if they can (the GPU, when it also checks the cofactors).
+	{
+		vector<mpz_class> coefficients;
+		for (int i = 0; i <= poly->get_degree(); i++)
+		{
+			coefficients.push_back(poly->get_coefficient((uint8)i));
+		}
+		for (Batch_slot* s : slots)
+		{
+			s->pairs_possible = !three_lp_stage && s->tree->Set_leaf_polynomial(coefficients);
+		}
 	}
 	//The other side's norms on the GPU, if the backend can.
 	other_factoring = NULL;
@@ -186,6 +212,7 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 	writer_busy = false;
 	writer_stopping = false;
 	flush_requested = false;
+	results_arrived = false;
 	output_size = -1;
 	other_stage = NULL;
 	other_stage_tried = other_stage_finished = false;
@@ -194,11 +221,18 @@ Batch_smooth::Batch_smooth(long long fblim, int lbp, int mfb, int max_bits_in_in
 
 	if (pipelined)
 	{
-		//The slots that are not being filled or checked can be in the trees at once (up to 4).
-		const int tree_workers = min(4, max(1, num_slots - 2));
+		//The threads of the trees: few, since the trees of several batches at once take turns on the GPU (two were the fastest on an
+		//RTX 5090, for 6 to 12 batches in progress). The other batches in progress are with the threads of the checks, which mostly
+		//wait for the GPU to split the cofactors and to factor the relations found.
+		const int tree_workers = max(1, min((tree_threads > 0) ? tree_threads : DEFAULT_TREE_THREADS, num_slots - 1));
 		for (int i = 0; i < tree_workers; i++)
 		{
 			workers.emplace_back(&Batch_smooth::Tree_worker, this);
+		}
+		const int collect_workers = max(1, num_slots - 2);
+		for (int i = 0; i < collect_workers; i++)
+		{
+			workers.emplace_back(&Batch_smooth::Collect_worker, this);
 		}
 		workers.emplace_back(&Batch_smooth::Check_worker, this);
 		writer_thread = thread(&Batch_smooth::Writer_worker, this);
@@ -293,6 +327,7 @@ Batch_slot* Batch_smooth::New_slot(int tree_levels, int max_bits_in_input, tree_
 	s->a_vals = new long long[n];
 	s->b_vals = new long long[n];
 	s->is_smooth = new bool[n];
+	s->has_list = new unsigned char[n];
 	s->lp1 = new unsigned long long[n];
 	s->lp2 = new unsigned long long[n];
 	//The saved factor lists, in one block.
@@ -306,8 +341,9 @@ Batch_slot* Batch_smooth::New_slot(int tree_levels, int max_bits_in_input, tree_
 		s->lp1[i] = 0;
 		s->lp2[i] = 0;
 		s->is_smooth[i] = false;
+		s->has_list[i] = LIST_NONE;
 	}
-	s->binary_lists = false;
+	s->pairs_possible = s->pairs = false;
 	s->entries = 0;
 	s->sequence = 0;
 	s->position[0] = s->position[1] = 0;
@@ -323,6 +359,7 @@ void Batch_smooth::Delete_slot(Batch_slot* s)
 	delete[] s->a_vals;
 	delete[] s->b_vals;
 	delete[] s->is_smooth;
+	delete[] s->has_list;
 	delete[] s->lp1;
 	delete[] s->lp2;
 	delete s;
@@ -342,7 +379,7 @@ bool Batch_smooth::Add_number(long long a_val, long long b_val, const char* rela
 	s.b_vals[s.entries] = b_val;
 	s.is_smooth[s.entries] = true; //Until the batch check shows otherwise.
 	strcpy(s.list_of_factors[s.entries], relation_factor_list);
-	s.binary_lists = false;
+	s.has_list[s.entries] = LIST_TEXT;
 
 	s.entries++;
 
@@ -375,7 +412,7 @@ bool Batch_smooth::Add_number_binary(long long a_val, long long b_val, const uns
 	{
 		memcpy(saved + 1, primes, num_primes * sizeof(unsigned int));
 	}
-	s.binary_lists = true;
+	s.has_list[s.entries] = LIST_BINARY;
 
 	s.entries++;
 
@@ -385,6 +422,26 @@ bool Batch_smooth::Add_number_binary(long long a_val, long long b_val, const uns
 		Submit();
 	}
 	return true;
+}
+
+int Batch_smooth::Fill_room(long long*& a, long long*& b)
+{
+	Batch_slot& s = *filling;
+	a = s.a_vals + s.entries;
+	b = s.b_vals + s.entries;
+	return max_entries_before_check - s.entries;
+}
+
+void Batch_smooth::Fill_done(int count)
+{
+	Batch_slot& s = *filling;
+	memset(s.is_smooth + s.entries, 1, (size_t)count); //Until the batch check shows otherwise.
+	memset(s.has_list + s.entries, LIST_NONE, (size_t)count);
+	s.entries += count;
+	if (s.entries == max_entries_before_check)
+	{
+		Submit();
+	}
 }
 
 //Add one 3LP candidate to the second stage: a relation with the factor list of the other side, and the cofactor of the batch checked side
@@ -399,6 +456,16 @@ bool Batch_smooth::Add_candidate(long long a_val, long long b_val, const unsigne
 	//The cofactor is checked instead of the polynomial value.
 	mpz_set(filling->tree->Leaf(filling->entries)->get_mpz_t(), cofactor);
 	return Add_number_binary(a_val, b_val, primes, num_primes);
+}
+
+//"format: keys": only a,b of the relations found is written, so the trees need not factor them.
+void Batch_smooth::Set_keys_only()
+{
+	keys_only = true;
+	for (Batch_slot* s : slots)
+	{
+		s->tree->Set_leaf_factoring(0, false, false);
+	}
 }
 
 bool Batch_smooth::Set_three_lp_handling(Batch_smooth* second_stage, string candidate_filename)
@@ -440,6 +507,17 @@ void Batch_smooth::Send_candidates(Batch_slot& s)
 		int index = s.candidate_index[n];
 		Get_saved_primes(s, index, primes);
 
+		//A saved prime of 2^32 or more (the other side has a large prime bound of more than 32 bits) does not fit in the candidate
+		//format: the candidate then goes on without its list, which is rebuilt from the norm when it is checked, as for the
+		//relations of .ab files.
+		for (size_t j = 0; j < primes.size(); j++)
+		{
+			if (primes[j] > UINT_MAX && other_poly != NULL)
+			{
+				primes.clear();
+				break;
+			}
+		}
 		bool fits = primes.size() <= MAX_SAVED_PRIMES && a_vals[index] >= INT_MIN && a_vals[index] <= INT_MAX && b_vals[index] <= UINT_MAX;
 		for (size_t j = 0; j < primes.size() && fits; j++)
 		{
@@ -530,7 +608,12 @@ void Batch_smooth::Finish()
 //The saved factor list of the other side of a relation, as text.
 void Batch_smooth::Get_saved_list(Batch_slot& s, int index, string& list)
 {
-	if (!s.binary_lists)
+	if (s.has_list[index] == LIST_NONE)
+	{
+		list.clear();
+		return;
+	}
+	if (s.has_list[index] == LIST_TEXT)
 	{
 		list = s.list_of_factors[index];
 		return;
@@ -548,15 +631,19 @@ void Batch_smooth::Get_saved_list(Batch_slot& s, int index, string& list)
 //in a text file is printed as it is: such files often hold the primes of one side only.
 bool Batch_smooth::Saved_list_missing(Batch_slot& s, int index)
 {
-	return s.binary_lists && reinterpret_cast<const unsigned int*>(s.list_of_factors[index])[0] == 0;
+	return s.has_list[index] == LIST_NONE || (s.has_list[index] == LIST_BINARY && reinterpret_cast<const unsigned int*>(s.list_of_factors[index])[0] == 0);
 }
 
 //The saved factor list of the other side of a relation, as numbers.
 void Batch_smooth::Get_saved_primes(Batch_slot& s, int index, vector<unsigned long long>& primes)
 {
 	primes.clear();
+	if (s.has_list[index] == LIST_NONE)
+	{
+		return;
+	}
 
-	if (s.binary_lists)
+	if (s.has_list[index] == LIST_BINARY)
 	{
 		const unsigned int* saved = reinterpret_cast<const unsigned int*>(s.list_of_factors[index]);
 		for (unsigned int i = 1; i <= saved[0]; i++)
@@ -611,6 +698,26 @@ Batch_smooth::cofactor_result Batch_smooth::Classify_cofactor(Batch_slot& s, mpz
 				return Check_two_primes(s, factor, n / factor, index);
 			}
 		}
+		else if (cofactor_bits <= 128 && mpz_odd_p(number.get_mpz_t()))
+		{
+			//Of 64 bits or more (large primes of 32 bits or more): Pollard rho with two limbs. Both factors must be large primes,
+			//so of one limb.
+			unsigned long long factor_lo, factor_hi;
+			if (split_composite128(mpz_getlimbn(number.get_mpz_t(), 0), (mpz_size(number.get_mpz_t()) > 1) ? mpz_getlimbn(number.get_mpz_t(), 1) : 0,
+				&factor_lo, &factor_hi))
+			{
+				mpz_class factor, other;
+				mpz_set_ui(factor.get_mpz_t(), (mpir_ui)factor_hi);
+				factor <<= 64;
+				factor += mpz_class((mpir_ui)factor_lo);
+				other = number / factor;
+				if (mpz_size(factor.get_mpz_t()) > 1 || mpz_size(other.get_mpz_t()) > 1)
+				{
+					return COFACTOR_NOT_SMOOTH;
+				}
+				return Check_two_primes(s, mpz_get_ui(factor.get_mpz_t()), mpz_get_ui(other.get_mpz_t()), index);
+			}
+		}
 
 		//either rho failed or the cofactor is too big for 64-bit rho, so do qs.
 		return COFACTOR_TINYQS;
@@ -629,7 +736,8 @@ Batch_smooth::cofactor_result Batch_smooth::Classify_cofactor(Batch_slot& s, mpz
 	}
 
 	//should be one large prime by now. Make sure it is actually a large prime as well.
-	if (number > (int64)max_batch_prime && is_probable_prime(number.get_mpz_t()))
+	//(Exactly: with a large prime bound of more than 32 bits, a pseudoprime to base 2 would be written as a prime.)
+	if (number > (int64)max_batch_prime && number.get_mpz_t()->_mp_size == 1 && is_prime64(mpz_get_ui(number.get_mpz_t())))
 	{
 		s.lp1[index] = mpz_get_ui(number.get_mpz_t());
 		s.lp2[index] = 0;
@@ -640,8 +748,8 @@ Batch_smooth::cofactor_result Batch_smooth::Classify_cofactor(Batch_slot& s, mpz
 		//and the small prime was not found by the batch code due to the high power.
 		//Since this seems to happend very rarely, for now just do a basic check if the sizes of the two factors makes the relation valid,
 		//and let the relation factoring code handle it later, without any lp hints from here.
-		unsigned int factors[MAX_FACTORS_IN_RELATION];
-		int count = factor_general(factors, number.get_mpz_t(), MAX_FACTORS_IN_RELATION);
+		unsigned long long factors[MAX_FACTORS_IN_RELATION];
+		int count = factor_general_wide(factors, number.get_mpz_t(), MAX_FACTORS_IN_RELATION, max(32, one_lp_bit_limit));
 
 		if (count < 0)
 		{
@@ -650,7 +758,7 @@ Batch_smooth::cofactor_result Batch_smooth::Classify_cofactor(Batch_slot& s, mpz
 
 		for (int i = 0; i < count; i++)
 		{
-			if ((unsigned long long)factors[i] >> one_lp_bit_limit != 0)
+			if (one_lp_bit_limit < 64 && factors[i] >> one_lp_bit_limit != 0)
 			{
 				//factor is 2^lbp or larger.
 				return COFACTOR_NOT_SMOOTH;
@@ -673,7 +781,7 @@ Batch_smooth::cofactor_result Batch_smooth::Check_two_primes(Batch_slot& s, unsi
 	{
 		return COFACTOR_NOT_SMOOTH;
 	}
-	if (!is_probable_prime(f1.get_mpz_t()) || !is_probable_prime(f2.get_mpz_t()))
+	if (!is_prime64(p) || !is_prime64(q))
 	{
 		return COFACTOR_NOT_SMOOTH;
 	}
@@ -794,6 +902,7 @@ void Batch_smooth::Submit()
 		s->sequence = submitted++;
 		Run_trees(*s);
 		Run_checks(*s);
+		Order_checks(*s);
 		checked++;
 		const unsigned long long now = three_lp_stage ? profile_add(PROF_3LP, t) : profile_now();
 		reader_blocked += now - t;
@@ -802,6 +911,7 @@ void Batch_smooth::Submit()
 
 	unique_lock<mutex> guard(lock);
 	s->sequence = submitted++;
+	s->stamp = profile_now();
 	tree_queue.push_back(s);
 	changed.notify_all();
 	changed.wait(guard, [this] { return !free_slots.empty(); });
@@ -817,7 +927,9 @@ void Batch_smooth::Run_trees(Batch_slot& s)
 {
 	unsigned long long t = profile_now();
 
-	for (int index = 0; index < s.entries && !three_lp_stage; index++)
+	//The values of the pairs, computed by the tree itself if it can (on the GPU), and otherwise here.
+	s.pairs = s.pairs_possible && !three_lp_stage && s.tree->Set_leaf_pairs(s.a_vals, s.b_vals, s.entries);
+	for (int index = 0; index < s.entries && !three_lp_stage && !s.pairs; index++)
 	{
 		mpz_class* value = s.tree->Leaf(index);
 
@@ -848,7 +960,7 @@ void Batch_smooth::Run_trees(Batch_slot& s)
 	t = profile_add(profile, PROF_POLY_EVAL, t);
 
 	//Leaves without a relation (in a batch that is not full) must be 1.
-	for (int index = s.entries; index < num_relations_per_batch; index++)
+	for (int index = s.entries; index < num_relations_per_batch && !s.pairs; index++)
 	{
 		*s.tree->Leaf(index) = 1;
 	}
@@ -866,9 +978,11 @@ void Batch_smooth::Run_trees(Batch_slot& s)
 	profile_add(profile, PROF_LEAVES, t);
 }
 
-//The checks of the cofactors of a batch, and its output: the cofactor N / gcd(N, (P mod N)^2) of each relation value N is 1 if N
-//is smooth (without cofactorization), or is checked for large primes. The cofactors are checked in parallel (with the threads
-//option), and the steps that are not thread safe afterwards, in leaf order. The batches are done one at a time, in their order.
+//The checks of the cofactors of a batch: the cofactor N / gcd(N, (P mod N)^2) of each relation value N is 1 if N is smooth
+//(without cofactorization), or is checked for large primes. This is the part that does not depend on the batches before it, and is
+//done for several batches at once (in the threads of the tree stage, right after their trees): the classes of the leaves, the
+//leaves that are not ruled out (items, in leaf order), and for those found smooth, the factors and the text of the relation. The
+//steps that must be done in the order of the batches follow in Order_checks.
 void Batch_smooth::Run_checks(Batch_slot& s)
 {
 	unsigned long long t = profile_now();
@@ -878,25 +992,35 @@ void Batch_smooth::Run_checks(Batch_slot& s)
 	}
 
 	s.leaf_result.resize(num_relations_per_batch);
+	s.items.clear();
 	const unsigned char* classes = s.tree->Leaf_classes();
 	if (classes != NULL)
 	{
 		//Checked by the tree: the large primes of the smooth ones, and the rest that the CPU checks.
 		const unsigned long long* large_primes = s.tree->Leaf_large_primes();
-		parallel_for(num_relations_per_batch, 4096, [&](int index)
+		for (int index = 0; index < num_relations_per_batch; index++)
 		{
-			if (classes[index] == LEAF_CHECK_ON_CPU)
+			unsigned char c = classes[index];
+			if (c == LEAF_NOT_SMOOTH)
 			{
-				s.leaf_result[index] = (unsigned char)Classify_cofactor(s, *s.tree->Leaf_cofactor(index), index);
-				return;
+				continue;
 			}
-			s.leaf_result[index] = classes[index];
-			if (classes[index] == LEAF_SMOOTH)
+			if (c == LEAF_CHECK_ON_CPU)
+			{
+				c = (unsigned char)Classify_cofactor(s, *s.tree->Leaf_cofactor(index), index);
+				if (c == COFACTOR_NOT_SMOOTH)
+				{
+					continue;
+				}
+			}
+			else if (c == LEAF_SMOOTH)
 			{
 				s.lp1[index] = large_primes[2 * index];
 				s.lp2[index] = large_primes[2 * index + 1];
 			}
-		});
+			s.leaf_result[index] = c;
+			s.items.push_back(index);
+		}
 	}
 	else
 	{
@@ -914,10 +1038,113 @@ void Batch_smooth::Run_checks(Batch_slot& s)
 				s.leaf_result[index] = (unsigned char)((Q > 1) ? COFACTOR_NOT_SMOOTH : COFACTOR_SMOOTH);
 			}
 		});
+		for (int index = 0; index < num_relations_per_batch; index++)
+		{
+			if (s.leaf_result[index] != COFACTOR_NOT_SMOOTH)
+			{
+				s.items.push_back(index);
+			}
+		}
 	}
-
-	for (int index = 0; index < num_relations_per_batch; index++)
+	Stage(s, STAGE_COFACTORS);
+	//Leaves without a relation (in a batch that is not full), and relations whose value is 0, are not smooth.
+	size_t kept = 0;
+	for (size_t k = 0; k < s.items.size(); k++)
 	{
+		const int index = s.items[k];
+		if (index < s.entries && s.is_smooth[index])
+		{
+			s.items[kept++] = index;
+		}
+	}
+	s.items.resize(kept);
+	t = profile_add(profile, PROF_COFACTOR, t);
+
+	//The relations found so far: the cofactors that still need tinyqs are split in Order_checks, and their relations made there.
+	const size_t count = s.items.size();
+	s.item_result.assign(count, RELATION_WRITTEN);
+	s.item_waiting.assign(count, 0);
+	if (s.item_text.size() < count)
+	{
+		s.item_text.resize(count);
+	}
+	if (result_sink && s.item_found.size() < count)
+	{
+		s.item_found.resize(count);
+	}
+	s.tree_factors = s.tree->Leaf_factors_ready();
+	Stage(s, STAGE_FACTORS);
+	auto make = [&](int k)
+	{
+		if (s.leaf_result[s.items[k]] == COFACTOR_SMOOTH)
+		{
+			Make_item(s, k);
+		}
+	};
+	if (classes != NULL && count < 16384)
+	{
+		//Few, and several batches are here at once: in this thread.
+		for (int k = 0; k < (int)count; k++)
+		{
+			make(k);
+		}
+	}
+	else
+	{
+		parallel_for((int)count, 16, make);
+	}
+	profile_add(profile, PROF_FACTOR, t);
+	Stage(s, STAGE_RELATIONS);
+}
+
+//The time of a batch of a pipeline since its last stage, for the profile.
+void Batch_smooth::Stage(Batch_slot& s, profile_stage stage)
+{
+	if (pipelined)
+	{
+		const unsigned long long now = profile_now();
+		profile_stages[result_sink ? 1 : 0][stage] += now - s.stamp;
+		s.stamp = now;
+	}
+}
+
+//The relation of item k of a batch, which was found smooth: its text, with the checked side factored (see Format_relation), or
+//for an other_stage its prime factors. Thread safe.
+void Batch_smooth::Make_item(Batch_slot& s, int k)
+{
+	const int index = s.items[k];
+	if (result_sink)
+	{
+		unsigned long long large[MAX_COFACTOR_PRIMES];
+		unsigned long long factors[MAX_FACTORS_IN_RELATION];
+		int num_large = 0, num_factors = 0;
+		vector<unsigned long long>& found = s.item_found[k];
+		found.clear();
+		if (Factor_checked_side(s, index, large, num_large, factors, num_factors) == RELATION_WRITTEN)
+		{
+			found.assign(large, large + num_large);
+			found.insert(found.end(), factors, factors + num_factors);
+			sort(found.begin(), found.end());
+		}
+		else
+		{
+			s.item_result[k] = RELATION_FACTORING_FAILED;
+		}
+		return;
+	}
+	bool waiting = false;
+	s.item_result[k] = (unsigned char)Format_relation(s, index, s.item_text[k], waiting);
+	s.item_waiting[k] = waiting;
+}
+
+//The steps of the checks of a batch that are done in the order of the batches, one batch at a time: the cofactors that tinyqs
+//splits (it keeps state between calls), the 3LP candidates, which go on to the second stage, and the output.
+void Batch_smooth::Order_checks(Batch_slot& s)
+{
+	unsigned long long t = profile_now();
+	for (size_t k = 0; k < s.items.size(); k++)
+	{
+		const int index = s.items[k];
 		switch (s.leaf_result[index])
 		{
 		case COFACTOR_SMOOTH:
@@ -932,7 +1159,12 @@ void Batch_smooth::Run_checks(Batch_slot& s)
 			s.is_smooth[index] = false;
 			break;
 		case COFACTOR_TINYQS:
-			if (!Split_with_tinyqs(s, *s.tree->Leaf_cofactor(index), index))
+			if (Split_with_tinyqs(s, *s.tree->Leaf_cofactor(index), index))
+			{
+				s.leaf_result[index] = COFACTOR_SMOOTH;
+				Make_item(s, (int)k);
+			}
+			else
 			{
 				s.is_smooth[index] = false;
 			}
@@ -965,7 +1197,34 @@ void Batch_smooth::Tree_worker()
 		guard.unlock();
 		profile_add(PROF_WAIT_TREES, t);
 
+		Stage(*s, STAGE_WAIT_TREES);
 		Run_trees(*s);
+		Stage(*s, STAGE_TREES);
+
+		guard.lock();
+		collect_queue.push_back(s);
+		changed.notify_all();
+	}
+}
+
+//A thread of the checks that do not depend on the order of the batches (Run_checks), which wait for the GPU to check the
+//cofactors and to factor the relations found: several batches are here at once, so that the trees go on meanwhile.
+void Batch_smooth::Collect_worker()
+{
+	unique_lock<mutex> guard(lock);
+	for (;;)
+	{
+		changed.wait(guard, [this] { return stopping || !collect_queue.empty(); });
+		if (collect_queue.empty())
+		{
+			return;
+		}
+		Batch_slot* s = collect_queue.front();
+		collect_queue.pop_front();
+		guard.unlock();
+
+		Stage(*s, STAGE_WAIT_CHECKS);
+		Run_checks(*s);
 
 		guard.lock();
 		trees_done.push_back(s);
@@ -1001,7 +1260,10 @@ void Batch_smooth::Check_worker()
 		guard.unlock();
 		profile_add(PROF_WAIT_CHECKS, t);
 
-		Run_checks(*s);
+		Stage(*s, STAGE_WAIT_ORDER);
+		Order_checks(*s);
+		Stage(*s, STAGE_ORDER);
+		profile_stage_batches[result_sink ? 1 : 0]++;
 
 		guard.lock();
 		checked++;
@@ -1028,7 +1290,7 @@ static void append_prime(string& list, unsigned long long prime)
 //small ones) are added. factors: all prime factors of the norm, in increasing order, if they were found (on the GPU), and otherwise
 //(num_factors -1) the norm is factored here. Returns false if a saved prime does not divide the norm, or if the norm could not be
 //fully factored. Thread safe.
-bool Batch_smooth::Complete_other_side(long long a, long long b, vector<unsigned long long>& primes, const unsigned int* factors, int num_factors, string& list)
+bool Batch_smooth::Complete_other_side(long long a, long long b, vector<unsigned long long>& primes, const unsigned long long* factors, int num_factors, string& list)
 {
 	if (num_factors >= 0)
 	{
@@ -1065,8 +1327,8 @@ bool Batch_smooth::Complete_other_side(long long a, long long b, vector<unsigned
 		//Factor whatever is left, which also finds any higher multiplicities of the listed primes.
 		if (norm > 1)
 		{
-			unsigned int other_side_factor_list[MAX_FACTORS_IN_RELATION];
-			int num_other_factors = factor_general(other_side_factor_list, norm.get_mpz_t(), MAX_FACTORS_IN_RELATION);
+			unsigned long long other_side_factor_list[MAX_FACTORS_IN_RELATION];
+			int num_other_factors = factor_general_wide(other_side_factor_list, norm.get_mpz_t(), MAX_FACTORS_IN_RELATION, Other_prime_bits());
 
 			if (num_other_factors < 0)
 			{
@@ -1122,8 +1384,8 @@ Batch_smooth::relation_status Batch_smooth::Format_relation(Batch_slot& s, int i
 {
 	const long long* a_vals = s.a_vals;
 	const long long* b_vals = s.b_vals;
-	unsigned int large[MAX_COFACTOR_PRIMES];
-	unsigned int factors[MAX_FACTORS_IN_RELATION];
+	unsigned long long large[MAX_COFACTOR_PRIMES];
+	unsigned long long factors[MAX_FACTORS_IN_RELATION];
 	int num_factors = 0;
 	int num_large = 0;
 	string checked_side_list; //factors of the relation value that was batch checked.
@@ -1173,7 +1435,7 @@ Batch_smooth::relation_status Batch_smooth::Format_relation(Batch_slot& s, int i
 	//The factor list for the batch checked side: large primes first, then the other factors.
 	for (int j = 0; j < num_large; j++)
 	{
-		if (large[j] >= (unsigned int)min_saved_prime_limit)
+		if (large[j] >= (unsigned long long)min_saved_prime_limit)
 		{
 			append_prime(checked_side_list, large[j]);
 		}
@@ -1181,7 +1443,7 @@ Batch_smooth::relation_status Batch_smooth::Format_relation(Batch_slot& s, int i
 
 	for (int j = 0; j < num_factors; j++)
 	{
-		if (factors[j] >= (unsigned int)min_saved_prime_limit)
+		if (factors[j] >= (unsigned long long)min_saved_prime_limit)
 		{
 			append_prime(checked_side_list, factors[j]);
 		}
@@ -1200,28 +1462,46 @@ Batch_smooth::relation_status Batch_smooth::Format_relation(Batch_slot& s, int i
 
 //The prime factors of the value of the batch checked side of a relation found smooth: num_large large primes, and the num_factors
 //factors of the rest. Returns RELATION_FACTORING_FAILED if they could not be found. Thread safe.
-Batch_smooth::relation_status Batch_smooth::Factor_checked_side(Batch_slot& s, int index, unsigned int* large, int& num_large, unsigned int* factors, int& num_factors)
+Batch_smooth::relation_status Batch_smooth::Factor_checked_side(Batch_slot& s, int index, unsigned long long* large, int& num_large, unsigned long long* factors, int& num_factors)
 {
-	mpz_class value = *s.tree->Leaf(index);
 	const long long* a_vals = s.a_vals;
 	const long long* b_vals = s.b_vals;
-	mpz_class temp;
 	num_factors = 0;
 	num_large = 0;
 
-	//negative values are handled by msieve, ignore here.
-	if (value < 0)
+	if (!three_lp_stage)
 	{
-		value = -value;
+		//The large primes, which are printed first, and the factors of the rest, which the tree may have found already (as
+		//factor_general would): the value is then not needed.
+		if (s.lp1[index] > 1)
+		{
+			large[num_large++] = s.lp1[index];
+		}
+		if (s.lp2[index] > 1)
+		{
+			large[num_large++] = s.lp2[index];
+		}
+		const unsigned long long* tree_factors = NULL;
+		const int num_tree_factors = s.tree_factors ? s.tree->Leaf_factors(index, &tree_factors) : -1;
+		if (num_tree_factors >= 0)
+		{
+			num_factors = num_tree_factors;
+			copy(tree_factors, tree_factors + num_factors, factors);
+			return RELATION_WRITTEN;
+		}
 	}
 
-	//factor the relation. First, divide out the large primes, which are printed first.
+	//negative values are handled by msieve, ignore here.
+	mpz_class value, temp;
+	Leaf_value(s, index, value);
+
+	//factor the relation. First, divide out the large primes.
 	if (three_lp_stage)
 	{
 		//The value is the cofactor from the first stage, and all its primes are below 2^lbp. Those are the large primes,
 		//and the rest of the polynomial value is factored as for other relations. The tree may have factored the cofactor already
 		//(as factor_smooth would, which takes values of up to two limbs).
-		const unsigned int* tree_large = NULL;
+		const unsigned long long* tree_large = NULL;
 		num_large = (s.tree_factors && mpz_size(value.get_mpz_t()) <= 2) ? s.tree->Leaf_factors(index, &tree_large) : -1;
 		if (num_large >= 0 && num_large <= MAX_COFACTOR_PRIMES)
 		{
@@ -1229,7 +1509,7 @@ Batch_smooth::relation_status Batch_smooth::Factor_checked_side(Batch_slot& s, i
 		}
 		else
 		{
-			num_large = factor_smooth(large, value.get_mpz_t(), MAX_COFACTOR_PRIMES);
+			num_large = factor_smooth_wide(large, value.get_mpz_t(), MAX_COFACTOR_PRIMES, 32);
 		}
 		poly->evaluate_polynomial_homogenous(&temp, (int64)a_vals[index], (int64)b_vals[index]);
 		mpz_abs(temp.get_mpz_t(), temp.get_mpz_t());
@@ -1247,33 +1527,46 @@ Batch_smooth::relation_status Batch_smooth::Factor_checked_side(Batch_slot& s, i
 	{
 		if (s.lp1[index] > 1)
 		{
-			large[num_large++] = (unsigned int)s.lp1[index];
 			mpz_divexact_ui(value.get_mpz_t(), value.get_mpz_t(), s.lp1[index]);
 		}
-
 		if (s.lp2[index] > 1)
 		{
-			large[num_large++] = (unsigned int)s.lp2[index];
 			mpz_divexact_ui(value.get_mpz_t(), value.get_mpz_t(), s.lp2[index]);
 		}
 	}
 
-	//The factors of the rest, which the tree may have found already (as factor_general would). Otherwise Pollard rho: since the
-	//rest is smooth, it is a decent choice.
-	const unsigned int* tree_factors = NULL;
-	const int num_tree_factors = (s.tree_factors && !three_lp_stage && num_factors == 0) ? s.tree->Leaf_factors(index, &tree_factors) : -1;
-	if (num_tree_factors >= 0)
+	//The factors of the rest, by Pollard rho: since the rest is smooth, it is a decent choice. The rest still has its large prime
+	//if the cofactor was accepted without one (a large prime times a small prime to a high power, see Classify_cofactor).
+	if (num_factors == 0 && value > 1)
 	{
-		num_factors = num_tree_factors;
-		copy(tree_factors, tree_factors + num_factors, factors);
-	}
-	else if (num_factors == 0 && value > 1)
-	{
-		num_factors = factor_general(factors, value.get_mpz_t(), MAX_FACTORS_IN_RELATION);
+		num_factors = factor_general_wide(factors, value.get_mpz_t(), MAX_FACTORS_IN_RELATION, three_lp_stage ? 32 : max(32, one_lp_bit_limit));
 	}
 
 	//Typically: one factor is too big for an uint32. An incomplete relation is useless, so skip it.
 	return (num_factors < 0) ? RELATION_FACTORING_FAILED : RELATION_WRITTEN;
+}
+
+//The value of a relation of a batch that was checked: the leaf of the tree, or if the tree computed the leaves itself from the
+//pairs, the polynomial value. Thread safe.
+void Batch_smooth::Leaf_value(Batch_slot& s, int index, mpz_class& value)
+{
+	if (!s.pairs)
+	{
+		value = *s.tree->Leaf(index);
+	}
+	else if (!using_snfs_deg4_binomial)
+	{
+		poly->evaluate_polynomial_homogenous(&value, (int64)s.a_vals[index], (int64)s.b_vals[index]);
+	}
+	else if (!Binomial_value_native(value.get_mpz_t(), s.a_vals[index], s.b_vals[index]))
+	{
+		mpz_class temp;
+		poly->evaluate_binomial_polynomial_homogeneous_SNFS_deg4(&value, s.a_vals[index], s.b_vals[index], &temp);
+	}
+	if (value < 0)
+	{
+		value = -value;
+	}
 }
 
 //The line of a relation: a,b:rational factors:algebraic factors
@@ -1290,9 +1583,9 @@ string Batch_smooth::Relation_line(long long a, long long b, const string& check
 	return line;
 }
 
-//The lines of the relations of the batch that were found smooth, factored by the threads (with the threads option), in their order
-//in the batch, for the writer. The norms of their other side that are factored in the background are submitted here. The slot is then
-//cleared for the next batch.
+//The relations of the batch that were found smooth (the items that are still smooth, whose relations Make_item made), in their
+//order in the batch, for the writer. The norms of their other side that are factored in the background are submitted there.
+//The slot is then cleared for the next batch.
 void Batch_smooth::Output_solutions(Batch_slot& s)
 {
 	unsigned long long t = profile_now();
@@ -1300,33 +1593,28 @@ void Batch_smooth::Output_solutions(Batch_slot& s)
 	if (result_sink)
 	{
 		//An other_stage: the factors of each relation, in the order they were added, for the writer that made it.
-		s.tree_factors = s.tree->Leaf_factors_ready();
-		vector<vector<unsigned long long>> found(s.entries);
-		vector<unsigned char> factored(s.entries, 0);
-		parallel_for(s.entries, 16, [&](int index)
-		{
-			unsigned int large[MAX_COFACTOR_PRIMES];
-			unsigned int factors[MAX_FACTORS_IN_RELATION];
-			int num_large = 0, num_factors = 0;
-			if (s.is_smooth[index] && Factor_checked_side(s, index, large, num_large, factors, num_factors) == RELATION_WRITTEN)
-			{
-				found[index].assign(large, large + num_large);
-				found[index].insert(found[index].end(), factors, factors + num_factors);
-				sort(found[index].begin(), found[index].end());
-				factored[index] = 1;
-			}
-		});
-		vector<int> candidate(s.entries, -1);
-		for (size_t n = 0; n < s.candidate_index.size(); n++)
-		{
-			candidate[s.candidate_index[n]] = (int)n;
-		}
+		vector<unsigned long long> none;
+		mpz_class value;
+		size_t k = 0, candidate = 0;
 		for (int index = 0; index < s.entries; index++)
 		{
-			const bool is_candidate = candidate[index] >= 0;
-			result_sink(sink_next + index, s.a_vals[index], s.b_vals[index], factored[index] != 0, found[index],
-				is_candidate ? &s.candidate_cofactor[candidate[index]] : NULL, is_candidate ? s.tree->Leaf(index) : NULL);
-			s.is_smooth[index] = false;
+			while (k < s.items.size() && s.items[k] < index)
+			{
+				k++;
+			}
+			const bool item = k < s.items.size() && s.items[k] == index;
+			const bool factored = item && s.is_smooth[index] && s.item_result[k] == RELATION_WRITTEN;
+			const bool is_candidate = candidate < s.candidate_index.size() && s.candidate_index[candidate] == index;
+			if (is_candidate)
+			{
+				Leaf_value(s, index, value);
+			}
+			result_sink(sink_next + index, s.a_vals[index], s.b_vals[index], factored, factored ? s.item_found[k] : none,
+				is_candidate ? &s.candidate_cofactor[candidate] : NULL, is_candidate ? &value : NULL);
+			candidate += is_candidate;
+		}
+		for (int index : s.items)
+		{
 			s.lp1[index] = 0;
 			s.lp2[index] = 0;
 		}
@@ -1334,45 +1622,35 @@ void Batch_smooth::Output_solutions(Batch_slot& s)
 		sink_next += s.entries;
 		s.entries = 0;
 		profile_add(profile, PROF_FACTOR, t);
+		if (sink_batch_done)
+		{
+			sink_batch_done();
+		}
 		return;
 	}
 
-	s.relation_texts.resize(num_relations_per_batch);
-	s.relation_result.resize(num_relations_per_batch);
-	s.relation_waiting.resize(num_relations_per_batch);
-	s.tree_factors = s.tree->Leaf_factors_ready();
-	parallel_for(s.entries, 16, [&](int index)
-	{
-		if (s.is_smooth[index])
-		{
-			bool waiting = false;
-			s.relation_result[index] = (unsigned char)Format_relation(s, index, s.relation_texts[index], waiting);
-			s.relation_waiting[index] = waiting;
-		}
-	});
-	t = profile_add(profile, PROF_FACTOR, t);
-
 	Output_batch* o = new Output_batch;
 	o->source = this;
-	for (int index = 0; index < s.entries; index++)
+	for (size_t k = 0; k < s.items.size(); k++)
 	{
+		const int index = s.items[k];
 		if (s.is_smooth[index])
 		{
-			if (s.relation_result[index] == RELATION_FACTORING_FAILED)
+			if (s.item_result[k] == RELATION_FACTORING_FAILED)
 			{
 				num_factoring_failures++;
 			}
-			else if (s.relation_result[index] == RELATION_OTHER_SIDE_FAILED)
+			else if (s.item_result[k] == RELATION_OTHER_SIDE_FAILED)
 			{
 				num_other_side_failures++;
 			}
-			else if (s.relation_waiting[index])
+			else if (s.item_waiting[k])
 			{
 				Output_batch::Waiting w;
 				w.line = o->lines.size();
 				w.a = s.a_vals[index];
 				w.b = s.b_vals[index];
-				w.checked_side.swap(s.relation_texts[index]);
+				w.checked_side.swap(s.item_text[k]);
 				Get_saved_primes(s, index, w.saved);
 				w.ticket = -1;
 				o->waiting.push_back(move(w));
@@ -1380,12 +1658,11 @@ void Batch_smooth::Output_solutions(Batch_slot& s)
 			}
 			else
 			{
-				o->lines.push_back(move(s.relation_texts[index]));
+				o->lines.push_back(move(s.item_text[k]));
 			}
 		}
 
 		//reset for next iteration.
-		s.is_smooth[index] = false;
 		s.lp1[index] = 0;
 		s.lp2[index] = 0;
 	}
@@ -1432,7 +1709,20 @@ void Batch_smooth::Writer_worker()
 	unique_lock<mutex> guard(output_lock);
 	for (;;)
 	{
-		output_changed.wait(guard, [this] { return writer_stopping || flush_requested || !output_queue.empty(); });
+		output_changed.wait(guard, [this] { return writer_stopping || flush_requested || results_arrived || !output_queue.empty(); });
+		if (results_arrived && output_queue.empty() && !flush_requested)
+		{
+			//Factors of the other side arrived: write the batches that waited for them.
+			results_arrived = false;
+			writer_busy = true;
+			guard.unlock();
+			Write_held(false);
+			guard.lock();
+			writer_busy = false;
+			output_changed.notify_all();
+			continue;
+		}
+		results_arrived = false;
 		if (!output_queue.empty())
 		{
 			Output_batch* o = output_queue.front();
@@ -1472,6 +1762,13 @@ void Batch_smooth::Flush_writer()
 	writer->flush_requested = true;
 	writer->output_changed.notify_all();
 	writer->output_changed.wait(guard, [this] { return writer->output_queue.empty() && !writer->writer_busy && !writer->flush_requested; });
+}
+
+//The bound in bits of the prime factors of the other side's norms: its large prime bound if that has more than 32 bits (up to
+//MAX_LARGE_PRIME_BITS), and otherwise 32, as before: primes below 2^32 are taken even if lpb of that side says less.
+int Batch_smooth::Other_prime_bits()
+{
+	return max(OTHER_STAGE_LARGE_PRIME_BITS, min(other_large_prime_bits, MAX_LARGE_PRIME_BITS));
 }
 
 //The other_stage of the writer, if the other side's norms are factored on the GPU, when the first relations whose other side is
@@ -1515,23 +1812,47 @@ void Batch_smooth::Create_other_stage(const Output_batch& first)
 	vector<int> above((size_t)n * num_bounds, 0);
 	vector<char> over_lpb(n, 0);
 	const auto start = chrono::steady_clock::now();
+	//Factored as a job of other_factoring: a norm that is not smooth then costs little, where the search of the CPU for a factor
+	//that is not there takes up to a second. The few that the job leaves are factored on the CPU.
+	other_factoring->Set_prime_bits(other_large_prime_bits);
+	vector<int> job_counts;
+	vector<unsigned int> job_offsets;
+	vector<unsigned long long> job_primes;
+	{
+		vector<long long> sample_a(n), sample_b(n);
+		for (int i = 0; i < n; i++)
+		{
+			sample_a[i] = first.waiting[i].a;
+			sample_b[i] = first.waiting[i].b;
+		}
+		other_factoring->Results(other_factoring->Submit(sample_a.data(), sample_b.data(), n), job_counts, job_offsets, job_primes);
+	}
 	parallel_for(n, 16, [&](int i)
 	{
-		mpz_class norm;
-		other_poly->evaluate_polynomial_homogenous(&norm, (int64)first.waiting[i].a, (int64)first.waiting[i].b);
-		norm = abs(norm);
-		unsigned int factors[MAX_FACTORS_IN_RELATION];
-		const int count = (norm == 0) ? -1 : factor_general(factors, norm.get_mpz_t(), MAX_FACTORS_IN_RELATION);
+		unsigned long long cpu_factors[MAX_FACTORS_IN_RELATION];
+		const unsigned long long* factors = cpu_factors;
+		int count = job_counts[i];
+		if (count >= 0)
+		{
+			factors = job_primes.data() + job_offsets[i];
+		}
+		else if (count != OTHER_NOT_SMOOTH)
+		{
+			mpz_class norm;
+			other_poly->evaluate_polynomial_homogenous(&norm, (int64)first.waiting[i].a, (int64)first.waiting[i].b);
+			norm = abs(norm);
+			count = (norm == 0) ? -1 : factor_general_wide(cpu_factors, norm.get_mpz_t(), MAX_FACTORS_IN_RELATION, Other_prime_bits());
+		}
 		int* row = &above[(size_t)i * num_bounds];
 		for (int j = 0; j < count; j++)
 		{
-			if (other_large_prime_bits > 0 && other_large_prime_bits < 32 && factors[j] >= (1u << other_large_prime_bits))
+			if (other_large_prime_bits > 0 && other_large_prime_bits < 64 && factors[j] >> other_large_prime_bits != 0)
 			{
 				over_lpb[i] = 1;
 			}
 			for (int k = 0; k < num_bounds; k++)
 			{
-				row[k] += (factors[j] > (1u << (OTHER_STAGE_MIN_BOUND_BITS + k)));
+				row[k] += (factors[j] > (1ULL << (OTHER_STAGE_MIN_BOUND_BITS + k)));
 			}
 		}
 		if (count < 0)
@@ -1581,19 +1902,38 @@ void Batch_smooth::Create_other_stage(const Output_batch& first)
 		}
 		if (failed > 0)
 		{
-			what += string(what.empty() ? "" : ", and ") + to_string(failed) + " did not factor with primes below 2^32";
+			what += string(what.empty() ? "" : ", and ") + to_string(failed) + " did not factor with primes below 2^" + to_string(Other_prime_bits());
 		}
 		console_message("Error: of the " + to_string(n) + " norms of the other side factored on the CPU, " + what + ". " +
 			(large > 0 ? "The relations were sieved with a larger bound than " + lpb_name + " " + to_string(other_large_prime_bits) +
 				" in the polynomial file: set it to the bound they were sieved with. " : "Are they relations of this polynomial? ") +
 			"The run goes on, and the factor lists of the other side are rebuilt all the same.");
 	}
-	other_stage = new Batch_smooth(1LL << bound_bits, OTHER_STAGE_LARGE_PRIME_BITS, OTHER_STAGE_MAX_COFACTOR_BITS, norm_bits, save_filename, other_poly,
-		1 - side, 1, NULL, false, OTHER_STAGE_LEVELS, backend_kind, false, 1);
+	//With a pipeline, the norms are checked by threads of their own (OTHER_STAGE_PIPELINE batches in progress), and the writer goes
+	//on with the batches meanwhile: their results come from a thread of other_stage, under other_lock, and wake the writer.
+	//As many batches as fit in the memory of the GPU that is free now (the batches of the relations have theirs), up to
+	//OTHER_STAGE_PIPELINE; with one, the writer checks each batch of norms itself, as without a pipeline.
+	const int other_pipeline = pipelined ? max(1, min(OTHER_STAGE_PIPELINE, default_pipeline(backend_kind, OTHER_STAGE_LEVELS, norm_bits, false))) : 1;
+	other_stage = new Batch_smooth(1LL << bound_bits, Other_prime_bits(), OTHER_STAGE_MAX_COFACTOR_BITS, norm_bits, save_filename, other_poly,
+		1 - side, 1, NULL, false, OTHER_STAGE_LEVELS, backend_kind, false, other_pipeline);
 	other_stage->profile = profile_cycles_other;
+	for (Batch_slot* s : other_stage->slots)
+	{
+		//All of its leaves are factored: the norms of relations.
+		s->tree->Set_leaf_factoring((unsigned long long)1 << bound_bits, true, true);
+	}
+	other_stage->sink_batch_done = [this]
+	{
+		{
+			lock_guard<mutex> guard(output_lock);
+			results_arrived = true;
+		}
+		output_changed.notify_all();
+	};
 	other_stage->result_sink = [this](long long ticket, long long a, long long b, bool factored, vector<unsigned long long>& primes,
 		const mpz_class* cofactor, const mpz_class* norm)
 	{
+		lock_guard<mutex> guard(other_lock);
 		if (factored)
 		{
 			Other_result& r = other_results[ticket];
@@ -1627,9 +1967,25 @@ void Batch_smooth::Create_other_stage(const Output_batch& first)
 }
 
 //The jobs of other_factoring for the norms that other_stage did not factor, after one of its trees: the cofactors and the rest of
-//the norms apart, and the whole norms.
+//the norms apart, and the whole norms. The lists are filled by other_stage (result_sink), and taken here.
 void Batch_smooth::Submit_fallback()
 {
+	vector<long long> tickets, a, b, values_tickets;
+	vector<unsigned long long> limbs;
+	vector<unsigned int> sizes;
+	{
+		lock_guard<mutex> guard(other_lock);
+		if (split_tickets.empty() && fallback_tickets.empty())
+		{
+			return;
+		}
+		values_tickets.swap(split_tickets);
+		limbs.swap(split_limbs);
+		sizes.swap(split_sizes);
+		tickets.swap(fallback_tickets);
+		a.swap(fallback_a);
+		b.swap(fallback_b);
+	}
 	//This thread also takes the results, so it must leave room for the (up to two) jobs submitted here: a batch of very many
 	//relations found can fill many trees of other_stage before any of its lines are written.
 	while (pending_jobs.size() + 2 > OTHER_JOBS)
@@ -1638,39 +1994,39 @@ void Batch_smooth::Submit_fallback()
 		pending_jobs.pop_front();
 		Take_one_job(oldest);
 	}
-	if (!split_tickets.empty())
+	if (!values_tickets.empty())
 	{
-		const int job = other_factoring->Submit_values(split_limbs.data(), split_sizes.data(), (int)split_sizes.size());
-		for (long long ticket : split_tickets)
+		const int job = other_factoring->Submit_values(limbs.data(), sizes.data(), (int)sizes.size());
+		{
+			lock_guard<mutex> guard(other_lock);
+			for (long long ticket : values_tickets)
+			{
+				Other_result& r = other_results[ticket];
+				r.state = OTHER_IN_JOB;
+				r.job = job;
+			}
+		}
+		job_tickets[job].swap(values_tickets);
+		job_split[job] = true;
+		pending_jobs.push_back(job);
+	}
+	if (tickets.empty())
+	{
+		return;
+	}
+	const int job = other_factoring->Submit(a.data(), b.data(), (int)a.size());
+	{
+		lock_guard<mutex> guard(other_lock);
+		for (long long ticket : tickets)
 		{
 			Other_result& r = other_results[ticket];
 			r.state = OTHER_IN_JOB;
 			r.job = job;
 		}
-		job_tickets[job].swap(split_tickets);
-		job_split[job] = true;
-		pending_jobs.push_back(job);
-		split_tickets.clear();
-		split_limbs.clear();
-		split_sizes.clear();
 	}
-	if (fallback_tickets.empty())
-	{
-		return;
-	}
-	const int job = other_factoring->Submit(fallback_a.data(), fallback_b.data(), (int)fallback_a.size());
-	for (long long ticket : fallback_tickets)
-	{
-		Other_result& r = other_results[ticket];
-		r.state = OTHER_IN_JOB;
-		r.job = job;
-	}
-	job_tickets[job].swap(fallback_tickets);
+	job_tickets[job].swap(tickets);
 	job_split[job] = false;
 	pending_jobs.push_back(job);
-	fallback_tickets.clear();
-	fallback_a.clear();
-	fallback_b.clear();
 }
 
 //The results of a job of other_factoring, for all of its norms, after those of the jobs submitted before it: the results must be
@@ -1692,10 +2048,12 @@ void Batch_smooth::Take_job(int job)
 void Batch_smooth::Take_one_job(int job)
 {
 	vector<int> counts;
-	vector<unsigned int> offsets, primes;
+	vector<unsigned int> offsets;
+	vector<unsigned long long> primes;
 	other_factoring->Results(job, counts, offsets, primes);
 	const vector<long long>& tickets = job_tickets[job];
 	const bool split = job_split[job];
+	lock_guard<mutex> guard(other_lock);
 	for (size_t i = 0; i < tickets.size(); i++)
 	{
 		Other_result& r = other_results[tickets[i]];
@@ -1704,12 +2062,20 @@ void Batch_smooth::Take_one_job(int job)
 		r.primes.clear();
 		for (size_t v = first; v < first + values; v++)
 		{
-			if (counts[v] < 0)
+			if (counts[v] == OTHER_NOT_SMOOTH)
 			{
-				r.state = OTHER_FAILED;
+				r.state = OTHER_SKIPPED;
 				break;
 			}
-			r.primes.insert(r.primes.end(), primes.begin() + offsets[v], primes.begin() + offsets[v] + counts[v]);
+			if (counts[v] < 0)
+			{
+				r.state = OTHER_FAILED; //and if a later part is not smooth, neither is the norm
+				continue;
+			}
+			if (r.state == OTHER_FACTORED)
+			{
+				r.primes.insert(r.primes.end(), primes.begin() + offsets[v], primes.begin() + offsets[v] + counts[v]);
+			}
 		}
 		sort(r.primes.begin(), r.primes.end());
 	}
@@ -1732,7 +2098,6 @@ void Batch_smooth::Writer_take(Output_batch* o)
 		{
 			w.ticket = other_tickets++;
 			other_stage->Add_number_binary(w.a, w.b, NULL, 0);
-			Submit_fallback();
 		}
 	}
 	held.push_back(o);
@@ -1743,6 +2108,7 @@ void Batch_smooth::Writer_take(Output_batch* o)
 //Whether the factors of all the waiting lines of a batch are there.
 bool Batch_smooth::Batch_ready(const Output_batch& o)
 {
+	lock_guard<mutex> guard(other_lock);
 	for (const Output_batch::Waiting& w : o.waiting)
 	{
 		if (w.ticket >= 0 && other_results.find(w.ticket) == other_results.end())
@@ -1761,6 +2127,13 @@ void Batch_smooth::Write_held(bool flush)
 		unsigned long long t = profile_now();
 		other_stage->Finish();
 		other_stage_finished = true;
+		Submit_fallback();
+		profile_add(profile, PROF_OTHER_SIDE, t);
+	}
+	if (other_stage != NULL)
+	{
+		//The norms that other_stage has left for other_factoring since.
+		unsigned long long t = profile_now();
 		Submit_fallback();
 		profile_add(profile, PROF_OTHER_SIDE, t);
 	}
@@ -1783,16 +2156,46 @@ void Batch_smooth::Write_batch(Output_batch& o)
 	for (size_t k = 0; k < o.waiting.size(); k++)
 	{
 		Output_batch::Waiting& w = o.waiting[k];
-		auto r = (w.ticket >= 0) ? other_results.find(w.ticket) : other_results.end();
-		if (r != other_results.end() && r->second.state == OTHER_IN_JOB)
+		//The result of the line, taken out of other_results: after the job that it is in, if it is in one.
+		Other_result result;
+		bool have = false;
+		for (int attempt = 0; attempt < 2 && !have && w.ticket >= 0; attempt++)
 		{
-			Take_job(r->second.job);
+			int job = -1;
+			{
+				lock_guard<mutex> guard(other_lock);
+				auto r = other_results.find(w.ticket);
+				if (r == other_results.end())
+				{
+					break;
+				}
+				if (r->second.state == OTHER_IN_JOB)
+				{
+					job = r->second.job;
+				}
+				else
+				{
+					result = move(r->second);
+					other_results.erase(r);
+					have = true;
+				}
+			}
+			if (job >= 0)
+			{
+				Take_job(job);
+			}
 		}
-		if (r == other_results.end())
+		if (!have)
 		{
 			rest.push_back(k);
 		}
-		else if (r->second.state == OTHER_FAILED)
+		else if (result.state == OTHER_SKIPPED)
+		{
+			//The norm is not smooth: the pair is no relation.
+			source.num_other_side_failures++;
+			source.num_relations_found--;
+		}
+		else if (result.state == OTHER_FAILED)
 		{
 			//Not factored on the GPU at all: on the CPU (rare).
 			string other_side;
@@ -1808,13 +2211,8 @@ void Batch_smooth::Write_batch(Output_batch& o)
 		}
 		else
 		{
-			vector<unsigned int> factors;
-			for (unsigned long long p : r->second.primes)
-			{
-				factors.push_back((unsigned int)p);
-			}
 			string other_side;
-			if (source.Complete_other_side(w.a, w.b, w.saved, factors.data(), (int)factors.size(), other_side))
+			if (source.Complete_other_side(w.a, w.b, w.saved, result.primes.data(), (int)result.primes.size(), other_side))
 			{
 				o.lines[w.line] = source.Relation_line(w.a, w.b, w.checked_side, other_side);
 			}
@@ -1823,10 +2221,6 @@ void Batch_smooth::Write_batch(Output_batch& o)
 				source.num_other_side_failures++;
 				source.num_relations_found--;
 			}
-		}
-		if (r != other_results.end())
-		{
-			other_results.erase(r);
 		}
 	}
 	if (!rest.empty())
@@ -1838,7 +2232,8 @@ void Batch_smooth::Write_batch(Output_batch& o)
 			b.push_back(o.waiting[k].b);
 		}
 		vector<int> counts(rest.size(), -1);
-		vector<unsigned int> offsets, primes;
+		vector<unsigned int> offsets;
+		vector<unsigned long long> primes;
 		if (source.other_factoring != NULL)
 		{
 			source.other_factoring->Results(source.other_factoring->Submit(a.data(), b.data(), (int)a.size()), counts, offsets, primes);
@@ -1847,7 +2242,7 @@ void Batch_smooth::Write_batch(Output_batch& o)
 		{
 			Output_batch::Waiting& w = o.waiting[rest[j]];
 			string other_side;
-			if (source.Complete_other_side(w.a, w.b, w.saved, (counts[j] >= 0) ? primes.data() + offsets[j] : NULL, counts[j], other_side))
+			if (counts[j] != OTHER_NOT_SMOOTH && source.Complete_other_side(w.a, w.b, w.saved, (counts[j] >= 0) ? primes.data() + offsets[j] : NULL, counts[j], other_side))
 			{
 				o.lines[w.line] = source.Relation_line(w.a, w.b, w.checked_side, other_side);
 			}
@@ -1945,4 +2340,4 @@ long long Batch_smooth::Get_num_relations_checked()
 long long Batch_smooth::Get_num_relations_found()
 {
 	return num_relations_found + ((second_stage != NULL) ? second_stage->Get_num_relations_found() : 0);
-}
+}
