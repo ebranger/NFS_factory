@@ -155,7 +155,7 @@ private:
 #ifdef NFS_GPU
 Tree_backend* create_gpu_tree_backend(int levels, int max_bits_in_input); //Gpu_tree_backend.cu
 Other_side_factoring* create_gpu_other_side_factoring(const std::vector<mpz_class>& coefficients); //Gpu_tree_backend.cu
-int gpu_pipeline(int levels, int max_bits_in_input, bool report); //Gpu_tree_backend.cu
+int gpu_pipeline(int levels, int max_bits_in_input, bool report, double reserve_bytes); //Gpu_tree_backend.cu
 #endif
 
 //The physical memory that is free, in bytes (0 if unknown).
@@ -171,13 +171,13 @@ static double free_host_memory()
 #endif
 }
 
-int default_pipeline(tree_backend_kind kind, int levels, int max_bits_in_input, bool report)
+int default_pipeline(tree_backend_kind kind, int levels, int max_bits_in_input, bool report, double gpu_reserve_bytes)
 {
 	int slots = 1;
 #ifdef NFS_GPU
 	if (kind == TREE_BACKEND_GPU)
 	{
-		slots = gpu_pipeline(levels, max_bits_in_input, report);
+		slots = gpu_pipeline(levels, max_bits_in_input, report, gpu_reserve_bytes);
 	}
 #endif
 	//A batch in progress takes about 420 bytes per relation on the host (its relation, the saved factor list, the leaf and

@@ -8,6 +8,9 @@
 #include "arith32.h"
 #include <stdio.h>
 #include <stdlib.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include <vector>
 
 void cuda_check(cudaError_t error, const char* call, const char* file, int line)
@@ -20,7 +23,9 @@ void cuda_check(cudaError_t error, const char* call, const char* file, int line)
 			fprintf(stderr, "The GPU ran out of memory. Other programs may be using it; otherwise use fewer batches at once (pipeline in the polynomial file, "
 				"down to 1) or smaller trees (treelevels). A run that is started again continues from its resume file.\n");
 		}
-		exit(3);
+		//Without the destructors of the objects that the other threads still use.
+		fflush(NULL);
+		_exit(3);
 	}
 }
 
@@ -1298,10 +1303,12 @@ constexpr int EXTRACT_THREADS = 128;
 constexpr int EXTRACT_ITEMS = 4;
 constexpr size_t EXTRACT_CHUNK = (size_t)EXTRACT_THREADS * EXTRACT_ITEMS;
 
-//The bits, a block per chunk of EXTRACT_CHUNK limbs of a row, and the lowest nonzero limb of each row (first, which is ~0 before).
+//The bits, a block per chunk of EXTRACT_CHUNK limbs of a row, and the lowest nonzero limb of each row (first, which is ~0 before)
+//and its highest nonzero limb plus one (last, which is 0 before): the top of a tree has fractions with many leading zero limbs
+//(where the nodes are larger than the prime product), which k_extract_finish would otherwise look through for the size.
 __global__ void __launch_bounds__(EXTRACT_THREADS) k_extract_copy(const uint64_t* __restrict__ in, size_t in_stride, const uint32_t* __restrict__ shift_bits,
 	const uint32_t* __restrict__ precision_bits, const uint32_t* __restrict__ y_size, int y_div, size_t chunks, uint64_t* __restrict__ out, size_t out_stride,
-	unsigned int* __restrict__ first)
+	unsigned int* __restrict__ first, unsigned int* __restrict__ last)
 {
 	const size_t row = blockIdx.x / chunks, chunk = blockIdx.x % chunks;
 	if (y_size[row / y_div] == 0)
@@ -1315,7 +1322,7 @@ __global__ void __launch_bounds__(EXTRACT_THREADS) k_extract_copy(const uint64_t
 	const unsigned int s = (unsigned int)(shift & 63);
 	const uint64_t* a = in + row * in_stride + first_limb;
 	uint64_t* o = out + row * out_stride;
-	unsigned int lowest = ~0u;
+	unsigned int lowest = ~0u, highest = 0;
 #pragma unroll
 	for (int it = 0; it < EXTRACT_ITEMS; it++)
 	{
@@ -1328,9 +1335,10 @@ __global__ void __launch_bounds__(EXTRACT_THREADS) k_extract_copy(const uint64_t
 				v |= a[j + 1] << (64 - s);
 			}
 			o[j] = v;
-			if (v != 0 && j < out_limbs && j < lowest)
+			if (v != 0 && j < out_limbs)
 			{
-				lowest = (unsigned int)j;
+				lowest = (j < lowest) ? (unsigned int)j : lowest;
+				highest = (j + 1 > highest) ? (unsigned int)(j + 1) : highest;
 			}
 		}
 	}
@@ -1338,17 +1346,21 @@ __global__ void __launch_bounds__(EXTRACT_THREADS) k_extract_copy(const uint64_t
 	{
 		const unsigned int other = __shfl_xor_sync(0xFFFFFFFFu, lowest, offset);
 		lowest = (other < lowest) ? other : lowest;
+		const unsigned int other_highest = __shfl_xor_sync(0xFFFFFFFFu, highest, offset);
+		highest = (other_highest > highest) ? other_highest : highest;
 	}
 	if ((threadIdx.x & 31) == 0 && lowest != ~0u)
 	{
 		atomicMin(first + row, lowest);
+		atomicMax(last + row, highest);
 	}
 }
 
-//Then a warp per row: minus one (the borrow stops at the lowest nonzero limb), the mask of the top limb, and the size. first is
-//~0 again afterwards.
+//Then a warp per row: minus one (the borrow stops at the lowest nonzero limb), the mask of the top limb, and the size, which is
+//looked for from the highest nonzero limb down (minus one and the mask can only clear that limb; if all limbs were zero, they are
+//all ones now). first is ~0 and last 0 again afterwards.
 __global__ void k_extract_finish(const uint32_t* __restrict__ shift_bits, const uint32_t* __restrict__ precision_bits, const uint32_t* __restrict__ y_size, int y_div,
-	size_t rows, uint64_t* __restrict__ out, size_t out_stride, uint32_t* __restrict__ out_size, unsigned int* __restrict__ first)
+	size_t rows, uint64_t* __restrict__ out, size_t out_stride, uint32_t* __restrict__ out_size, unsigned int* __restrict__ first, unsigned int* __restrict__ last)
 {
 	const int lane = threadIdx.x & 31;
 	const size_t row = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) / 32;
@@ -1368,10 +1380,12 @@ __global__ void k_extract_finish(const uint32_t* __restrict__ shift_bits, const 
 	const size_t out_limbs = (size_t)((out_bits + 63) >> 6);
 	uint64_t* o = out + row * out_stride;
 	const size_t z = first[row];
+	const size_t highest = last[row];
 	__syncwarp();
 	if (lane == 0)
 	{
 		first[row] = ~0u;
+		last[row] = 0;
 	}
 	for (size_t j = lane; j < out_limbs && j <= z; j += 32)
 	{
@@ -1392,7 +1406,7 @@ __global__ void k_extract_finish(const uint32_t* __restrict__ shift_bits, const 
 	__syncwarp();
 	//The size, from the top down, 32 limbs at a time: lane i looks at limb top - 1 - i.
 	size_t size = 0;
-	for (size_t top = out_limbs; top > 0; top = (top > 32) ? top - 32 : 0)
+	for (size_t top = (z == ~0u || highest > out_limbs) ? out_limbs : highest; top > 0; top = (top > 32) ? top - 32 : 0)
 	{
 		const bool nonzero = (size_t)lane < top && o[top - 1 - lane] != 0;
 		const unsigned int found = __ballot_sync(0xFFFFFFFFu, nonzero);
@@ -1445,39 +1459,114 @@ __device__ uint32_t school_multiply(const uint64_t* a, uint32_t na, const uint64
 	return n;
 }
 
+//The sum of a column of a product in three words (c0 lowest), to which the product of two limbs is added.
+__device__ __forceinline__ void column_add(uint64_t& c0, uint64_t& c1, uint64_t& c2, uint64_t a, uint64_t b)
+{
+	const uint64_t lo = a * b;
+	uint64_t hi = __umul64hi(a, b);
+	c0 += lo;
+	hi += (c0 < lo); //at most 2^64 - 1, as the high half of a product is at most 2^64 - 2
+	c1 += hi;
+	c2 += (c1 < hi);
+}
+
+//The products of the pairs of small numbers: out[j] = x[2j] x[2j + 1], a thread each, column by column (the sums of a column are
+//kept in registers, and each limb of the product is written once, where a row by row product reads and writes the product for
+//every limb of a factor).
 __global__ void k_school_products(const uint64_t* __restrict__ x, size_t x_stride, const uint32_t* __restrict__ x_size, size_t count, uint64_t* __restrict__ out, size_t out_stride, uint32_t* __restrict__ out_size)
 {
 	for (size_t j = (size_t)blockIdx.x * blockDim.x + threadIdx.x; j < count; j += (size_t)gridDim.x * blockDim.x)
 	{
-		out_size[j] = school_multiply(x + 2 * j * x_stride, x_size[2 * j], x + (2 * j + 1) * x_stride, x_size[2 * j + 1], out + j * out_stride);
+		const uint64_t* a = x + 2 * j * x_stride;
+		const uint64_t* b = x + (2 * j + 1) * x_stride;
+		const uint32_t na = x_size[2 * j], nb = x_size[2 * j + 1];
+		uint64_t* o = out + j * out_stride;
+		uint32_t n = 0;
+		if (na != 0 && nb != 0)
+		{
+			uint64_t c0 = 0, c1 = 0, c2 = 0;
+			for (uint32_t k = 0; k < na + nb; k++)
+			{
+				const uint32_t low = (k >= nb) ? k - nb + 1 : 0, high = (k < na) ? k : na - 1;
+				for (uint32_t i = low; i <= high; i++)
+				{
+					column_add(c0, c1, c2, a[i], b[k - i]);
+				}
+				o[k] = c0;
+				n = (c0 != 0) ? k + 1 : n;
+				c0 = c1;
+				c1 = c2;
+				c2 = 0;
+			}
+		}
+		out_size[j] = n;
 	}
 }
 
+//The middle products of small numbers: out[r] = ((y[r / 2] x[r ^ 1]) mod 2^precision) >> shift, exactly, a thread each. The
+//product is computed column by column from the bottom (for the carries) up to the last limb that the result needs: the columns
+//above it, about a quarter of the products of limbs, are not computed, and only the limbs of the result are written.
 __global__ void k_school_middle(const uint64_t* __restrict__ y, size_t y_stride, const uint32_t* __restrict__ y_size, const uint64_t* __restrict__ x, size_t x_stride,
 	const uint32_t* __restrict__ x_size, const uint32_t* __restrict__ shift_bits, const uint32_t* __restrict__ precision_bits, size_t rows,
-	uint64_t* __restrict__ scratch, uint64_t* __restrict__ out, size_t out_stride, uint32_t* __restrict__ out_size)
+	uint64_t* __restrict__ out, size_t out_stride, uint32_t* __restrict__ out_size)
 {
 	for (size_t r = (size_t)blockIdx.x * blockDim.x + threadIdx.x; r < rows; r += (size_t)gridDim.x * blockDim.x)
 	{
 		const size_t partner = r ^ 1;
-		uint64_t* product = scratch + r * (y_stride + x_stride);
-		uint32_t n = school_multiply(y + (r / 2) * y_stride, y_size[r / 2], x + partner * x_stride, x_size[partner], product);
+		const uint64_t* a = y + (r / 2) * y_stride;
+		const uint64_t* b = x + partner * x_stride;
+		const size_t na = y_size[r / 2], nb = x_size[partner];
 		const uint64_t shift = shift_bits[r], precision = precision_bits[r];
 		uint64_t* o = out + r * out_stride;
-		//bits shift up to precision of the product, exactly
+		//bits shift up to precision of the product, exactly: limb j of the result is from the limbs first + j and first + j + 1
+		//of the product.
 		const size_t first = (size_t)(shift >> 6);
 		const unsigned int s = (unsigned int)(shift & 63);
 		const uint64_t out_bits = precision - shift;
 		const size_t out_limbs = (size_t)((out_bits + 63) >> 6);
-		for (size_t j = 0; j < out_limbs; j++)
+		const size_t total = (na != 0 && nb != 0) ? na + nb : 0;
+		const size_t need = (total < first + out_limbs + 1) ? total : first + out_limbs + 1;
+		uint64_t c0 = 0, c1 = 0, c2 = 0, previous = 0;
+		for (size_t k = 0; k < need; k++)
 		{
-			const size_t k = first + j;
-			uint64_t v = (k < n) ? product[k] >> s : 0;
-			if (s != 0 && k + 1 < n)
+			const size_t low = (k >= nb) ? k - nb + 1 : 0, high = (k < na) ? k : na - 1;
+			for (size_t i = low; i <= high; i++)
 			{
-				v |= product[k + 1] << (64 - s);
+				column_add(c0, c1, c2, a[i], b[k - i]);
 			}
-			o[j] = v;
+			const uint64_t limb = c0;
+			c0 = c1;
+			c1 = c2;
+			c2 = 0;
+			if (k >= first)
+			{
+				const size_t j = k - first;
+				if (s == 0)
+				{
+					if (j < out_limbs)
+					{
+						o[j] = limb;
+					}
+				}
+				else if (j > 0)
+				{
+					o[j - 1] = (previous >> s) | (limb << (64 - s));
+				}
+				previous = limb;
+			}
+		}
+		//The limb of the result from the last limb computed, if the product ends there, and zeros above the product.
+		size_t done = (need > first) ? need - first : 0; //limbs of the product from first on
+		if (s != 0 && done > 0)
+		{
+			if (done - 1 < out_limbs)
+			{
+				o[done - 1] = previous >> s;
+			}
+		}
+		for (size_t j = done; j < out_limbs; j++)
+		{
+			o[j] = 0;
 		}
 		if ((out_bits & 63) != 0)
 		{
@@ -1780,19 +1869,171 @@ __device__ int limbs_divexact_odd(uint64_t* n, int nn, const uint64_t* g, int ng
 
 constexpr int LEAF_MAX_SQUARINGS = 2;
 
+//gcd(a, b) for two numbers of two limbs, not both 0, by the binary algorithm in registers.
+__device__ void gcd_two_limbs(uint64_t& alo, uint64_t& ahi, uint64_t blo, uint64_t bhi)
+{
+	if ((blo | bhi) == 0)
+	{
+		return;
+	}
+	if ((alo | ahi) == 0)
+	{
+		alo = blo;
+		ahi = bhi;
+		return;
+	}
+	//x >>= its trailing zeros, which are returned.
+	auto strip = [](uint64_t& lo, uint64_t& hi) -> int
+	{
+		int z = 0;
+		if (lo == 0)
+		{
+			lo = hi;
+			hi = 0;
+			z = 64;
+		}
+		const int s = __ffsll((long long)lo) - 1;
+		if (s != 0)
+		{
+			lo = (lo >> s) | (hi << (64 - s));
+			hi >>= s;
+		}
+		return z + s;
+	};
+	const int za = strip(alo, ahi), zb = strip(blo, bhi);
+	const int z = (za < zb) ? za : zb;
+	while (alo != blo || ahi != bhi)
+	{
+		//Both odd: the larger minus the smaller, without its trailing zeros.
+		if (ahi > bhi || (ahi == bhi && alo > blo))
+		{
+			const uint64_t tlo = alo, thi = ahi;
+			alo = blo;
+			ahi = bhi;
+			blo = tlo;
+			bhi = thi;
+		}
+		const uint64_t borrow = (blo < alo);
+		blo -= alo;
+		bhi -= ahi + borrow;
+		strip(blo, bhi);
+	}
+	if (z >= 64)
+	{
+		ahi = alo << (z - 64);
+		alo = 0;
+	}
+	else if (z != 0)
+	{
+		ahi = (ahi << z) | (alo >> (64 - z));
+		alo <<= z;
+	}
+}
+
+//a = gcd(a, b) for numbers of at most K limbs (in arrays of K + 1), not both 0, by the binary algorithm; b is destroyed.
+//Returns the size of the gcd.
+template <int K> __device__ int limbs_gcd(uint64_t* a, int na, uint64_t* b, int nb)
+{
+	if (K == 2)
+	{
+		uint64_t alo = (na > 0) ? a[0] : 0, ahi = (na > 1) ? a[1] : 0;
+		gcd_two_limbs(alo, ahi, (nb > 0) ? b[0] : 0, (nb > 1) ? b[1] : 0);
+		a[0] = alo;
+		a[1] = ahi;
+		return (ahi != 0) ? 2 : ((alo != 0) ? 1 : 0);
+	}
+	if (nb == 0)
+	{
+		return na;
+	}
+	if (na == 0)
+	{
+		for (int j = 0; j < nb; j++)
+		{
+			a[j] = b[j];
+		}
+		return nb;
+	}
+	const unsigned int za = limbs_ctz(a, na), zb = limbs_ctz(b, nb);
+	const unsigned int z = (za < zb) ? za : zb;
+	if (za != 0)
+	{
+		na = limbs_shift_right(a, na, za);
+	}
+	if (zb != 0)
+	{
+		nb = limbs_shift_right(b, nb, zb);
+	}
+	uint64_t *u = a, *v = b;
+	int nu = na, nv = nb;
+	for (;;)
+	{
+		//u and v odd
+		const int order = limbs_compare(u, nu, v, nv);
+		if (order == 0)
+		{
+			break;
+		}
+		if (order > 0)
+		{
+			uint64_t* t = u;
+			u = v;
+			v = t;
+			const int tn = nu;
+			nu = nv;
+			nv = tn;
+		}
+		nv = limbs_subtract(v, nv, u, nu);
+		nv = limbs_shift_right(v, nv, limbs_ctz(v, nv));
+	}
+	if (u != a)
+	{
+		for (int j = 0; j < nu; j++)
+		{
+			a[j] = u[j];
+		}
+	}
+	na = nu;
+	if (z != 0)
+	{
+		for (int j = na; j < K + 1; j++)
+		{
+			a[j] = 0;
+		}
+		na = limbs_shift_left(a, na, K, z);
+	}
+	return na;
+}
+
+//q = n / g for g dividing n: the powers of two of g first, then Hensel division by its odd part. n and g are destroyed. Returns
+//the size of q.
+__device__ int limbs_divexact(uint64_t* n, int nn, uint64_t* g, int ng, uint64_t* q)
+{
+	const unsigned int zg = limbs_ctz(g, ng);
+	if (zg != 0)
+	{
+		ng = limbs_shift_right(g, ng, zg);
+		nn = limbs_shift_right(n, nn, zg);
+	}
+	return limbs_divexact_odd(n, nn, g, ng, q);
+}
+
 //The cofactor of each leaf N of the scaled remainder tree, one thread per leaf: from the fraction y of its parent (scaled by
 //2^(parent bits + guard)) and its sibling x, r = P mod N = round(((y x) mod 2^(parent bits + guard)) >> (parent bits - N bits)
 //times N / 2^(N bits + guard)), as Cpu_tree_backend::Leaf_cofactors, and then N / gcd(N, r^(2^squarings)). K is the most limbs
 //of a leaf, and a parent fraction has at most 2K + 1.
+//The gcd is taken with r itself, not with its powers: g = gcd(N, r), and for each squaring one more factor, since
+//gcd(N, r^2) = g gcd(N / g, g) (a prime divides both sides as often: min(v(N), 2 v(r))). The numbers then have the size of N
+//instead of that of r^2, and for most leaves, which share only a few small primes with the prime product, the second gcd is
+//with a small number.
 template <int K>
 __global__ void __launch_bounds__(128) k_leaf_cofactors(const uint64_t* __restrict__ y, size_t y_stride, const uint32_t* __restrict__ y_size, const uint32_t* __restrict__ y_bits,
 	const uint64_t* __restrict__ x, size_t x_stride, const uint32_t* __restrict__ x_size, const uint32_t* __restrict__ x_bits, size_t count, uint32_t guard, int squarings,
 	uint64_t* __restrict__ out, size_t out_stride, uint32_t* __restrict__ out_size)
 {
-	constexpr int V = K << LEAF_MAX_SQUARINGS; //r^(2^squarings)
 	for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < count; i += (size_t)gridDim.x * blockDim.x)
 	{
-		uint64_t product[3 * K + 1], q[K + 2], a[V], b[V], c[K + 1];
+		uint64_t product[3 * K + 1], q[K + 2], r[K + 1], g[K + 1], h[K + 1], n1[K + 1], n2[K + 1], c[K + 1];
 		const size_t parent = i / 2, sibling = i ^ 1;
 		const uint32_t nb = x_bits[i], pb = y_bits[parent];
 		const uint64_t* N = x + i * x_stride;
@@ -1809,95 +2050,64 @@ __global__ void __launch_bounds__(128) k_leaf_cofactors(const uint64_t* __restri
 			q[j] += carry;
 			carry = (q[j] < carry);
 		}
-		size = limbs_bits(q, K + 2, guard, 64 * K, a);
+		const int r_size = limbs_bits(q, K + 2, guard, 64 * K, r);
 
-		//v = r^(2^squarings), in b
-		for (int s = 0; s < squarings; s++)
+		//g = gcd(N, r), which is N for r = 0.
+		for (int j = 0; j < K + 1; j++)
 		{
-			size = (int)school_multiply(a, size, a, size, b);
-			for (int j = 0; j < size; j++)
-			{
-				a[j] = b[j];
-			}
+			g[j] = (j < n_size) ? N[j] : 0;
+			n1[j] = g[j];
 		}
-		for (int j = 0; j < size; j++)
+		for (int j = r_size; j < K + 1; j++)
 		{
-			b[j] = a[j];
+			r[j] = 0;
 		}
-		int vb = size;
+		int g_size = limbs_gcd<K>(g, n_size, r, r_size);
 
-		//g = gcd(N, v) by the binary algorithm, in a
-		for (int j = 0; j < n_size; j++)
+		//c = N / g
+		for (int j = 0; j < K + 1; j++)
 		{
-			a[j] = N[j];
+			n2[j] = g[j];
 		}
-		int va = n_size;
-		if (vb != 0 && va != 0)
+		int c_size = limbs_divexact(n1, n_size, n2, g_size, c);
+		for (int j = c_size; j < K + 1; j++)
 		{
-			const unsigned int za = limbs_ctz(a, va), zb = limbs_ctz(b, vb);
-			const unsigned int z = (za < zb) ? za : zb;
-			if (za != 0)
-			{
-				va = limbs_shift_right(a, va, za);
-			}
-			if (zb != 0)
-			{
-				vb = limbs_shift_right(b, vb, zb);
-			}
-			uint64_t *u = a, *v = b;
-			int nu = va, nv = vb;
-			for (;;)
-			{
-				//u and v odd
-				const int order = limbs_compare(u, nu, v, nv);
-				if (order == 0)
-				{
-					break;
-				}
-				if (order > 0)
-				{
-					uint64_t* t = u;
-					u = v;
-					v = t;
-					int tn = nu;
-					nu = nv;
-					nv = tn;
-				}
-				nv = limbs_subtract(v, nv, u, nu);
-				nv = limbs_shift_right(v, nv, limbs_ctz(v, nv));
-			}
-			if (u != a)
-			{
-				for (int j = 0; j < nu; j++)
-				{
-					a[j] = u[j];
-				}
-			}
-			va = nu;
-			if (z != 0)
-			{
-				for (int j = va; j < K + 1 && j < V; j++)
-				{
-					a[j] = 0;
-				}
-				va = limbs_shift_left(a, va, K, z);
-			}
+			c[j] = 0;
 		}
-		//else gcd(N, 0) = N, already in a
 
-		//c = N / g: the common power of 2 removed, then Hensel division by the odd part.
-		for (int j = 0; j < n_size; j++)
+		//For each squaring: h = gcd(N / g, g), which goes from the cofactor to g.
+		for (int s = 0; s < squarings && !(c_size == 1 && c[0] == 1) && !(g_size == 1 && g[0] == 1); s++)
 		{
-			b[j] = N[j];
+			for (int j = 0; j < K + 1; j++)
+			{
+				h[j] = g[j];
+				n1[j] = c[j];
+			}
+			const int h_size = limbs_gcd<K>(h, g_size, n1, c_size);
+			if (h_size == 1 && h[0] == 1)
+			{
+				break;
+			}
+			for (int j = 0; j < K + 1; j++)
+			{
+				n1[j] = c[j];
+				n2[j] = h[j];
+			}
+			c_size = limbs_divexact(n1, c_size, n2, h_size, c);
+			for (int j = c_size; j < K + 1; j++)
+			{
+				c[j] = 0;
+			}
+			if (s + 1 < squarings)
+			{
+				g_size = (int)school_multiply(g, g_size, h, h_size, product);
+				for (int j = 0; j < K + 1; j++)
+				{
+					g[j] = (j < g_size) ? product[j] : 0;
+				}
+			}
 		}
-		int nn = n_size;
-		const unsigned int zg = limbs_ctz(a, va);
-		if (zg != 0)
-		{
-			va = limbs_shift_right(a, va, zg);
-			nn = limbs_shift_right(b, nn, zg);
-		}
-		const int c_size = limbs_divexact_odd(b, nn, a, va, c);
+
 		uint64_t* o = out + i * out_stride;
 		for (int j = 0; j < K; j++)
 		{
@@ -2284,14 +2494,16 @@ void Gpu_ntt::Extract_middle(const Gpu_level& in, const uint32_t* shift, const u
 		CUDA_CHECK(cudaDeviceSynchronize());
 		cudaFree(extract_first);
 		extract_first_count = in.count + in.count / 8;
-		CUDA_CHECK(cudaMalloc(&extract_first, extract_first_count * sizeof(unsigned int)));
+		CUDA_CHECK(cudaMalloc(&extract_first, 2 * extract_first_count * sizeof(unsigned int)));
 		CUDA_CHECK(cudaMemset(extract_first, 0xFF, extract_first_count * sizeof(unsigned int)));
+		CUDA_CHECK(cudaMemset(extract_first + extract_first_count, 0, extract_first_count * sizeof(unsigned int)));
 	}
 	const size_t chunks = (out.stride + EXTRACT_CHUNK - 1) / EXTRACT_CHUNK;
 	k_extract_copy<<<(unsigned)(in.count * chunks), EXTRACT_THREADS, 0, stream>>>(in.limbs, in.stride, shift, precision, y_size, y_div, chunks, out.limbs, out.stride,
-		extract_first);
+		extract_first, extract_first + extract_first_count);
 	CUDA_CHECK(cudaGetLastError());
-	k_extract_finish<<<(unsigned)((in.count * 32 + 255) / 256), 256, 0, stream>>>(shift, precision, y_size, y_div, in.count, out.limbs, out.stride, out.size, extract_first);
+	k_extract_finish<<<(unsigned)((in.count * 32 + 255) / 256), 256, 0, stream>>>(shift, precision, y_size, y_div, in.count, out.limbs, out.stride, out.size, extract_first,
+		extract_first + extract_first_count);
 	CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2312,8 +2524,7 @@ void Gpu_ntt::School_middle(const Gpu_level& y, const Gpu_level& x, const uint32
 	{
 		return;
 	}
-	Reserve_scratch(x.count * (y.stride + x.stride));
-	k_school_middle<<<grid_size(x.count, 128), 128, 0, stream>>>(y.limbs, y.stride, y.size, x.limbs, x.stride, x.size, shift, precision, x.count, scratch, out.limbs, out.stride, out.size);
+	k_school_middle<<<grid_size(x.count, 128), 128, 0, stream>>>(y.limbs, y.stride, y.size, x.limbs, x.stride, x.size, shift, precision, x.count, out.limbs, out.stride, out.size);
 	CUDA_CHECK(cudaGetLastError());
 }
 

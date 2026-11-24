@@ -41,7 +41,21 @@ static const char* phase_names[PROF_NUM_PHASES] = {
 //added up over the threads that do it: when the batches are checked in a pipeline, several threads work at once (up to four
 //batches in the trees, the reader and the thread of the checks), so a phase can take more than 100 %, and the shares add up to
 //more than 100 %.
-void print_profile(unsigned long long total_cycles)
+profile_counter profile_stages[2][STAGE_NUM] = {};
+std::atomic<long long> profile_stage_batches[2] = {};
+
+static const char* stage_names[STAGE_NUM] = {
+	"waiting for the trees",
+	"in the trees",
+	"waiting for the checks",
+	"cofactors (GPU)",
+	"factoring (GPU)",
+	"relations found",
+	"waiting for its turn",
+	"steps in order",
+};
+
+void print_profile(unsigned long long total_cycles, double seconds)
 {
 	unsigned long long accounted = 0;
 	for (int i = 0; i < PROF_FIRST_WAIT; i++)
@@ -112,6 +126,21 @@ void print_profile(unsigned long long total_cycles)
 		for (int i = PROF_FIRST_WAIT; i < PROF_NUM_PHASES; i++)
 		{
 			cout << "  " << left << setw(25) << phase_names[i] << right << setw(8) << profile_cycles[i] / 1e9 << setw(7) << 100.0 * profile_cycles[i] / total_cycles << " %" << endl;
+		}
+	}
+
+	//What a batch waits for: the stage with the longest time holds the batches in progress, and with them the reader.
+	for (int k = 0; k < 2 && seconds > 0 && total_cycles > 0; k++)
+	{
+		const long long batches = profile_stage_batches[k];
+		if (batches == 0)
+		{
+			continue;
+		}
+		cout << ((k == 0) ? "A batch in the stages of the pipeline (ms on average, " : "A batch of the other side's norms (ms on average, ") << batches << " batches):" << endl;
+		for (int i = 0; i < STAGE_NUM; i++)
+		{
+			cout << "  " << left << setw(25) << stage_names[i] << right << setw(8) << 1e3 * seconds * profile_stages[k][i] / total_cycles / batches << endl;
 		}
 	}
 

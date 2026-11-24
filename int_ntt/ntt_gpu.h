@@ -119,7 +119,8 @@ private:
 	unsigned int* row_done; //for the carries: the blocks done in each row, and its top nonzero limb plus one
 	size_t row_done_count;
 	unsigned int* size_found; //the top found by the blocks of k_size, and the blocks done, 0 between calls
-	unsigned int* extract_first; //the lowest nonzero limb of each row of Extract_middle, ~0 between calls
+	unsigned int* extract_first; //the lowest nonzero limb of each row of Extract_middle, ~0 between calls, and after those of all rows
+	//(extract_first_count) the highest nonzero limb plus one of each row, 0 between calls
 	size_t extract_first_count;
 	size_t combine_coefficients; //that the combine keeps in shared memory, from the shared memory of the GPU
 	void Reserve_scratch(size_t limbs);

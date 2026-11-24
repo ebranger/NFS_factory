@@ -7,17 +7,22 @@ The 3LP candidate file (3lp: save) holds a in 32 bits, as the .bin format, so th
 more (from .ab or text files) are skipped and counted. With 3lp: auto they are checked. A candidate format with a 64-bit a
 would keep them.
 
-The other side's factor lists for .ab files: a batch check of the norms against the primes up to 2^28 (other_stage), with the
-cofactors of norms with three or four larger primes factored apart from the rest. With nothing else on the GPU, 4 SNFS-240 files
-took 46 s; 57 s with the norms factored by Pollard rho alone, and 37 s with no other side at all. What is left is mostly the rho
-for the parts of the norms below 2^28, with the leaves. A second tree at 2^26 would split those (rho on 100,000 of them took 0.41 s,
-and 0.29 s for the parts below 2^26 and between 2^26 and 2^28), about 1.6 s of the 46, but needs a stage within the stage. One walk
-per thread instead of a warp per norm was tried, and was not faster (the threads of a warp diverge). The prime product of that
-check takes about 8 s to set up, which only matters for short runs. The CPU build factors the norms on the CPU (a one-thread
-SNFS-220 run was about 30 % slower than from the .bin file).
+The other side's factor lists for .ab files are what a run on an RTX 5090 spends most on after the trees: for x - 10^53 with a
+polynomial of degree 4 (24 ns per relation checked in all, 7.2 relations found per 1000), 5.1 ns, against 19 ns without them. Of
+that, 1.2 ns are the batch check of the norms (other_stage: the tree against the primes up to 2^25, and rho on the cofactors of
+two larger primes), 2.0 ns the factoring of the part of each norm below that bound (k_factor_walk: Pollard rho with a thread per
+value, mostly with two limbs), and 1.8 ns the 18 % of the norms with three or more larger primes, whose cofactor and rest are
+factored apart in jobs (1.4 us per norm, five times what the others cost). Checking the norms against several bounds in the same
+tree (the product tree is shared, each bound costs a remainder tree) would give the part of each norm between two bounds, which
+is mostly a prime, or a product of two that rho splits with one limb; an estimate is half of the 5.1 ns. The bound itself
+(OTHER_STAGE_PRIMES_ABOVE) is a compromise: for x - 10^53 2^25 was 4 % faster than 2^26, for x^7 - 30 2^25 was 4 % faster than
+the 2^23 that is chosen.
 
-The thread of the checks now mostly waits for k_rho (Pollard rho on the two large prime cofactors, a thread each, about 240 per
-SNFS-240 batch). A warp per cofactor (32 walks) was tried and was not faster.
+Pollard rho on the cofactors of two large primes of the checked side (k_rho) costs 2.2 ns of the 16 ns per relation of a run
+with "format: keys" (x - 10^53, lpba 29: about 8400 cofactors per million relations, of which a third are relations). The
+cofactors that are not relations could be found by a batch check of their own against the primes up to 2^lpb (as the 3LP second
+stage does), leaving rho only for the relations, whose two primes are printed; their batches would have to wait for it, which
+changes the order of the work, not of the output.
 
 A validating converter to .ab (finding the right a for the relations of old .bin files whose |a| is 2^31 or more, which needs the
 polynomial) exists outside the repository; Utilities\RelationsToBinaryFormat converts without checking.
@@ -29,8 +34,12 @@ Batch checking with early abort: a first batch against the primes up to about 2^
 check only for the few values whose remaining part can still be smooth. Perhaps 15-25 % faster, but it loses some relations,
 and the best split depends on parameters that change during a factorization.
 
-GPU transform kernels: they are limited by latency (registers, barriers between the passes), not memory bandwidth. Passes of
-4 levels with 16 elements per thread would need fewer barriers, at the cost of registers. A few percent at most.
+GPU transform kernels: they are limited by latency (registers, barriers between the passes), not memory bandwidth. Passes of 4
+levels with 16 elements per thread would need fewer barriers, at the cost of registers. A few percent at most. The transforms
+(kRow, kCol) are about two thirds of the time of the kernels of a tree, the combine and its carries a sixth; the products of
+small numbers, the leaves and the root the rest. The kernels of the trees of several threads take turns on the GPU rather than
+run at once, so the time of a run is close to the sum of the times of its kernels: a tree of 2^18 leaves has about 400 kernel
+launches, many of them of a few us, which larger trees spread over more relations (see treelevels).
 
 The plan of the integer NTT (number of primes and transform length) is chosen with a cost model of the CPU transforms. On the
 GPU the CRT combine is a larger part, and grows with the square of the number of primes.
@@ -38,8 +47,19 @@ GPU the CRT combine is a larger part, and grows with the square of the number of
 The prime product of the 3LP second stage (all primes below 2^lbp) takes about 1.3 s to set up on the CPU (the root tests of
 28 million primes). Only noticeable on short runs.
 
-On the CPU still: the polynomial values (about 2 ms per batch per tree thread), the check of the saved factor lists of the
-relations found, relation values of more than 256 bits, other side norms of more than 256 bits, and tinyqs.
+On the CPU still: the check of the saved factor lists of the relations found (.bin and text files), relation values of more than
+256 bits, other side norms of more than 256 bits, and tinyqs. For .ab files the polynomial values are computed on the GPU; for
+.bin and text files they still are computed on the CPU, a relation at a time, and the reader adds those relations one at a time
+(about 50 ns each, which limits such a run to about 20 million relations per second).
 
-With -rels, a run stops after the batches in progress, so it finds a few more relations than asked for, more with a larger
-pipeline.
+With -rels, a run stops after the batches in progress, so it finds more relations than asked for: up to twelve batches with
+small trees, or four to six of a million relations each with the large ones (about 30000 relations for x - 10^53).
+
+The 3LP second stage needs the product of all primes below 2^lpb, so three large primes are limited to lpb 32 (and its candidate
+file to primes of 32 bits: a candidate whose saved list of the other side has a larger prime is kept without the list, which is
+rebuilt from the norm). The .bin format holds primes of 32 bits too: a relation set sieved with a larger bound on the side
+that is not checked needs the .ab format.
+
+A cofactor of more than 2 log2(lim) bits is taken as two large primes, also when it is below 2^lpb. With lim below 2^(lpb/2)
+(131072 for lpb 34, far below any lim in use) a relation with one large prime above lim^2 is therefore not found. The limit
+could be max(2 log2(lim), lpb) bits.
